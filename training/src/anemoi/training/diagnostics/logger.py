@@ -171,7 +171,8 @@ def get_wandb_logger(config: DictConfig, model: pl.LightningModule) -> pl.logger
         log_model=config.diagnostics.log.wandb.log_model,
         resume=config.training.run_id is not None,
     )
-    logger.log_hyperparams(OmegaConf.to_container(config, resolve=True))
+    # Monte: Incorporate the convert_to_omegaconf above from the mlflow logger. 
+    logger.log_hyperparams(OmegaConf.to_container(convert_to_omegaconf(config), resolve=True))
     if config.diagnostics.log.wandb.gradients or config.diagnostics.log.wandb.parameters:
         if config.diagnostics.log.wandb.gradients and config.diagnostics.log.wandb.parameters:
             log_ = "all"
