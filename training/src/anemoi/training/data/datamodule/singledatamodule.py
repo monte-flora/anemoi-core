@@ -114,6 +114,10 @@ class AnemoiDatasetsDataModule(pl.LightningDataModule):
         NOTE: This is only relevant when training on non-analysis and could in the future be replaced with
         a property of the dataset stored in data_reader. Now assumes regular interval of changed model runs
         """
+        if hasattr(data_reader, "trajectory_ids"):
+            LOGGER.info(f"Using the existing forecast trajectory ids")
+            return data_reader
+        
         if not hasattr(self.config.dataloader, "model_run_info"):
             data_reader.trajectory_ids = None
             return data_reader
@@ -218,6 +222,8 @@ class AnemoiDatasetsDataModule(pl.LightningDataModule):
         label: str = "generic",
     ) -> NativeGridDataset:
 
+        LOGGER.info(f"{data_reader=}")
+        
         data_reader = self.add_trajectory_ids(data_reader)  # NOTE: Functionality to be moved to anemoi datasets
 
         return NativeGridDataset(
