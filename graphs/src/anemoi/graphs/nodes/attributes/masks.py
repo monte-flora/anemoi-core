@@ -20,6 +20,27 @@ from anemoi.graphs.nodes.attributes.base_attributes import BooleanBaseNodeAttrib
 LOGGER = logging.getLogger(__name__)
 
 
+class DatasetVariableMask(BooleanBaseNodeAttribute):
+    """
+    Reads a boolean mask variable directly from an Anemoi dataset (Zarr store).
+    """
+
+    def __init__(self, variable: str):
+        super().__init__()
+        self.variable = variable
+
+    def get_raw_values(self, nodes, **kwargs) -> torch.Tensor:
+        from anemoi.datasets import open_dataset
+        assert "_dataset" in nodes, "Missing '_dataset' key in node storage."
+                
+        ds = open_dataset(nodes["_dataset"])
+
+        mask = getattr(ds, self.variable)
+        if mask.dtype != bool:
+            mask = mask.astype(bool)
+            
+        return torch.from_numpy(mask)
+
 class NonmissingAnemoiDatasetVariable(BooleanBaseNodeAttribute):
     """Mask of valid (not missing) values of a Anemoi dataset variable.
 
