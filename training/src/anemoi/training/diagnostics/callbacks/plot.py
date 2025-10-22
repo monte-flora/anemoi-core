@@ -1027,6 +1027,8 @@ class PlotSample(BasePerBatchPlotCallback):
         )
         # Monte: perhaps not accounting for ensemble dim change?
         # So switching 1->2 
+        # Also, removing the .numpy to avoid a cuda/cpu mismatch error
+        # RuntimeError: expected self and mask to be on the same device, but got mask on cuda:0 and self on cpu
         output_tensor = pl_module.output_mask.apply(output_tensor, dim=2, fill_value=np.nan).numpy()
         data[1:, ...] = pl_module.output_mask.apply(data[1:, ...], dim=2, fill_value=np.nan)
         data = data.numpy()
@@ -1079,14 +1081,16 @@ class BasePlotAdditionalMetrics(BasePerBatchPlotCallback):
             .cpu()
         )
         data = self.post_processors(input_tensor)[self.sample_idx]
+        
         output_tensor = torch.cat(
             tuple(
                 self.post_processors(x[:, ...].detach().cpu(), in_place=False)[self.sample_idx : self.sample_idx + 1]
                 for x in outputs[1]
             ),
         )
+        
         # Monte: mismatch for the ens dim. 1->2
-        output_tensor = pl_module.output_mask.apply(output_tensor, dim=2, fill_value=np.nan).numpy()
+        output_tensor = pl_module.output_mask.apply(output_tensor, dim=2, fill_value=np.nan).cpu().numpy()
         data[1:, ...] = pl_module.output_mask.apply(data[1:, ...], dim=2, fill_value=np.nan)
         data = data.numpy()
         return data, output_tensor

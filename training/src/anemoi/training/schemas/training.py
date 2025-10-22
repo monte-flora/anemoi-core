@@ -220,6 +220,7 @@ class ImplementedLossesUsingBaseLossSchema(str, Enum):
     mae = "anemoi.training.losses.MAELoss"
     logcosh = "anemoi.training.losses.LogCoshLoss"
     huber = "anemoi.training.losses.HuberLoss"
+    rmse_norm = "anemoi.training.losses.RMSELossNormalized"
 
 
 class BaseLossSchema(BaseModel):

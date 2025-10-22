@@ -31,6 +31,10 @@ from scipy.interpolate import griddata
 from torch import Tensor
 from torch import nn
 
+# Monte: my additions. 
+import cartopy.crs as ccrs
+import cartopy.feature as cfeature
+
 from anemoi.training.diagnostics.maps import Coastlines
 from anemoi.training.diagnostics.maps import EquirectangularProjection
 from anemoi.training.utils.variables_metadata import ExtractVariableGroupAndLevel
@@ -53,6 +57,19 @@ def equirectangular_projection(latlons: np.array) -> np.array:
     lat, lon = latlons[:, 0], latlons[:, 1]
     pc_lon, pc_lat = pc(lon, lat)
     return pc_lat, pc_lon
+
+def add_cartopy_features(ax: plt.Axes, lats, lons) -> None:
+    """Add coastlines, borders, and U.S. states to the given axes."""
+    ax.add_feature(cfeature.COASTLINE.with_scale("50m"), linewidth=0.6)
+    ax.add_feature(cfeature.BORDERS.with_scale("50m"), linewidth=0.4, linestyle=":")
+    ax.add_feature(cfeature.STATES.with_scale("50m"), linewidth=0.4, alpha=0.6)
+    
+    # Focus on the U.S.
+    lon_min, lon_max = min(lons), max(lons)
+    lat_min, lat_max = min(lats), max(lats)
+    
+    ax.set_extent([lon_min-0.25, lon_max+0.25, lat_min-0.25, lat_max+0.25], crs=ccrs.PlateCarree())
+    
 
 
 def argsort_variablename_variablelevel(data: list[str], metadata_variables: dict | None = None) -> list[int]:
@@ -432,9 +449,17 @@ def plot_predicted_multilevel_flat_sample(
     n_plots_x, n_plots_y = len(parameters), n_plots_per_sample
 
     figsize = (n_plots_y * 4, n_plots_x * 3)
-    fig, ax = plt.subplots(n_plots_x, n_plots_y, figsize=figsize, layout=LAYOUT)
+    fig, ax = plt.subplots(n_plots_x, 
+                           n_plots_y, 
+                           figsize=figsize, 
+                           layout=LAYOUT, 
+                           subplot_kw={"projection": ccrs.PlateCarree()},
+                          )
 
-    pc_lat, pc_lon = equirectangular_projection(latlons)
+    #pc_lat, pc_lon = equirectangular_projection(latlons)
+    # Monte: using the default lat/lon and waiting for 
+    # cartopy to convert. 
+    pc_lat, pc_lon = latlons[:, 0], latlons[:, 1]
     if colormaps is None:
         colormaps = {}
 
@@ -670,6 +695,7 @@ def single_plot(
             alpha=1.0,
             norm=norm,
             rasterized=False,
+            transform=ccrs.PlateCarree()
         )
     else:
         df = pd.DataFrame({"val": data, "x": lon, "y": lat})
@@ -694,7 +720,9 @@ def single_plot(
     ax.set_xlim((xmin - 0.1, xmax + 0.1))
     ax.set_ylim((ymin - 0.1, ymax + 0.1))
 
-    continents.plot_continents(ax)
+    # Monte: opting to plot with cartopy.
+    #continents.plot_continents(ax)
+    add_cartopy_features(ax, lat, lon)
 
     if title is not None:
         ax.set_title(title)

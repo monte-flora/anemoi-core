@@ -160,7 +160,7 @@ class BaseGraphModule(pl.LightningModule, ABC):
 
         """
         super().__init__()
-
+        
         graph_data = graph_data.to(self.device)
 
         self.output_mask = instantiate(config.model_dump(by_alias=True).model.output_mask, graph_data=graph_data)

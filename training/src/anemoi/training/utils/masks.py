@@ -105,6 +105,12 @@ class Boolean1DMask(torch.nn.Module, BaseMask):
             return Boolean1DMask._fill_tensor_with_tensor(x, indices, fill_value, dim)
 
         mask = self.broadcast_like(x, dim, grid_shard_slice)
+        
+        if not x.is_cuda:
+            # Monte: If x is cpu-bound, then shift the mask to the cpu.
+            # This is related to plotting. 
+            mask = mask.to(x.device) 
+        
         return Boolean1DMask._fill_tensor_with_float(x, ~mask, fill_value)
 
     def rollout_boundary(

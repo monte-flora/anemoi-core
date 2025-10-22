@@ -71,6 +71,8 @@ def get_loss_function(
     if "*" in scalers_to_include:
         scalers_to_include = [s for s in list(scalers.keys()) if f"!{s}" not in scalers_to_include]
 
+    ##LOGGER.info(f"{scalers=}")    
+        
     # Instantiate the loss function with the loss_init_config
     loss_function = instantiate(loss_config, **kwargs, _recursive_=False)
 
