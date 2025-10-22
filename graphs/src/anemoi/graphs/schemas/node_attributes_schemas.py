@@ -60,7 +60,6 @@ class GridsMaskSchema(BaseModel):
     grids: list[int] | int = Field(examples=[0, [0]])
     "Position of the grids to consider as True."
 
-
 class NonmissingAnemoiDatasetVariableSchema(BaseModel):
     target_: Literal["anemoi.graphs.nodes.attributes.NonmissingAnemoiDatasetVariable"] = Field(..., alias="_target_")
     (
@@ -70,6 +69,17 @@ class NonmissingAnemoiDatasetVariableSchema(BaseModel):
     variable: str
     "The anemoi-datasets variable to use."
 
+    
+class DatasetVariableMaskSchema(BaseModel):
+    target_: Literal["anemoi.graphs.nodes.attributes.DatasetVariableMask"] = Field(..., alias="_target_")
+    (
+        
+        "Implementation of a mask read directly from an Anemoi dataset (Zarr store) "
+        "from anemoi.graphs.nodes.attributes."
+    )
+    variable: str
+    "The anemoi-datasets variable to use."    
+    
 
 SingleAttributeSchema = (
     PlanarAreaWeightSchema
@@ -78,6 +88,7 @@ SingleAttributeSchema = (
     | CutOutMaskSchema
     | GridsMaskSchema
     | NonmissingAnemoiDatasetVariableSchema
+    | DatasetVariableMaskSchema
 )
 
 
