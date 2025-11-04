@@ -134,7 +134,7 @@ class LimitedAreaIcosahedralandHealPixNodeSchema(BaseModel):
     "Refinement level of the mesh."
     reference_node_name: str  # TODO(Helen): Discuss check that reference nodes exists in the config
     "Name of the reference nodes in the graph to consider for the Area Mask."
-    mask_attr_name: str  # TODO(Helen): Discuss check that mask_attr_name exists in the dataset config
+    mask_attr_name: str | None = None  # TODO(Helen): Discuss check that mask_attr_name exists in the dataset config
     "Name of a node to attribute to mask the reference nodes, if desired. Defaults to consider all reference nodes."
     margin_radius_km: PositiveFloat = Field(example=100.0)
     "Maximum distance to the reference nodes to consider a node as valid, in kilometers. Defaults to 100 km."
