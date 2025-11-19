@@ -564,12 +564,13 @@ def plot_flat_sample(
     None
     """
     precip_and_related_fields = precip_and_related_fields or []
-    if vname in precip_and_related_fields:
+    if vname in precip_and_related_fields and vname != 'composite_reflectivity':
         # converting to mm from m
         truth *= 1000.0
         pred *= 1000.0
         if sum(input_) != 0:
             input_ *= 1000.0
+            
     data = [None for _ in range(6)]
     # truth, prediction and prediction error always plotted
     data[1:4] = [truth, pred, truth - pred]
@@ -578,9 +579,9 @@ def plot_flat_sample(
         f"{vname} input",
         f"{vname} target",
         f"{vname} pred",
-        f"{vname} pred err",
-        f"{vname} increment [pred - input]",
-        f"{vname} persist err",
+        f"{vname} Err. [target - pred]",
+        f"{vname} Pred Resid. [pred - input]",
+        f"{vname} True Resid. [target - input]",
     ]
     # colormaps
     cmaps = [cmap] * 3 + [error_cmap] * 3
@@ -726,6 +727,16 @@ def single_plot(
 
     if title is not None:
         ax.set_title(title)
+        
+    max_data = np.nanmax(data)
+    min_data = np.nanmin(data)
+   
+    for i, label, val in zip([0, 0.1], ["Min", "Max"], [min_data, max_data]):
+        ax.annotate(f"{label}: {val:.4f}", 
+                xy=(0.1, i), 
+                xycoords="axes fraction",
+                fontweight='bold'
+               )
 
     ax.set_aspect("auto", adjustable=None)
     _hide_axes_ticks(ax)
@@ -911,3 +922,233 @@ def plot_graph_edge_features(
             )
 
     return fig
+
+def plot_predicted_ensemble(
+    parameters: dict[int, str],
+    n_plots_per_sample: int,
+    latlons: np.ndarray,
+    clevels: float,
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    datashader: bool = True,
+    precip_and_related_fields: list | None = None,
+    colormaps: dict[str, Colormap] | None = None,
+) -> Figure:
+    """Plots data for one ensemble member.
+
+    Args:
+        parameters : Dict[int, str]
+            Dictionary of target variables
+        n_plots_per_sample : int
+            Number of plots per sample
+        latlons : np.ndarray
+            Latitudes and longitudes
+        clevels : float
+            Accumulation levels used for precipitation related plots
+        cmap_precip: str
+            Colours used for each precipitation accumulation level
+        y_true : np.ndarray
+            True values
+        y_pred : np.ndarray
+            Predicted values
+        datashader : bool, optional
+            Datashader plot, by default True
+        precip_and_related_fields : list, optional
+            List of precipitation-like variables, by default None
+        colormaps : dict[str, Colormap], optional
+            Dictionary of colormaps, by default None
+
+    Returns
+    -------
+        fig:
+            The figure object handle.
+    """
+    nens = y_pred.shape[0] if len(y_pred.shape) == 3 else 1
+
+    n_plots_per_sample = 4  # target, pred mean, mean error, ens sd
+    n_plots_x, n_plots_y = len(parameters), nens + n_plots_per_sample
+    LOGGER.debug("n_plots_x = %d, n_plots_y = %d", n_plots_x, n_plots_y)
+
+    figsize = (n_plots_y * 4, n_plots_x * 3)
+    fig, axs = plt.subplots(n_plots_x, 
+                            n_plots_y, 
+                            figsize=figsize,
+                            subplot_kw={"projection": ccrs.PlateCarree()},
+                           )
+
+    #pc_lat, pc_lon = equirectangular_projection(latlons)
+    # Monte: using the default lat/lon and waiting for 
+    # cartopy to convert. 
+    pc_lat, pc_lon = latlons[:, 0], latlons[:, 1]
+    
+    colormaps = colormaps if colormaps is not None else {}
+    precip_and_related_fields = precip_and_related_fields if precip_and_related_fields is not None else []
+
+    for plot_idx, (variable_idx, variable_name) in enumerate(parameters.items()):
+        yp = y_pred[..., variable_idx].squeeze()
+        yt = y_true[..., variable_idx].squeeze()
+        _axs = axs[plot_idx, :] if n_plots_x > 1 else axs
+
+        # get the colormap for the variable as defined in config file
+        cmap = colormaps.default.get_cmap() if colormaps.get("default") else cm.get_cmap("viridis")
+        error_cmap = colormaps.error.get_cmap() if colormaps.get("error") else cm.get_cmap("bwr")
+        for key in colormaps:
+            if key not in ["default", "error"] and variable_name in colormaps[key].variables:
+                cmap = colormaps[key].get_cmap()
+                continue
+
+        plot_ensemble_sample(
+            fig=fig,
+            axs=_axs,
+            pc_lon=pc_lon,
+            pc_lat=pc_lat,
+            truth=yt,
+            pred_ens=yp,
+            vname=variable_name,
+            clevels=clevels,
+            ens_dim=0,
+            datashader=datashader,
+            precip_and_related_fields=precip_and_related_fields,
+            cmap=cmap,
+            error_cmap=error_cmap,
+        )
+
+    return fig
+
+
+def plot_ensemble_sample(
+    fig: Figure,
+    axs: list[plt.Axes],
+    pc_lon: np.ndarray,
+    pc_lat: np.ndarray,
+    truth: np.ndarray,
+    pred_ens: np.ndarray,
+    vname: np.ndarray,
+    clevels: float,
+    ens_dim: int = 0,
+    datashader: bool = True,
+    precip_and_related_fields: list | None = None,
+    cmap: Colormap | None = None,
+    error_cmap: Colormap | None = None,
+) -> None:
+    """Use this when plotting ensembles.
+
+    Each member is defined on "flat" (reduced Gaussian) grids.
+
+    Parameters
+    ----------
+    fig: figure
+        Figure object handle
+    axs: list[matplotlib.axes]
+        List of axis object handles
+    pc_lon : np.ndarray
+        Projected Longitude coordinates array
+    pc_lat : np.ndarray
+        Projected Latitude coordinates array
+    truth : np.ndarray
+        True values
+    pred_ens : np.ndarray
+        Ensemble array
+    vname : np.ndarray
+        Variable name
+    clevels : float
+        Accumulation levels used for precipitation related plots
+    ens_dim : int, optional
+        Ensemble dimension, by default
+    datashader : bool, optional
+        Datashader plot, by default True
+    precip_and_related_fields : list, optional
+        List of precipitation-like variables, by default []
+    cmap : Colormap, optional
+        Colormap for the plot
+    error_cmap : Colormap, optional
+        Colormap for the error plot
+
+    Returns
+    -------
+        None
+    """
+    vmin=np.nanmin(truth.flatten()) 
+    vmax=np.nanmax(truth.flatten())
+    LOGGER.info(f"Truth values: {vname=} {vmin=} {vmax=} {truth.shape=}")
+    
+    precip_and_related_fields = precip_and_related_fields if precip_and_related_fields is not None else []
+    if vname in precip_and_related_fields:
+        # converting to mm from m
+        truth *= 1000.0
+        pred_ens *= 1000.0
+        cummulation_lvls = clevels
+        norm = BoundaryNorm(cummulation_lvls, len(cummulation_lvls) + 1)
+    else:
+        combined_data = np.concatenate((truth.flatten(), pred_ens.flatten()))
+        norm = Normalize(vmin=np.nanmin(combined_data), vmax=np.nanmax(combined_data))
+        
+    if len(pred_ens.shape) == 2:
+        nens = pred_ens.shape[ens_dim]
+        ens_mean, ens_sd = pred_ens.mean(axis=ens_dim), pred_ens.std(axis=ens_dim)
+    else:
+        nens = 1
+        ens_mean = pred_ens
+        ens_sd = np.zeros(pred_ens.shape)
+
+    # truth
+    single_plot(
+        fig,
+        axs[0],
+        pc_lon,
+        pc_lat,
+        truth,
+        cmap=cmap,
+        norm=norm,
+        title=f"{vname[0]} target",
+        datashader=datashader,
+    )
+    # ensemble mean
+    single_plot(
+        fig,
+        axs[1],
+        pc_lon,
+        pc_lat,
+        ens_mean,
+        cmap=cmap,
+        norm=norm,
+        title=f"{vname[0]} pred mean",
+        datashader=datashader,
+    )
+    # ensemble spread
+    single_plot(
+        fig,
+        axs[2],
+        pc_lon,
+        pc_lat,
+        ens_mean - truth,
+        cmap=error_cmap,
+        norm=TwoSlopeNorm(vcenter=0.0),
+        title=f"{vname[0]} ens mean err",
+        datashader=datashader,
+    )
+    # ensemble mean error
+    single_plot(
+        fig,
+        axs[3],
+        pc_lon,
+        pc_lat,
+        ens_sd,
+        title=f"{vname[0]} ens sd",
+        datashader=datashader,
+    )
+
+    # ensemble members (difference from mean)
+    plot_index = 4
+    for i_ens in range(nens):
+        single_plot(
+            fig,
+            axs[i_ens + plot_index],
+            pc_lon,
+            pc_lat,
+            np.take(pred_ens, i_ens, axis=ens_dim) - ens_mean,
+            cmap=error_cmap,
+            norm=TwoSlopeNorm(vcenter=0.0),
+            title=f"{vname[0]}_{i_ens + 1} - mean",
+            datashader=datashader,
+        )

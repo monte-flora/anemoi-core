@@ -51,6 +51,7 @@ class BaseVariableLevelScaler(BaseVariableLossScaler):
             Type of normalization to apply. Options are None, unit-sum, unit-mean and l1.
         """
         super().__init__(data_indices, metadata_extractor=metadata_extractor, norm=norm)
+        self.min_factor = kwargs.get("min_factor", 0.25)       
         del kwargs
         self.scaling_group = group
         self.y_intercept = y_intercept
@@ -107,12 +108,11 @@ class ReluVariableLevelScaler(BaseVariableLevelScaler):
     def get_level_scaling(self, variable_level: float) -> torch.Tensor:
         return max(self.y_intercept, variable_level * self.slope)
 
-#class ModelLevelReluVariableLevelScaler(BaseVariableLevelScaler):
-#    """Scales model levels linearly with a floor (min_factor) to prevent very small weights."""
-#   
-#    def get_level_scaling(self, variable_level: float) -> torch.Tensor:
-#        min_factor = 0.25 
-#       return max((self.slope / self.y_intercept) * variable_level + (1 - self.slope), min_factor)
+class ModelLevelReluVariableLevelScaler(BaseVariableLevelScaler):
+    """Scales model levels linearly with a floor (min_factor) to prevent very small weights."""
+   
+    def get_level_scaling(self, variable_level: float) -> torch.Tensor:
+        return max((self.slope / self.y_intercept) * variable_level + (1 - self.slope), self.min_factor)
 
 class PolynomialVariableLevelScaler(BaseVariableLevelScaler):
     """Polynomial scaling, (slope * variable_level)^2, yaxis shift by self.y_intercept."""

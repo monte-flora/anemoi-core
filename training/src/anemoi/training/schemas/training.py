@@ -157,6 +157,7 @@ class VariableLevelScalerTargets(str, Enum):
     linear_scaler = "anemoi.training.losses.scalers.LinearVariableLevelScaler"
     polynomial_sclaer = "anemoi.training.losses.scalers.PolynomialVariableLevelScaler"
     no_scaler = "anemoi.training.losses.scalers.NoVariableLevelScaler"
+    model_level_scaler = "anemoi.training.losses.scalers.ModelLevelReluVariableLevelScaler"
 
 
 class VariableLevelScalerSchema(BaseModel):
@@ -361,11 +362,14 @@ class BaseTrainingSchema(BaseModel):
 
 
 class ForecasterSchema(BaseTrainingSchema):
-    model_task: Literal["anemoi.training.train.tasks.GraphForecaster",] = Field(..., alias="model_task")
+    model_task: Literal["anemoi.training.train.tasks.GraphForecaster", 
+                        # Monte 7 Nov 2025: Added to accomodate 
+                        # the GraphResidualForecaster.
+                        "anemoi.training.train.tasks.GraphResidualForecaster"
+                       ] = Field(..., alias="model_task")
     "Training objective."
     rollout: Rollout = Field(default_factory=Rollout)
     "Rollout configuration."
-
 
 class ForecasterEnsSchema(ForecasterSchema):
     model_task: Literal["anemoi.training.train.tasks.GraphEnsForecaster",] = Field(..., alias="model_task")

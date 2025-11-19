@@ -17,7 +17,7 @@ from .variable_level import LinearVariableLevelScaler
 from .variable_level import NoVariableLevelScaler
 from .variable_level import PolynomialVariableLevelScaler
 from .variable_level import ReluVariableLevelScaler
-#from .variable_level import ModelLevelReluVariableLevelScaler
+from .variable_level import ModelLevelReluVariableLevelScaler
 from .variable_masking import VariableMaskingLossScaler
 from .variable_tendency import NoTendencyScaler
 from .variable_tendency import StdevTendencyScaler
@@ -32,7 +32,7 @@ __all__ = [
     "NoVariableLevelScaler",
     "PolynomialVariableLevelScaler",
     "ReluVariableLevelScaler",
-    #"ModelLevelReluVariableLevelScaler",
+    "ModelLevelReluVariableLevelScaler",
     "ReweightedGraphNodeAttributeScaler",
     "StdevTendencyScaler",
     "TensorDim",
