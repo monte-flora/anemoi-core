@@ -42,9 +42,9 @@ class InputNormalizer(BasePreprocessor):
             Data statistics dictionary
         """
         super().__init__(config, data_indices, statistics)
-
+                
         name_to_index_training_input = self.data_indices.data.input.name_to_index
-
+        
         minimum = statistics["minimum"]
         maximum = statistics["maximum"]
         mean = statistics["mean"]
@@ -58,6 +58,7 @@ class InputNormalizer(BasePreprocessor):
 
         # Two-step to avoid overwriting the original statistics in the loop (this reduces dependence on order)
         for idx, new_stats in statistics_remap.items():
+            LOGGER.info("Statistics remapping happened!")
             minimum[idx], maximum[idx], mean[idx], stdev[idx] = new_stats
 
         self._validate_normalization_inputs(name_to_index_training_input, minimum, maximum, mean, stdev)
@@ -69,7 +70,7 @@ class InputNormalizer(BasePreprocessor):
             method = self.methods.get(name, self.default)
 
             if method == "mean-std":
-                LOGGER.info(f"Normalizing: {name} is mean-std-normalised. {mean[i]:.4f} {stdev[i]:.4f}")
+                LOGGER.info(f"Normalizing: {name} is mean-std-normalised. {stdev[i]=:.5f} {mean[i]=:.5f}")
                 if stdev[i] < (mean[i] * 1e-6):
                     warnings.warn(f"Normalizing: the field seems to have only one value {mean[i]}")
                     
@@ -80,14 +81,14 @@ class InputNormalizer(BasePreprocessor):
                 _norm_add[i] = -mean[i] / stdev[i]
 
             elif method == "std":
-                LOGGER.debug(f"Normalizing: {name} is std-normalised.")
+                LOGGER.info(f"Normalizing: {name} is std-normalised.")
                 if stdev[i] < (mean[i] * 1e-6):
                     warnings.warn(f"Normalizing: the field seems to have only one value {mean[i]}")
                 _norm_mul[i] = 1 / stdev[i]
                 _norm_add[i] = 0
 
             elif method == "min-max":
-                LOGGER.debug(f"Normalizing: {name} is min-max-normalised to [0, 1].")
+                LOGGER.info(f"Normalizing: {name} is min-max-normalised to [0, 1].")
                 x = maximum[i] - minimum[i]
                 if x < 1e-9:
                     warnings.warn(f"Normalizing: the field {name} seems to have only one value {maximum[i]}.")
@@ -95,7 +96,7 @@ class InputNormalizer(BasePreprocessor):
                 _norm_add[i] = -minimum[i] / x
 
             elif method == "max":
-                LOGGER.debug(f"Normalizing: {name} is max-normalised to [0, 1].")
+                LOGGER.info(f"Normalizing: {name} is max-normalised to [0, 1]. max={maximum[i]}")
                 _norm_mul[i] = 1 / maximum[i]
 
             elif method == "none":

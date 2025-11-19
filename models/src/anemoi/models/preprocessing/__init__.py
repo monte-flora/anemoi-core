@@ -165,6 +165,7 @@ class Processors(nn.Module):
             processors = processors[::-1]
 
         self.processors = nn.ModuleDict(processors)
+        LOGGER.info(f"{self.processors=}")
 
     def __repr__(self) -> str:
         return f"{self.__class__.__name__} [{'inverse' if self.inverse else 'forward'}]({self.processors})"

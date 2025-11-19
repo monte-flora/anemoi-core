@@ -6,7 +6,7 @@
 # In applying this licence, ECMWF does not waive the privileges and immunities
 # granted to it by virtue of its status as an intergovernmental organisation
 # nor does it submit to any jurisdiction.
-
+import logging
 import uuid
 from typing import Optional
 
@@ -17,6 +17,11 @@ from torch_geometric.data import HeteroData
 
 from anemoi.models.preprocessing import Processors
 from anemoi.utils.config import DotDict
+
+from anemoi.models.preprocessing.residual_normalizer import ResidualNormalizer 
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 class AnemoiModelInterface(torch.nn.Module):
@@ -66,6 +71,7 @@ class AnemoiModelInterface(torch.nn.Module):
         truncation_data: dict,
     ) -> None:
         super().__init__()
+                
         self.config = config
         self.id = str(uuid.uuid4())
         self.multi_step = self.config.training.multistep_input
@@ -85,29 +91,36 @@ class AnemoiModelInterface(torch.nn.Module):
             [name, instantiate(processor, data_indices=self.data_indices, statistics=self.statistics)]
             for name, processor in self.config.data.processors.items()
         ]
-
+                    
         # Assign the processor list pre- and post-processors
         self.pre_processors = Processors(processors)
         self.post_processors = Processors(processors, inverse=True)
-
-        # If tendencies statistics are provided, instantiate the tendencies processors
-        '''
-        if self.statistics_tendencies is not None:
-            processors = [
-                [name, instantiate(processor, data_indices=self.data_indices, statistics=self.statistics_tendencies)]
-                for name, processor in self.config.data.processors.items()
-            ]
-            # Assign the processor list pre- and post-processors
-            self.pre_processors_tendencies = Processors(processors)
-            self.post_processors_tendencies = Processors(processors, inverse=True)
-        '''
         
+        # TODO: similar to the processors being initialized here, 
+        # the residual_normalizer should be a class attr of 
+        LOGGER.info(f"Initializing ResidualNormalizer...")
+        self.residual_normalizer = ResidualNormalizer(data_indices=self.data_indices, 
+                                                      statistics_tendencies=self.statistics_tendencies,
+                                                     )
+                
+        # Monte: deprecating this!               
+        # If tendencies statistics are provided, instantiate the tendencies processors
+        #if self.statistics_tendencies is not None:
+        #    processors = [
+        #        [name, instantiate(processor, data_indices=self.data_indices, statistics=self.statistics_tendencies)]
+        #        for name, processor in self.config.data.processors.items()
+        #    ]
+        #    # Assign the processor list pre- and post-processors
+        #    self.pre_processors_tendencies = Processors(processors)
+        #    self.post_processors_tendencies = Processors(processors, inverse=True)
+
         # Instantiate the model
         # Only pass _target_ and _convert_ from model config to avoid passing diffusion as kwarg
         model_instantiate_config = {
             "_target_": self.config.model.model._target_,
             "_convert_": getattr(self.config.model.model, "_convert_", "all"),
         }
+        
         self.model = instantiate(
             model_instantiate_config,
             model_config=self.config,
@@ -155,5 +168,9 @@ class AnemoiModelInterface(torch.nn.Module):
         if hasattr(self, "post_processors_tendencies"):
             predict_kwargs["post_processors_tendencies"] = self.post_processors_tendencies
 
+        # For the residual prediction
+        predict_kwargs["residual_normalizer"] = self.residual_normalizer
+        predict_kwargs["data_indices"] = self.data_indices 
+        
         # Delegate to the model's predict_step implementation with processors
         return self.model.predict_step(**predict_kwargs, **kwargs)
