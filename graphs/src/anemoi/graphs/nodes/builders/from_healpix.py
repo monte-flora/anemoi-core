@@ -81,11 +81,18 @@ class LimitedAreaHEALPixNodes(HEALPixNodes):
         margin_radius_km: float = 100.0,
     ) -> None:
 
+        # Init'ing the HealPixNodes class before 
+        # init'ing the area mask builder 
+        super().__init__(resolution, name)
         self.area_mask_builder = KNNAreaMaskBuilder(reference_node_name, margin_radius_km, mask_attr_name)
 
-        super().__init__(resolution, name)
+        LOGGER.info(f"__init__.{self.area_mask_builder=}")
+        
+        #super().__init__(resolution, name)
 
     def register_nodes(self, graph: HeteroData) -> None:
+        LOGGER.info(f"register_nodes.{self.area_mask_builder=}")
+        
         self.area_mask_builder.fit(graph)
         return super().register_nodes(graph)
 
