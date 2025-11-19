@@ -57,7 +57,7 @@ class EnsemblePlotMixin:
 
         # Return batch[0] (normalized data) and structured output like regular forecaster
         return batch[0] if isinstance(batch, list | tuple) else batch, [loss, y_preds]
-    
+
     def process(
         self,
         pl_module: pl.LightningModule,
@@ -244,12 +244,9 @@ class PlotEnsSample(EnsemblePerBatchPlotMixin, _PlotSample):
             for name in self.config.diagnostics.plot.parameters
         }
 
-        LOGGER.info(f"{plot_parameters_dict=}")
-        
+ 
         data, output_tensor = self.process(pl_module, outputs, batch, members=self.plot_members)
 
-        LOGGER.info(f"Tensor Shapes: {data.shape=} {output_tensor.shape=}")
-        
         local_rank = pl_module.local_rank
         for rollout_step in range(pl_module.rollout):
             fig = plot_predicted_ensemble(
@@ -286,11 +283,14 @@ class PlotLoss(_PlotLoss):
         batch: torch.Tensor,
         batch_idx: int,
     ) -> None:
+        
+        LOGGER.info(f"{batch.shape=}")
+        
         super().on_validation_batch_end(
             trainer,
             pl_module,
             outputs,
-            batch[0][:, :, 0, :, :],
+            batch[:, :, 0, :, :],
             batch_idx,
         )
 

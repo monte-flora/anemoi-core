@@ -91,6 +91,7 @@ class AnemoiModelInterface(torch.nn.Module):
         self.post_processors = Processors(processors, inverse=True)
 
         # If tendencies statistics are provided, instantiate the tendencies processors
+        '''
         if self.statistics_tendencies is not None:
             processors = [
                 [name, instantiate(processor, data_indices=self.data_indices, statistics=self.statistics_tendencies)]
@@ -99,7 +100,8 @@ class AnemoiModelInterface(torch.nn.Module):
             # Assign the processor list pre- and post-processors
             self.pre_processors_tendencies = Processors(processors)
             self.post_processors_tendencies = Processors(processors, inverse=True)
-
+        '''
+        
         # Instantiate the model
         # Only pass _target_ and _convert_ from model config to avoid passing diffusion as kwarg
         model_instantiate_config = {

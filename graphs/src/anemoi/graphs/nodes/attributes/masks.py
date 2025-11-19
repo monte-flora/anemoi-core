@@ -10,11 +10,13 @@
 
 import logging
 from abc import ABC
+from abc import abstractmethod
 
 import numpy as np
 import torch
 from torch_geometric.data.storage import NodeStorage
 
+from anemoi.datasets import open_dataset
 from anemoi.graphs.nodes.attributes.base_attributes import BooleanBaseNodeAttribute
 
 LOGGER = logging.getLogger(__name__)
@@ -42,9 +44,35 @@ class DatasetVariableMask(BooleanBaseNodeAttribute):
         return torch.from_numpy(mask)
 
 class NonmissingAnemoiDatasetVariable(BooleanBaseNodeAttribute):
-    """Mask of valid (not missing) values of a Anemoi dataset variable.
+    """Mask of valid (not missing) values of a Anemoi dataset variable."""
 
-    It reads a variable from a Anemoi dataset and returns a boolean mask of nonmissing values in the first timestep.
+class BaseAnemoiDatasetVariable(BooleanBaseNodeAttribute):
+    """Base class for computing mask based on a variable in an Anemoi dataset."""
+
+    def __init__(self, variable: str) -> None:
+        super().__init__()
+        self.variable = variable
+
+    @abstractmethod
+    def _get_mask(self, ds) -> np.ndarray: ...
+
+    def _read_data(self, nodes: NodeStorage, **kwargs) -> np.ndarray:
+        return open_dataset(nodes["_dataset"], select=self.variable)[0].squeeze()
+
+    def get_raw_values(self, nodes: NodeStorage, **kwargs) -> torch.Tensor:
+
+        assert nodes["node_type"] in [
+            "ZarrDatasetNodes",
+            "AnemoiDatasetNodes",
+        ], f"{self.__class__.__name__} can only be used with AnemoiDatasetNodes."
+        ds = self._read_data(nodes)
+        return torch.from_numpy(self._get_mask(ds))
+
+
+class NonmissingAnemoiDatasetVariable(BaseAnemoiDatasetVariable):
+    """Mask of valid (not missing) values of an Anemoi dataset variable.
+
+    It reads a variable from an Anemoi dataset and returns a boolean mask of nonmissing values in the first timestep.
 
     Attributes
     ----------
@@ -58,18 +86,35 @@ class NonmissingAnemoiDatasetVariable(BooleanBaseNodeAttribute):
     """
 
     def __init__(self, variable: str) -> None:
-        super().__init__()
+        super().__init__(variable)
         self.variable = variable
 
-    def get_raw_values(self, nodes: NodeStorage, **kwargs) -> torch.Tensor:
-        from anemoi.datasets import open_dataset
+    def _get_mask(self, ds) -> np.ndarray:
+        return ~np.isnan(ds)
 
-        assert nodes["node_type"] in [
-            "ZarrDatasetNodes",
-            "AnemoiDatasetNodes",
-        ], f"{self.__class__.__name__} can only be used with AnemoiDatasetNodes."
-        ds = open_dataset(nodes["_dataset"], select=self.variable)[0].squeeze()
-        return torch.from_numpy(~np.isnan(ds))
+
+class NonzeroAnemoiDatasetVariable(BaseAnemoiDatasetVariable):
+    """Mask of non-zero values of an Anemoi dataset variable.
+
+    Reads a variable from an Anemoi dataset and returns a boolean mask of non-zero values in the first timestep.
+
+    Attributes
+    ----------
+    variable : str
+        Variable to read from the Anemoi dataset.
+
+    Methods
+    -------
+    compute(self, graph, nodes_name)
+        Computer the attribute for each node.
+    """
+
+    def __init__(self, variable: str) -> None:
+        super().__init__(variable)
+        self.variable = variable
+
+    def _get_mask(self, ds) -> np.ndarray:
+        return ds != 0
 
 
 class BaseCombineAnemoiDatasetsMask(BooleanBaseNodeAttribute, ABC):
@@ -86,8 +131,9 @@ class BaseCombineAnemoiDatasetsMask(BooleanBaseNodeAttribute, ABC):
         from anemoi.datasets import open_dataset
 
         assert "_dataset" in nodes and isinstance(
-            nodes["_dataset"], dict
-        ), "The '_dataset' attribute must be a dictionary."
+            nodes["_dataset"], (dict, str)
+        ), "The '_dataset' attribute must be a dictionary or string."
+
         return open_dataset(nodes["_dataset"]).grids
 
     @staticmethod
@@ -140,3 +186,23 @@ class GridsMask(BaseCombineAnemoiDatasetsMask):
     def __init__(self, grids: int | list[int] = 0) -> None:
         self.grids = [grids] if isinstance(grids, int) else grids
         super().__init__()
+
+
+class LimitedAreaMask(BooleanBaseNodeAttribute):
+    """Limited area mask.
+
+    It adds a mask based on an area of interest. This mask is only defined
+    for nodes built with a subclass of `StretchedIcosahedronNodes`.
+
+    Methods
+    -------
+    compute(self, graph, nodes_name)
+        Compute the attribute for each node.
+    """
+
+    def get_raw_values(self, nodes: NodeStorage, **kwargs) -> torch.Tensor:
+        assert nodes["node_type"] in [
+            "StretchedTriNodes"
+        ], f"{self.__class__.__name__} can only be used with StretchedIcosahedronNodes."
+        lam_mask = nodes["_area_mask_builder"].get_mask(nodes.x)
+        return torch.from_numpy(lam_mask)
