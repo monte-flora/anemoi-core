@@ -73,6 +73,10 @@ class InputNormalizer(BasePreprocessor):
                 LOGGER.info(f"Normalizing: {name} is mean-std-normalised. {stdev[i]=:.5f} {mean[i]=:.5f}")
                 if stdev[i] < (mean[i] * 1e-6):
                     warnings.warn(f"Normalizing: the field seems to have only one value {mean[i]}")
+                    
+                if stdev[i] < 0.00000001:
+                    LOGGER.info(f"CAUTION CAUTION {name} {stdev[i]:.6f} has stdev of 0!!")
+                    
                 _norm_mul[i] = 1 / stdev[i]
                 _norm_add[i] = -mean[i] / stdev[i]
 

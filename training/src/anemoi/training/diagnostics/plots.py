@@ -325,6 +325,7 @@ def plot_histogram(
     y_true: np.ndarray,
     y_pred: np.ndarray,
     precip_and_related_fields: list | None = None,
+    log_scale: bool = False,
 ) -> Figure:
     """Plots histogram.
 
@@ -343,6 +344,8 @@ def plot_histogram(
         Predicted data of shape (lat*lon, nvar*level)
     precip_and_related_fields : list, optional
         List of precipitation-like variables, by default []
+    log_scale : bool, optional
+        Plot histograms with a log-scale, by default False
 
     Returns
     -------
@@ -394,6 +397,8 @@ def plot_histogram(
         ax[plot_idx].set_title(variable_name)
         ax[plot_idx].set_xlabel(variable_name)
         ax[plot_idx].set_ylabel("Density")
+        if log_scale:
+            ax[plot_idx].set_yscale("log")
         ax[plot_idx].legend()
         ax[plot_idx].set_aspect("auto", adjustable=None)
 
@@ -449,7 +454,8 @@ def plot_predicted_multilevel_flat_sample(
     n_plots_x, n_plots_y = len(parameters), n_plots_per_sample
 
     figsize = (n_plots_y * 4, n_plots_x * 3)
-    fig, ax = plt.subplots(n_plots_x, 
+
+    fig, axs = plt.subplots(n_plots_x, 
                            n_plots_y, 
                            figsize=figsize, 
                            layout=LAYOUT, 
@@ -475,39 +481,22 @@ def plot_predicted_multilevel_flat_sample(
             if key not in ["default", "error"] and variable_name in colormaps[key].variables:
                 cmap = colormaps[key].get_cmap()
                 continue
-        if n_plots_x > 1:
-            plot_flat_sample(
-                fig,
-                ax[plot_idx, :],
-                pc_lon,
-                pc_lat,
-                xt,
-                yt,
-                yp,
-                variable_name,
-                clevels,
-                datashader,
-                precip_and_related_fields,
-                cmap=cmap,
-                error_cmap=error_cmap,
-            )
-        else:
-            plot_flat_sample(
-                fig,
-                ax,
-                pc_lon,
-                pc_lat,
-                xt,
-                yt,
-                yp,
-                variable_name,
-                clevels,
-                datashader,
-                precip_and_related_fields,
-                cmap=cmap,
-                error_cmap=error_cmap,
-            )
-
+        ax = axs[plot_idx, :] if n_plots_x > 1 else axs
+        plot_flat_sample(
+            fig=fig,
+            ax=ax,
+            lon=pc_lon,
+            lat=pc_lat,
+            input_=xt,
+            truth=yt,
+            pred=yp,
+            vname=variable_name,
+            clevels=clevels,
+            datashader=datashader,
+            precip_and_related_fields=precip_and_related_fields,
+            cmap=cmap,
+            error_cmap=error_cmap,
+        )
     return fig
 
 
@@ -564,11 +553,11 @@ def plot_flat_sample(
     None
     """
     precip_and_related_fields = precip_and_related_fields or []
-    if vname in precip_and_related_fields and vname != 'composite_reflectivity':
+    if vname in precip_and_related_fields:
         # converting to mm from m
         truth *= 1000.0
         pred *= 1000.0
-        if sum(input_) != 0:
+        if np.nansum(input_) != 0:
             input_ *= 1000.0
             
     data = [None for _ in range(6)]
@@ -600,7 +589,6 @@ def plot_flat_sample(
     else:
         combined_data = np.concatenate((input_, truth, pred))
         # For 'errors', only persistence and increments need identical colorbar-limits
-
         norm = Normalize(vmin=np.nanmin(combined_data), vmax=np.nanmax(combined_data))
 
         norms[1] = norm
@@ -923,6 +911,43 @@ def plot_graph_edge_features(
 
     return fig
 
+
+def plot_rank_histograms(
+    parameters: dict[int, str],
+    rh: np.ndarray,
+) -> Figure:
+    """Plots one rank histogram per target variable.
+
+    Parameters
+    ----------
+    parameters : Dict[int, str]
+        Dictionary of target variables
+    rh : np.ndarray
+        Rank histogram data of shape (nens, nvar)
+
+    Returns
+    -------
+    Figure
+        The figure object handle.
+    """
+    fig, ax = plt.subplots(1, len(parameters), figsize=(len(parameters) * 4.5, 4))
+    n_ens = rh.shape[0] - 1
+    rh = rh.astype(float)
+
+    # Ensure ax is iterable
+    if not isinstance(ax, np.ndarray):
+        ax = np.array([ax])
+
+    for plot_idx, (_variable_idx, variable_name) in enumerate(parameters.items()):
+        rh_ = rh[:, plot_idx]
+        ax[plot_idx].bar(np.arange(0, n_ens + 1), rh_ / rh_.sum(), linewidth=1, color="blue", width=0.7)
+        ax[plot_idx].hlines(rh_.mean() / rh_.sum(), xmin=-0.5, xmax=n_ens + 0.5, linestyles="--", colors="red")
+        ax[plot_idx].set_title(f"{variable_name[0]} ranks")
+        _hide_axes_ticks(ax[plot_idx])
+
+    fig.tight_layout()
+    return fig
+
 def plot_predicted_ensemble(
     parameters: dict[int, str],
     n_plots_per_sample: int,
@@ -970,6 +995,7 @@ def plot_predicted_ensemble(
     LOGGER.debug("n_plots_x = %d, n_plots_y = %d", n_plots_x, n_plots_y)
 
     figsize = (n_plots_y * 4, n_plots_x * 3)
+
     fig, axs = plt.subplots(n_plots_x, 
                             n_plots_y, 
                             figsize=figsize,
@@ -1068,10 +1094,6 @@ def plot_ensemble_sample(
     -------
         None
     """
-    vmin=np.nanmin(truth.flatten()) 
-    vmax=np.nanmax(truth.flatten())
-    LOGGER.info(f"Truth values: {vname=} {vmin=} {vmax=} {truth.shape=}")
-    
     precip_and_related_fields = precip_and_related_fields if precip_and_related_fields is not None else []
     if vname in precip_and_related_fields:
         # converting to mm from m
@@ -1082,7 +1104,7 @@ def plot_ensemble_sample(
     else:
         combined_data = np.concatenate((truth.flatten(), pred_ens.flatten()))
         norm = Normalize(vmin=np.nanmin(combined_data), vmax=np.nanmax(combined_data))
-        
+
     if len(pred_ens.shape) == 2:
         nens = pred_ens.shape[ens_dim]
         ens_mean, ens_sd = pred_ens.mean(axis=ens_dim), pred_ens.std(axis=ens_dim)

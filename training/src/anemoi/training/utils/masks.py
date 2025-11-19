@@ -136,6 +136,22 @@ class Boolean1DMask(torch.nn.Module, BaseMask):
         torch.Tensor
             The updated predicted state tensor with boundary forcing applied.
         """
+        # ---------------------------------------------
+        # FIX: Ensure true_state ensemble dimension matches pred_state
+        # ---------------------------------------------
+        if true_state.size(1) != pred_state.size(1):
+            if true_state.size(1) == 1:
+                # Repeat the single-ens truth to match predicted ensemble dim
+                true_state = true_state.repeat(1, pred_state.size(1), 1, 1)
+            else:
+                raise RuntimeError(
+                    f"Cannot roll out boundaries: pred_state ensemble={pred_state.size(1)}, "
+                    f"true ensemble={true_state.size(1)} (true!=1)."
+                )
+
+        # ---------------------------------------------
+        # Apply boundary mask
+        # ---------------------------------------------
         pred_state[..., data_indices.model.input.prognostic] = self.apply(
             pred_state[..., data_indices.model.input.prognostic],
             dim=2,
@@ -144,6 +160,19 @@ class Boolean1DMask(torch.nn.Module, BaseMask):
         )
 
         return pred_state
+        
+        
+        
+        '''Original Anemoi code
+        pred_state[..., data_indices.model.input.prognostic] = self.apply(
+            pred_state[..., data_indices.model.input.prognostic],
+            dim=2,
+            fill_value=true_state[..., data_indices.data.output.prognostic],
+            grid_shard_slice=grid_shard_slice,
+        )
+
+        return pred_state
+        '''
 
 
 class NoOutputMask(BaseMask):
