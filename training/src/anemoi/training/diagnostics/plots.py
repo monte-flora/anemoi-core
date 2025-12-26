@@ -454,6 +454,7 @@ def plot_predicted_multilevel_flat_sample(
     n_plots_x, n_plots_y = len(parameters), n_plots_per_sample
 
     figsize = (n_plots_y * 4, n_plots_x * 3)
+    fig, axs = plt.subplots(n_plots_x, n_plots_y, figsize=figsize, layout=LAYOUT)
 
     fig, axs = plt.subplots(n_plots_x, 
                            n_plots_y, 

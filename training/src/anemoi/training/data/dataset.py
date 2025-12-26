@@ -61,16 +61,11 @@ class NativeGridDataset(IterableDataset):
         num_gpus_per_model : int, optional
             Number of GPUs per model, by default 1
         """
-        self.label = label
-
         self.data = data_reader
-
         self.timestep = timestep
         self.grid_indices = grid_indices
-
-        # lazy init
-        self.n_samples_per_epoch_total: int = 0
-        self.n_samples_per_epoch_per_worker: int = 0
+        self.label = label
+        self.relative_date_indices = relative_date_indices  # relative index of dates to extract
 
         self.num_gpus_per_ens = num_gpus_per_ens
         self.num_gpus_per_model = num_gpus_per_model
@@ -95,13 +90,6 @@ class NativeGridDataset(IterableDataset):
         self.n_samples_per_worker = 0
         self.chunk_index_range: np.ndarray | None = None
         self.shuffle = shuffle
-
-        # Data dimensions
-        self.ensemble_dim: int = 2
-        self.ensemble_size = self.data.shape[self.ensemble_dim]
-
-        # relative index of dates to extract
-        self.relative_date_indices = relative_date_indices
 
     @cached_property
     def statistics(self) -> dict:
