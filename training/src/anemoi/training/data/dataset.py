@@ -310,7 +310,7 @@ class NativeGridDataset(IterableDataset):
             shuffled_chunk_indices[:10],
         )
 
-        for i in shuffled_chunk_indices:
+        for sample_count, i in enumerate(shuffled_chunk_indices):
             start = i + self.relative_date_indices[0]
             end = i + self.relative_date_indices[-1] + 1
             timeincrement = self.relative_date_indices[1] - self.relative_date_indices[0]

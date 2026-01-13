@@ -9,7 +9,6 @@
 
 
 import logging
-import warnings
 from typing import Optional
 
 import numpy as np
@@ -26,34 +25,27 @@ class ResidualNormalizer(BasePreprocessor):
     Δx_norm = (y_true - x_last) / std_tendency
     """
 
-    def __init__(self, data_indices: IndexCollection, statistics_tendencies: dict):
+    def __init__(self, data_indices: IndexCollection, statistics_tendencies: dict, min_stdev: float = 1e-8):
         # Passing an empty dict for the config
         super().__init__({}, data_indices, statistics_tendencies)
-        
+
+        self.min_stdev = min_stdev
         name_to_index_training_input = self.data_indices.data.input.name_to_index
 
         stddev_tendency = statistics_tendencies["stdev"]
-        
-        # Copied it over from the InputNormalizer, but I likely won't use it. 
-        # Optionally reuse statistic of one variable for another variable
-        #statistics_remap = {}
-        #for remap, source in self.remap.items():
-        #    idx_src, idx_remap = name_to_index_training_input[source], name_to_index_training_input[remap]
-        #    statistics_remap[idx_remap] = stdev_tendency[idx_src]
 
-        # Two-step to avoid overwriting the original statistics in the loop (this reduces dependence on order)
-        #for idx, new_stats in statistics_remap.items():
-        #    LOGGER.info("Statistics remapping happened!")
-        #    stdev_tendency[idx] = new_stats
-        
-        # For the default, we want =1 for the division. 
-        # Otherwise, use the stored stdevs for the prognostic variables. 
-        _stdev = np.ones((stddev_tendency.size,), dtype=np.float32)        
+        # For the default, we want =1 for the division.
+        # Otherwise, use the stored stdevs for the prognostic variables.
+        _stdev = np.ones((stddev_tendency.size,), dtype=np.float32)
         for name, i in name_to_index_training_input.items():
             if i in self.data_indices.data.output.full:
-                _stdev[i] = stddev_tendency[i]
-                
-            LOGGER.info(f"Residual Normalization for {name} : {_stdev[i]:.5f}")
+                stdev_val = stddev_tendency[i]
+                # Apply minimum threshold to prevent division by very small numbers
+                if stdev_val < min_stdev:
+                    LOGGER.warning(f"ResidualNormalizer: {name} (idx={i}) has very small stdev={stdev_val:.10f}, "
+                                   f"clipping to {min_stdev}")
+                    stdev_val = min_stdev
+                _stdev[i] = stdev_val
 
         # register as buffers so they move automatically with the model
         self.register_buffer("_std_tendency", torch.from_numpy(_stdev), persistent=True)
@@ -89,3 +81,48 @@ class ResidualNormalizer(BasePreprocessor):
         # last timestep. 
         Δx_phys = Δx_norm * self._std_tendency[self._prog_idx]
         return x_last + Δx_phys
+
+    def transform_from_normalized(
+        self,
+        x_last_norm: torch.Tensor,
+        y_true_norm: torch.Tensor,
+        norm_mul: torch.Tensor,
+        in_place: bool = True,
+    ) -> torch.Tensor:
+        """Compute normalized residual directly from normalized inputs."""
+        if not in_place:
+            y_true_norm = y_true_norm.clone()
+
+        Δx_norm = y_true_norm.sub_(x_last_norm)
+        Δx_norm.div_(norm_mul[self._prog_idx] * self._std_tendency[self._prog_idx])
+        return Δx_norm
+
+    def inverse_transform_to_normalized(
+        self,
+        x_last_norm: torch.Tensor,
+        Δx_norm: torch.Tensor,
+        norm_mul: torch.Tensor,
+        in_place: bool = True,
+    ) -> torch.Tensor:
+        """Reconstruct next state in normalized space."""
+        if not in_place:
+            Δx_norm = Δx_norm.clone()
+
+        Δx_norm.mul_(self._std_tendency[self._prog_idx] * norm_mul[self._prog_idx])
+        return x_last_norm + Δx_norm
+
+    def inverse_transform_physical_from_normalized(
+        self,
+        x_last_norm: torch.Tensor,
+        Δx_norm: torch.Tensor,
+        norm_mul: torch.Tensor,
+        norm_add: torch.Tensor,
+        in_place: bool = True,
+    ) -> torch.Tensor:
+        """Reconstruct next state in physical space from normalized inputs."""
+        if not in_place:
+            Δx_norm = Δx_norm.clone()
+
+        Δx_phys = Δx_norm.mul(self._std_tendency[self._prog_idx])
+        x_last_phys = (x_last_norm - norm_add[self._prog_idx]) / norm_mul[self._prog_idx]
+        return x_last_phys + Δx_phys
