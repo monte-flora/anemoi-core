@@ -243,6 +243,8 @@ class ImplementedLossesUsingBaseLossSchema(str, Enum):
     graphcast_clipped_mse = "anemoi.training.losses.GraphCastClippedMSELoss"
     graphcast_pseudo_huber = "anemoi.training.losses.GraphCastPseudoHuberLoss"
     graphcast_gaussian_nll = "anemoi.training.losses.GraphCastGaussianNLLLoss"
+    fcl = "anemoi.training.losses.spectral.FourierCorrelationLoss"
+    lsd = "anemoi.training.losses.spectral.LogSpectralDistance"
 
 
 class BaseLossSchema(BaseModel):
@@ -286,6 +288,18 @@ class MultiScaleLossSchema(BaseModel):
 class HuberLossSchema(BaseLossSchema):
     delta: float = 1.0
     "Threshold for Huber loss."
+
+
+class SpectralLossSchema(BaseLossSchema):
+    """Spectral loss class (upstream consolidated module)."""
+
+    transform: Literal["fft2d", "sht"] = Field(..., example="fft2d")
+    """Type of spectral transform to use."""
+
+    class Config(BaseModel.Config):
+        """Override to allow extra parameters for spectral transforms."""
+
+        extra = "allow"
 
 
 class LogFFT2DistanceSchema(BaseLossSchema):
@@ -444,8 +458,9 @@ class CombinedLossSchema(BaseLossSchema):
         | FourierCorrelationLossSchema
         | SpectralAmplitudeLossSchema
         | SpatialGradientLossSchema
+        | SpectralLossSchema
     ] = Field(min_length=1)
-    "Losses to combine, can be any of the normal losses or a spatial loss (LogFFT2Distance, FourierCorrelation, SpectralAmplitude/MSH, SpatialGradient)."
+    "Losses to combine, can be any of the normal losses or a spatial/spectral loss."
     loss_weights: list[int | float] | None = None
     "Weightings of losses, if not set, all losses are weighted equally."
 
@@ -477,6 +492,7 @@ LossSchemas = (
     | CombinedLossSchema
     | AlmostFairKernelCRPSSchema
     | KernelCRPSSchema
+    | SpectralLossSchema
     | MultiScaleLossSchema
     | GraphCastMSELossSchema
     | GraphCastHuberLossSchema
