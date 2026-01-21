@@ -8,6 +8,7 @@
 # nor does it submit to any jurisdiction.
 
 from .combined import CombinedLoss
+from .graphcast_gaussian_nll import GraphCastGaussianNLLLoss
 from .graphcast_huber import GraphCastHuberLoss
 from .graphcast_logcosh import GraphCastLogCoshLoss
 from .graphcast_mse import GraphCastMSELoss
@@ -26,6 +27,7 @@ from .weighted_mse import WeightedMSELoss
 __all__ = [
     "AlmostFairKernelCRPS",
     "CombinedLoss",
+    "GraphCastGaussianNLLLoss",
     "GraphCastHuberLoss",
     "GraphCastLogCoshLoss",
     "GraphCastMSELoss",
