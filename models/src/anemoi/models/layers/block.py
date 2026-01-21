@@ -29,6 +29,7 @@ from anemoi.models.distributed.graph import sync_tensor
 from anemoi.models.distributed.khop_edges import sort_edges_1hop_chunks
 from anemoi.models.distributed.transformer import shard_heads
 from anemoi.models.distributed.transformer import shard_sequence
+from anemoi.models.layers.attention import BandedGraphSelfAttention
 from anemoi.models.layers.attention import MultiHeadCrossAttention
 from anemoi.models.layers.attention import MultiHeadSelfAttention
 from anemoi.models.layers.conv import GraphConv
@@ -158,6 +159,87 @@ class TransformerProcessorBlock(BaseBlock):
 
         x = x + self.attention(
             self.layer_norm_attention(x, **cond_kwargs), shapes, batch_size, model_comm_group=model_comm_group
+        )
+        x = x + self.mlp(
+            self.layer_norm_mlp(
+                x,
+                **cond_kwargs,
+            )
+        )
+        return (x,)
+
+
+class BandedTransformerProcessorBlock(BaseBlock):
+    """Transformer block with BandedGraphSelfAttention for sparse graph-aware attention.
+
+    This block uses RCM permutation to reorder nodes so that graph neighbors are
+    adjacent in sequence space, enabling efficient windowed attention that
+    approximates k-hop graph attention.
+    """
+
+    def __init__(
+        self,
+        *,
+        num_channels: int,
+        hidden_dim: int,
+        num_heads: int,
+        window_size: int,
+        layer_kernels: DotDict,
+        dropout_p: float = 0.0,
+        qk_norm: bool = False,
+        attention_implementation: str = "flash_attention",
+        softcap: Optional[float] = None,
+        use_alibi_slopes: bool = False,
+        use_rotary_embeddings: bool = False,
+    ):
+        super().__init__()
+
+        self.layer_norm_attention = layer_kernels.LayerNorm(normalized_shape=num_channels)
+        self.layer_norm_mlp = layer_kernels.LayerNorm(normalized_shape=num_channels)
+
+        self.attention = BandedGraphSelfAttention(
+            num_heads=num_heads,
+            embed_dim=num_channels,
+            window_size=window_size,
+            qkv_bias=False,
+            is_causal=False,
+            qk_norm=qk_norm,
+            dropout_p=dropout_p,
+            layer_kernels=layer_kernels,
+            attention_implementation=attention_implementation,
+            softcap=softcap,
+            use_alibi_slopes=use_alibi_slopes,
+            use_rotary_embeddings=use_rotary_embeddings,
+        )
+
+        self.mlp = nn.Sequential(
+            layer_kernels.Linear(num_channels, hidden_dim),
+            layer_kernels.Activation(),
+            layer_kernels.Linear(hidden_dim, num_channels),
+        )
+
+    def forward(
+        self,
+        x: Tensor,
+        shapes: list,
+        batch_size: int,
+        model_comm_group: Optional[ProcessGroup] = None,
+        perm: Optional[Tensor] = None,
+        inv_perm: Optional[Tensor] = None,
+        cond: Optional[Tensor] = None,
+        **layer_kwargs,
+    ) -> tuple[Tensor]:
+
+        # In case we have conditionings we pass these to the layer norm
+        cond_kwargs = {"cond": cond} if cond is not None else {}
+
+        x = x + self.attention(
+            self.layer_norm_attention(x, **cond_kwargs),
+            shapes,
+            batch_size,
+            perm=perm,
+            inv_perm=inv_perm,
+            model_comm_group=model_comm_group,
         )
         x = x + self.mlp(
             self.layer_norm_mlp(

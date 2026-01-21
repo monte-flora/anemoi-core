@@ -129,7 +129,11 @@ class BaseImputer(BasePreprocessor, ABC):
         torch.Tensor
             Tensor with NaN locations of shape (batch, time, ..., grid)
         """
-        idx = [slice(None), slice(None)] + [0] * (x.ndim - 4) + [slice(None), slice(None)]
+        idx = (
+         (slice(None), slice(None)) +
+         (0,) * (x.ndim - 4) +
+         (slice(None), slice(None))
+        )
         return torch.isnan(x[idx])
 
     def _expand_subset_mask(self, x: torch.Tensor, idx_src: int, nan_locations: torch.Tensor) -> torch.Tensor:
@@ -156,6 +160,7 @@ class BaseImputer(BasePreprocessor, ABC):
 
         return nan_locations[..., idx_src].expand(-1, *x.shape[1:-2], -1)
 
+    '''
     def fill_with_value(
         self, x: torch.Tensor, index_x: list[int], nan_locations: torch.Tensor, index_nl: list[int]
     ) -> torch.Tensor:
@@ -181,6 +186,28 @@ class BaseImputer(BasePreprocessor, ABC):
         for idx_src, (idx_dst, value) in zip(index_nl, zip(index_x, self.replacement)):
             if idx_src is not None and idx_dst is not None:
                 x[..., idx_dst][nan_locations[..., idx_src]] = value
+        return x
+    '''
+    def fill_with_value(self, x, index_x, nan_locations, index_nl):
+        # Expand nan_locations to match x up to (grid, var)
+        mask = nan_locations
+        for _ in x.shape[2:-2]:
+            mask = mask.unsqueeze(2)
+
+        for idx_src, (idx_dst, value) in zip(index_nl, zip(index_x, self.replacement)):
+            if idx_src is None or idx_dst is None:
+                continue
+
+            # pick mask for this source variable
+            m = mask[..., idx_src]  # shape like x[..., idx_dst]
+
+            # scalar tensor on right device/dtype
+            v = torch.as_tensor(value, device=x.device, dtype=x.dtype)
+
+            # overwrite destination slice safely
+            x_dst = x[..., idx_dst]
+            x[..., idx_dst] = torch.where(m, v, x_dst)
+
         return x
 
     def transform(self, x: torch.Tensor, in_place: bool = True) -> torch.Tensor:

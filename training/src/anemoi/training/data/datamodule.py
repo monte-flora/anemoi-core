@@ -233,8 +233,8 @@ class AnemoiDatasetsDataModule(pl.LightningDataModule):
             shuffle=shuffle,
             grid_indices=self.grid_indices,
             label=label,
-            num_gpus_per_ens=getattr(self.config.hardware, "num_gpus_per_ensemble", 1),
-            num_gpus_per_model=self.config.hardware.num_gpus_per_model,
+            #num_gpus_per_ens=getattr(self.config.system.hardware, "num_gpus_per_ensemble", 1),
+            #num_gpus_per_model=self.config.system.hardware.num_gpus_per_model,
         )
 
     def _get_dataloader(self, ds: NativeGridDataset, stage: str) -> DataLoader:
@@ -258,6 +258,7 @@ class AnemoiDatasetsDataModule(pl.LightningDataModule):
         return self._get_dataloader(self.ds_train, "training")
 
     def val_dataloader(self) -> DataLoader:
+        LOGGER.warning("val_dataloader CALLED")
         return self._get_dataloader(self.ds_valid, "validation")
 
     def test_dataloader(self) -> DataLoader:

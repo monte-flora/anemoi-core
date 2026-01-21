@@ -22,6 +22,8 @@ from anemoi.models.distributed.graph import shard_tensor
 from anemoi.models.distributed.khop_edges import sort_edges_1hop_sharding
 from anemoi.models.distributed.shapes import change_channels_in_shape
 from anemoi.models.distributed.shapes import get_shard_shapes
+from anemoi.models.layers.attention import compute_banded_permutation
+from anemoi.models.layers.block import BandedTransformerProcessorBlock
 from anemoi.models.layers.block import GraphConvProcessorBlock
 from anemoi.models.layers.block import GraphTransformerProcessorBlock
 from anemoi.models.layers.block import PointWiseMLPProcessorBlock
@@ -271,6 +273,150 @@ class TransformerProcessor(BaseProcessor):
             ), "Only batch size of 1 is supported when model is sharded accross GPUs"
 
         (x,) = self.run_layers((x,), shape_nodes, batch_size, model_comm_group=model_comm_group, **kwargs)
+
+        return x
+
+
+class BandedTransformerProcessor(GraphEdgeMixin, BaseProcessor):
+    """Banded Transformer Processor with graph-aware sparse attention.
+
+    This processor uses the Reverse Cuthill-McKee (RCM) algorithm to reorder
+    graph nodes so that neighbors are adjacent in sequence space. Combined with
+    windowed flash attention, this approximates k-hop graph attention efficiently.
+
+    The permutation is computed once during initialization based on the graph
+    topology and reused for all forward passes.
+    """
+
+    def __init__(
+        self,
+        *,
+        num_layers: int,
+        num_channels: int,
+        num_chunks: int,
+        num_heads: int,
+        mlp_hidden_ratio: int,
+        src_grid_size: int,
+        dst_grid_size: int,
+        sub_graph: HeteroData,
+        sub_graph_edge_attributes: list[str],
+        trainable_size: int = 8,
+        qk_norm: bool = False,
+        dropout_p: float = 0.0,
+        attention_implementation: str = "flash_attention",
+        softcap: float = 0,
+        use_alibi_slopes: bool = False,
+        window_size: Optional[int] = None,
+        cpu_offload: bool = False,
+        layer_kernels: DotDict,
+        **kwargs,
+    ) -> None:
+        """Initialize BandedTransformerProcessor.
+
+        Parameters
+        ----------
+        num_layers : int
+            Number of layers
+        num_channels : int
+            Number of channels
+        num_chunks : int
+            Number of chunks in processor
+        num_heads : int
+            Number of heads in transformer
+        mlp_hidden_ratio : int
+            Ratio of mlp hidden dimension to embedding dimension
+        src_grid_size : int
+            Source grid size (number of nodes)
+        dst_grid_size : int
+            Destination grid size (number of nodes)
+        sub_graph : HeteroData
+            Graph containing edge topology for computing RCM permutation
+        sub_graph_edge_attributes : list[str]
+            Edge attributes (not used but kept for API consistency)
+        trainable_size : int
+            Size of trainable tensor (not used but kept for API consistency)
+        qk_norm : bool, optional
+            Normalize query and key, by default False
+        dropout_p : float, optional
+            Dropout probability, by default 0.0
+        attention_implementation : str
+            Attention implementation ("flash_attention" or "scaled_dot_product_attention")
+        softcap : float, optional
+            Softcapping for flash attention, by default 0
+        use_alibi_slopes : bool
+            Use ALiBi slopes, by default False
+        window_size : int, optional
+            Window size for windowed attention. Should be >= k-hop bandwidth after RCM.
+        cpu_offload : bool
+            Whether to offload processing to CPU, by default False
+        layer_kernels : DotDict
+            Layer kernel implementations
+        """
+        super().__init__(
+            num_layers=num_layers,
+            num_channels=num_channels,
+            window_size=window_size,
+            num_chunks=num_chunks,
+            cpu_offload=cpu_offload,
+            num_heads=num_heads,
+            mlp_hidden_ratio=mlp_hidden_ratio,
+            layer_kernels=layer_kernels,
+            dropout_p=dropout_p,
+        )
+
+        # Register edges from graph (we only need edge_index for permutation)
+        self._register_edges(sub_graph, sub_graph_edge_attributes, src_grid_size, dst_grid_size, trainable_size)
+
+        # Compute RCM permutation once based on graph topology
+        # edge_index_base is (2, num_edges) tensor
+        self.num_nodes = src_grid_size  # For processor, src == dst
+        perm, inv_perm = compute_banded_permutation(self.edge_index_base, self.num_nodes)
+
+        # Register as buffers so they're saved with the model and moved to correct device
+        self.register_buffer("perm", perm)
+        self.register_buffer("inv_perm", inv_perm)
+
+        self.build_layers(
+            BandedTransformerProcessorBlock,
+            num_channels=num_channels,
+            hidden_dim=(mlp_hidden_ratio * num_channels),
+            num_heads=num_heads,
+            qk_norm=qk_norm,
+            window_size=window_size,
+            layer_kernels=self.layer_factory,
+            dropout_p=dropout_p,
+            attention_implementation=attention_implementation,
+            softcap=softcap,
+            use_alibi_slopes=use_alibi_slopes,
+        )
+
+        self.offload_layers(cpu_offload)
+
+    def forward(
+        self,
+        x: Tensor,
+        batch_size: int,
+        shard_shapes: list[list[int]],
+        model_comm_group: Optional[ProcessGroup] = None,
+        *args,
+        **kwargs,
+    ) -> Tensor:
+        shape_nodes = change_channels_in_shape(shard_shapes, self.num_channels)
+        if model_comm_group:
+            assert (
+                model_comm_group.size() == 1 or batch_size == 1
+            ), "Only batch size of 1 is supported when model is sharded across GPUs"
+
+        # Pass permutation tensors to layers
+        (x,) = self.run_layers(
+            (x,),
+            shape_nodes,
+            batch_size,
+            model_comm_group=model_comm_group,
+            perm=self.perm,
+            inv_perm=self.inv_perm,
+            **kwargs,
+        )
 
         return x
 

@@ -222,6 +222,9 @@ class ImplementedLossesUsingBaseLossSchema(str, Enum):
     huber = "anemoi.training.losses.HuberLoss"
     rmse_norm = "anemoi.training.losses.RMSELossNormalized"
     combined = "anemoi.training.losses.combined.CombinedLoss"
+    graphcast_mse = "anemoi.training.losses.GraphCastMSELoss"
+    graphcast_huber = "anemoi.training.losses.GraphCastHuberLoss"
+    graphcast_logcosh = "anemoi.training.losses.GraphCastLogCoshLoss"
 
 
 class BaseLossSchema(BaseModel):
@@ -267,6 +270,41 @@ class HuberLossSchema(BaseLossSchema):
     "Threshold for Huber loss."
 
 
+class GraphCastMSELossSchema(BaseLossSchema):
+    """Schema for GraphCast-style MSE loss with sample weighting."""
+
+    sample_weighting: bool = False
+    "If True, downweight samples with extreme target values."
+    sample_weight_threshold: float = 10.0
+    "Target magnitude threshold for weighting."
+    sample_weight_min: float = 0.01
+    "Minimum weight for extreme samples."
+
+
+class GraphCastHuberLossSchema(BaseLossSchema):
+    """Schema for GraphCast-style Huber loss with sample weighting."""
+
+    delta: float = 1.0
+    "Threshold for switching from quadratic to linear loss."
+    sample_weighting: bool = False
+    "If True, downweight samples with extreme target values."
+    sample_weight_threshold: float = 10.0
+    "Target magnitude threshold for weighting."
+    sample_weight_min: float = 0.01
+    "Minimum weight for extreme samples."
+
+
+class GraphCastLogCoshLossSchema(BaseLossSchema):
+    """Schema for GraphCast-style LogCosh loss with sample weighting."""
+
+    sample_weighting: bool = False
+    "If True, downweight samples with extreme target values."
+    sample_weight_threshold: float = 10.0
+    "Target magnitude threshold for weighting."
+    sample_weight_min: float = 0.01
+    "Minimum weight for extreme samples."
+
+
 class CombinedLossSchema(BaseLossSchema):
     losses: list[BaseLossSchema] = Field(min_length=1)
     "Losses to combine, can be any of the normal losses."
@@ -302,6 +340,9 @@ LossSchemas = (
     | AlmostFairKernelCRPSSchema
     | KernelCRPSSchema
     | MultiScaleLossSchema
+    | GraphCastMSELossSchema
+    | GraphCastHuberLossSchema
+    | GraphCastLogCoshLossSchema
 )
 
 

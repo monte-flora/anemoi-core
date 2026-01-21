@@ -15,6 +15,7 @@ from .builders.icon import ICONTopologicalEncoderEdges
 from .builders.icon import ICONTopologicalProcessorEdges
 from .builders.knn import KNNEdges
 from .builders.knn import ReversedKNNEdges
+from .builders.mpas import MPASTopologicalEdges
 from .builders.multi_scale import MultiScaleEdges
 
 __all__ = [
@@ -27,4 +28,5 @@ __all__ = [
     "ICONTopologicalProcessorEdges",
     "ICONTopologicalEncoderEdges",
     "ICONTopologicalDecoderEdges",
+    "MPASTopologicalEdges",
 ]

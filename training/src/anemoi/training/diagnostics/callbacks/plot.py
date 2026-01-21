@@ -923,6 +923,12 @@ class PlotLoss(BasePerBatchPlotCallback):
                 RuntimeWarning,
             )
 
+        # Check if this is a GraphCast-style loss (returns grouped losses)
+        is_graphcast_loss = (
+            hasattr(self.loss, "variable_groups")
+            and self.loss.variable_groups is not None
+        )
+
         for rollout_step in range(output_times[0]):
             y_hat = outputs[1][rollout_step]
             y_true = batch[
@@ -932,9 +938,40 @@ class PlotLoss(BasePerBatchPlotCallback):
                 pl_module.data_indices.data.output.full,
             ]
             loss = reduce_to_last_dim(self.loss(y_hat, y_true, squash=False).detach().cpu().numpy())
-            sort_by_parameter_group, colors, xticks, legend_patches = self.sort_and_color_by_parameter_group
-            loss = loss[argsort_indices]
-            fig = plot_loss(loss[sort_by_parameter_group], colors, xticks, legend_patches)
+
+            if is_graphcast_loss:
+                # GraphCast loss returns per-group losses, not per-variable
+                # Use simple bar plot with group names
+                group_names = list(self.loss.variable_groups.keys())
+                n_groups = len(group_names)
+
+                if len(loss) != n_groups:
+                    LOGGER.warning(
+                        "GraphCast loss shape %s does not match variable groups %d. Skipping plot.",
+                        loss.shape,
+                        n_groups,
+                    )
+                    continue
+
+                fig, ax = plt.subplots(figsize=(max(10, n_groups * 0.5), 6))
+                sort_idx = np.argsort(group_names)
+                sorted_names = [group_names[i] for i in sort_idx]
+                sorted_loss = loss[sort_idx]
+
+                cmap = plt.cm.get_cmap("tab20", n_groups)
+                colors = [cmap(i) for i in range(n_groups)]
+                ax.bar(range(n_groups), sorted_loss, color=colors)
+                ax.set_xticks(range(n_groups))
+                ax.set_xticklabels(sorted_names, rotation=45, ha="right", fontsize=8)
+                ax.set_ylabel("Loss (per variable group)")
+                ax.set_title(f"Loss by Variable Group - Step {rollout_step}")
+                ax.set_yscale("log")
+                plt.tight_layout()
+            else:
+                # Standard per-variable loss plotting
+                sort_by_parameter_group, colors, xticks, legend_patches = self.sort_and_color_by_parameter_group
+                loss = loss[argsort_indices]
+                fig = plot_loss(loss[sort_by_parameter_group], colors, xticks, legend_patches)
 
             self._output_figure(
                 logger,
@@ -958,6 +995,146 @@ class PlotLoss(BasePerBatchPlotCallback):
             self.loss = copy.deepcopy(pl_module.loss)
 
             # gather nan-mask weight shards, don't gather if constant in grid dimension (broadcastable)
+            if (
+                hasattr(self.loss.scaler, "nan_mask_weights")
+                and self.loss.scaler.nan_mask_weights.shape[pl_module.grid_dim] != 1
+            ):
+                self.loss.scaler.nan_mask_weights = pl_module.allgather_batch(self.loss.scaler.nan_mask_weights)
+
+            super().on_validation_batch_end(
+                trainer,
+                pl_module,
+                output,
+                batch,
+                batch_idx,
+            )
+
+
+class PlotGraphCastLoss(BasePerBatchPlotCallback):
+    """Plots per-variable-group loss for GraphCast-style losses.
+
+    This callback is designed for use with GraphCastMSELoss and other losses
+    that return per-variable-group losses (grouped by base variable name)
+    rather than per-flat-variable losses.
+    """
+
+    def __init__(
+        self,
+        config: OmegaConf,
+        every_n_batches: int | None = None,
+    ) -> None:
+        """Initialize the PlotGraphCastLoss callback.
+
+        Parameters
+        ----------
+        config : OmegaConf
+            Object with configuration settings
+        every_n_batches : int, optional
+            Override for batch frequency, by default None
+        """
+        super().__init__(config, every_n_batches=every_n_batches)
+        self.group_names = None
+
+    @rank_zero_only
+    def _plot(
+        self,
+        trainer: pl.Trainer,
+        pl_module: pl.LightningModule,
+        outputs: list[torch.Tensor],
+        batch: torch.Tensor,
+        batch_idx: int,
+        epoch: int,
+        output_times: tuple,
+    ) -> None:
+        logger = trainer.logger
+        _ = batch_idx
+
+        # Get variable group names from the loss function
+        if hasattr(self.loss, "variable_groups") and self.loss.variable_groups is not None:
+            self.group_names = list(self.loss.variable_groups.keys())
+        else:
+            LOGGER.warning(
+                "Loss function does not have variable_groups attribute. "
+                "PlotGraphCastLoss requires a GraphCast-style loss function."
+            )
+            return
+
+        n_groups = len(self.group_names)
+
+        for rollout_step in range(output_times[0]):
+            y_hat = outputs[1][rollout_step]
+            y_true = batch[
+                :,
+                pl_module.multi_step + rollout_step,
+                ...,
+                pl_module.data_indices.data.output.full,
+            ]
+
+            # Get per-group losses (shape: n_groups)
+            loss = reduce_to_last_dim(self.loss(y_hat, y_true, squash=False).detach().cpu().numpy())
+
+            if len(loss) != n_groups:
+                LOGGER.warning(
+                    f"Loss shape {loss.shape} does not match number of variable groups {n_groups}. "
+                    "Skipping plot."
+                )
+                return
+
+            # Create bar plot for grouped losses
+            fig, ax = plt.subplots(figsize=(max(10, n_groups * 0.5), 6))
+
+            # Sort groups alphabetically for consistent ordering
+            sort_idx = np.argsort(self.group_names)
+            sorted_names = [self.group_names[i] for i in sort_idx]
+            sorted_loss = loss[sort_idx]
+
+            # Create color map
+            cmap = plt.cm.get_cmap("tab20", n_groups)
+            colors = [cmap(i) for i in range(n_groups)]
+
+            bars = ax.bar(range(n_groups), sorted_loss, color=colors)
+
+            ax.set_xticks(range(n_groups))
+            ax.set_xticklabels(sorted_names, rotation=45, ha="right", fontsize=8)
+            ax.set_ylabel("Loss (per variable group)")
+            ax.set_title(f"GraphCast Loss by Variable Group - Step {rollout_step}")
+            ax.set_yscale("log")
+
+            # Add value labels on bars
+            for bar, val in zip(bars, sorted_loss):
+                ax.annotate(
+                    f"{val:.2e}",
+                    xy=(bar.get_x() + bar.get_width() / 2, bar.get_height()),
+                    xytext=(0, 3),
+                    textcoords="offset points",
+                    ha="center",
+                    va="bottom",
+                    fontsize=6,
+                    rotation=90,
+                )
+
+            plt.tight_layout()
+
+            self._output_figure(
+                logger,
+                fig,
+                epoch=epoch,
+                tag=f"graphcast_loss_step{rollout_step:02d}_rank{pl_module.local_rank:01d}",
+                exp_log_tag=f"graphcast_loss_sample_step{rollout_step:02d}_rank{pl_module.local_rank:01d}",
+            )
+
+    def on_validation_batch_end(
+        self,
+        trainer: pl.Trainer,
+        pl_module: pl.LightningModule,
+        output: list[torch.Tensor],
+        batch: torch.Tensor,
+        batch_idx: int,
+    ) -> None:
+        if batch_idx % self.every_n_batches == 0:
+            self.loss = copy.deepcopy(pl_module.loss)
+
+            # Gather nan-mask weight shards if needed
             if (
                 hasattr(self.loss.scaler, "nan_mask_weights")
                 and self.loss.scaler.nan_mask_weights.shape[pl_module.grid_dim] != 1

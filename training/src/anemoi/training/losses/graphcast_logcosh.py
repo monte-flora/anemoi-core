@@ -7,24 +7,32 @@
 # granted to it by virtue of its status as an intergovernmental organisation
 # nor does it submit to any jurisdiction.
 
-"""GraphCast-style MSE loss with level-grouped variable reduction.
+"""GraphCast-style LogCosh loss with level-grouped variable reduction.
 
-This module provides an MSE loss that follows the reduction semantics from
+This module provides a LogCosh loss that follows the reduction semantics from
 the GraphCast paper (Lam et al., 2023), where:
 - Variables are grouped by their base name (e.g., all temperature levels together)
 - Loss is averaged over levels within each group before summing across groups
 - This ensures equal weighting per physical quantity, not per output channel
 
+LogCosh loss is log(cosh(error)), which behaves like:
+- MSE for small errors: ~0.5 * error^2 when |error| << 1
+- MAE for large errors: ~|error| - log(2) when |error| >> 1
+
+This provides smooth transition between MSE and MAE behavior, making it
+robust to outliers while maintaining differentiability everywhere.
+
 Example YAML configuration:
     training:
       training_loss:
-        _target_: anemoi.training.losses.GraphCastMSELoss
+        _target_: anemoi.training.losses.GraphCastLogCoshLoss
         scalers: ['node_weights']
         ignore_nans: False
 """
 
 from typing import TYPE_CHECKING
 
+import numpy as np
 import torch
 
 from anemoi.training.losses.base import GraphCastBaseLoss
@@ -33,19 +41,41 @@ if TYPE_CHECKING:
     from torch.distributed.distributed_c10d import ProcessGroup
 
 
-class GraphCastMSELoss(GraphCastBaseLoss):
-    """Mean Squared Error loss with GraphCast-style reduction.
+class LogCosh(torch.autograd.Function):
+    """LogCosh custom autograd function for numerical stability.
 
-    Computes MSE between predictions and targets, then reduces using
+    Uses the identity: log(cosh(x)) = |x| + log(1 + exp(-2|x|)) - log(2)
+    This avoids numerical overflow for large |x| values.
+    """
+
+    @staticmethod
+    def forward(ctx, inp: torch.Tensor) -> torch.Tensor:
+        ctx.save_for_backward(inp)
+        abs_input = torch.abs(inp)
+        return abs_input + torch.nn.functional.softplus(-2 * abs_input) - np.log(2)
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor) -> torch.Tensor:
+        (inp,) = ctx.saved_tensors
+        return grad_output * torch.tanh(inp)
+
+
+class GraphCastLogCoshLoss(GraphCastBaseLoss):
+    """LogCosh loss with GraphCast-style reduction.
+
+    Computes LogCosh loss between predictions and targets, then reduces using
     the GraphCast reduction order:
     1. Mean over vertical levels within each variable group
     2. Mean over spatial (grid) and ensemble dimensions
     3. Sum over variable groups
-    4. Weighted mean over batch (optionally downweighting extreme samples)
+    4. Mean over batch
 
-    This differs from standard Anemoi MSELoss which treats each level
-    as an independent variable, effectively weighting 3D variables
-    by their number of levels.
+    LogCosh provides a smooth interpolation between MSE and MAE:
+    - For small errors (|e| << 1): loss ≈ 0.5 * e^2 (MSE-like)
+    - For large errors (|e| >> 1): loss ≈ |e| - log(2) (MAE-like)
+
+    This makes it naturally robust to outliers without requiring a
+    threshold parameter like Huber loss.
 
     Parameters
     ----------
@@ -60,15 +90,29 @@ class GraphCastMSELoss(GraphCastBaseLoss):
 
     Example
     -------
-    >>> loss_fn = GraphCastMSELoss()
+    >>> loss_fn = GraphCastLogCoshLoss()
     >>> loss_fn.set_data_indices(data_indices)  # Required for variable grouping
     >>> loss = loss_fn(pred, target)
 
-    >>> # With sample weighting to handle extreme convective events
-    >>> loss_fn = GraphCastMSELoss(sample_weighting=True, sample_weight_threshold=10.0)
+    >>> # With sample weighting for extra outlier robustness
+    >>> loss_fn = GraphCastLogCoshLoss(sample_weighting=True)
+
+    Notes
+    -----
+    Comparison with other losses for various error magnitudes:
+
+    | Error | MSE    | MAE | Huber(δ=1) | LogCosh |
+    |-------|--------|-----|------------|---------|
+    | 0.1   | 0.01   | 0.1 | 0.005      | 0.005   |
+    | 1.0   | 1.0    | 1.0 | 0.5        | 0.43    |
+    | 10.0  | 100    | 10  | 9.5        | 9.31    |
+    | 100.0 | 10000  | 100 | 99.5       | 99.31   |
+
+    LogCosh is smoother than Huber at the transition point and doesn't
+    require tuning a delta parameter.
     """
 
-    name: str = "graphcast_mse"
+    name: str = "graphcast_logcosh"
 
     def __init__(
         self,
@@ -85,7 +129,7 @@ class GraphCastMSELoss(GraphCastBaseLoss):
         )
 
     def calculate_difference(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        """Calculate the squared difference between prediction and target.
+        """Calculate the LogCosh loss between prediction and target.
 
         Computation is performed in float32 for numerical stability with bfloat16
         inputs. The loss remains in float32 for proper gradient computation.
@@ -100,14 +144,11 @@ class GraphCastMSELoss(GraphCastBaseLoss):
         Returns
         -------
         torch.Tensor
-            Squared difference tensor in float32.
+            LogCosh loss tensor in float32.
         """
         # Compute loss in float32 for numerical stability
-        # This is critical for bfloat16 training where squaring small differences
-        # can lose precision. Loss stays in float32 for proper backward pass.
         diff = pred.float() - target.float()
-        squared = torch.square(diff)
-        return squared  # Keep in float32
+        return LogCosh.apply(diff)
 
     def forward(
         self,
@@ -121,7 +162,7 @@ class GraphCastMSELoss(GraphCastBaseLoss):
         group: "ProcessGroup | None" = None,
         **kwargs,
     ) -> torch.Tensor:
-        """Calculates the area-weighted scaled loss.
+        """Calculates the area-weighted scaled LogCosh loss.
 
         Parameters
         ----------

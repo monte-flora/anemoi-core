@@ -103,6 +103,21 @@ class ICONTopologicalEdgeSchema(BaseModel):
     "Mask to apply to target nodes of the edges. Default to None."
 
 
+class MPASTopologicalEdgeSchema(BaseModel):
+    target_: Literal["anemoi.graphs.edges.MPASTopologicalEdges"] = Field(
+        "anemoi.graphs.edges.MPASTopologicalEdges",
+        alias="_target_",
+    )
+    mpas_mesh_path: str | None = None
+    "Path to the MPAS static mesh NetCDF file. If omitted, adjacency is read from MPASCoarseNodes."
+    max_cells: PositiveInt | None = None
+    "Optional cap on the number of fine cells to consider."
+    source_mask_attr_name: str | None = Field(default=None, examples=["boundary_mask"])
+    "Mask to apply to source nodes of the edges. Default to None."
+    target_mask_attr_name: str | None = Field(default=None, examples=["boundary_mask"])
+    "Mask to apply to target nodes of the edges. Default to None."
+
+
 class EdgeAttributeSchema(BaseModel):
     target_: Literal["anemoi.graphs.edges.attributes.EdgeLength", "anemoi.graphs.edges.attributes.EdgeDirection"] = (
         Field("anemoi.graphs.edges.attributes.EdgeLength", alias="_target_")
@@ -113,6 +128,11 @@ class EdgeAttributeSchema(BaseModel):
 
 
 EdgeBuilderSchemas = Annotated[
-    KNNEdgeSchema | CutoffEdgeSchema | MultiScaleEdgeSchema | HEALPixMultiScaleEdgesSchema | ICONTopologicalEdgeSchema,
+    KNNEdgeSchema
+    | CutoffEdgeSchema
+    | MultiScaleEdgeSchema
+    | HEALPixMultiScaleEdgesSchema
+    | ICONTopologicalEdgeSchema
+    | MPASTopologicalEdgeSchema,
     Field(discriminator="target_"),
 ]

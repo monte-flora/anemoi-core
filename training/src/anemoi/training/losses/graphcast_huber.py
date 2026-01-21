@@ -7,18 +7,27 @@
 # granted to it by virtue of its status as an intergovernmental organisation
 # nor does it submit to any jurisdiction.
 
-"""GraphCast-style MSE loss with level-grouped variable reduction.
+"""GraphCast-style Huber loss with level-grouped variable reduction.
 
-This module provides an MSE loss that follows the reduction semantics from
+This module provides a Huber loss that follows the reduction semantics from
 the GraphCast paper (Lam et al., 2023), where:
 - Variables are grouped by their base name (e.g., all temperature levels together)
 - Loss is averaged over levels within each group before summing across groups
 - This ensures equal weighting per physical quantity, not per output channel
 
+Huber loss is less sensitive to outliers than MSE, transitioning from quadratic
+to linear behavior for errors larger than delta. This makes it suitable for
+weather data with extreme events (e.g., deep convection) that can cause
+100+ sigma outliers in normalized tendency space.
+
+For |error| < delta: loss = 0.5 * error^2  (MSE behavior)
+For |error| >= delta: loss = delta * |error| - 0.5 * delta^2  (MAE behavior)
+
 Example YAML configuration:
     training:
       training_loss:
-        _target_: anemoi.training.losses.GraphCastMSELoss
+        _target_: anemoi.training.losses.GraphCastHuberLoss
+        delta: 3.0
         scalers: ['node_weights']
         ignore_nans: False
 """
@@ -33,22 +42,30 @@ if TYPE_CHECKING:
     from torch.distributed.distributed_c10d import ProcessGroup
 
 
-class GraphCastMSELoss(GraphCastBaseLoss):
-    """Mean Squared Error loss with GraphCast-style reduction.
+class GraphCastHuberLoss(GraphCastBaseLoss):
+    """Huber loss with GraphCast-style reduction.
 
-    Computes MSE between predictions and targets, then reduces using
+    Computes Huber loss between predictions and targets, then reduces using
     the GraphCast reduction order:
     1. Mean over vertical levels within each variable group
     2. Mean over spatial (grid) and ensemble dimensions
     3. Sum over variable groups
-    4. Weighted mean over batch (optionally downweighting extreme samples)
+    4. Mean over batch
 
-    This differs from standard Anemoi MSELoss which treats each level
-    as an independent variable, effectively weighting 3D variables
-    by their number of levels.
+    Huber loss provides robustness to outliers by using:
+    - Quadratic loss (MSE) for small errors: |error| < delta
+    - Linear loss (MAE) for large errors: |error| >= delta
+
+    This is particularly useful for storm-scale weather prediction where
+    deep convection can produce extreme tendencies (100+ sigma) that would
+    otherwise dominate MSE loss.
 
     Parameters
     ----------
+    delta : float, optional
+        Threshold for switching from quadratic to linear loss. Default 1.0.
+        For normalized tendency space, delta=3.0 means errors < 3 sigma use
+        MSE, while larger errors use MAE-like behavior.
     ignore_nans : bool, optional
         If True, use nanmean/nansum to ignore NaN values. Default False.
     sample_weighting : bool, optional
@@ -60,18 +77,30 @@ class GraphCastMSELoss(GraphCastBaseLoss):
 
     Example
     -------
-    >>> loss_fn = GraphCastMSELoss()
+    >>> loss_fn = GraphCastHuberLoss(delta=3.0)
     >>> loss_fn.set_data_indices(data_indices)  # Required for variable grouping
     >>> loss = loss_fn(pred, target)
 
-    >>> # With sample weighting to handle extreme convective events
-    >>> loss_fn = GraphCastMSELoss(sample_weighting=True, sample_weight_threshold=10.0)
+    >>> # With sample weighting for extra outlier robustness
+    >>> loss_fn = GraphCastHuberLoss(delta=3.0, sample_weighting=True)
+
+    Notes
+    -----
+    Choosing delta:
+    - delta=1.0: Tight threshold, switches to linear quickly
+    - delta=3.0: Reasonable for normalized data, allows 3-sigma errors to use MSE
+    - delta=5.0: More permissive, only extreme outliers get linear treatment
+
+    For a 100-sigma error:
+    - MSE contribution: 10,000
+    - Huber(delta=3) contribution: 3 * 100 - 0.5 * 9 = 295.5 (34x reduction)
     """
 
-    name: str = "graphcast_mse"
+    name: str = "graphcast_huber"
 
     def __init__(
         self,
+        delta: float = 1.0,
         ignore_nans: bool = False,
         sample_weighting: bool = False,
         sample_weight_threshold: float = 10.0,
@@ -83,9 +112,10 @@ class GraphCastMSELoss(GraphCastBaseLoss):
             sample_weight_threshold=sample_weight_threshold,
             sample_weight_min=sample_weight_min,
         )
+        self.delta = delta
 
     def calculate_difference(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        """Calculate the squared difference between prediction and target.
+        """Calculate the Huber loss between prediction and target.
 
         Computation is performed in float32 for numerical stability with bfloat16
         inputs. The loss remains in float32 for proper gradient computation.
@@ -100,15 +130,11 @@ class GraphCastMSELoss(GraphCastBaseLoss):
         Returns
         -------
         torch.Tensor
-            Squared difference tensor in float32.
+            Huber loss tensor in float32.
         """
-        # Compute loss in float32 for numerical stability
-        # This is critical for bfloat16 training where squaring small differences
-        # can lose precision. Loss stays in float32 for proper backward pass.
-        diff = pred.float() - target.float()
-        squared = torch.square(diff)
-        return squared  # Keep in float32
-
+        diff = torch.abs(pred - target)
+        return torch.where(diff < self.delta, 0.5 * torch.square(diff), self.delta * (diff - 0.5 * self.delta))
+        
     def forward(
         self,
         pred: torch.Tensor,
@@ -121,7 +147,7 @@ class GraphCastMSELoss(GraphCastBaseLoss):
         group: "ProcessGroup | None" = None,
         **kwargs,
     ) -> torch.Tensor:
-        """Calculates the area-weighted scaled loss.
+        """Calculates the area-weighted scaled Huber loss.
 
         Parameters
         ----------

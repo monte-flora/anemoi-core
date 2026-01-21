@@ -26,6 +26,7 @@ from omegaconf import DictConfig
 from omegaconf import OmegaConf
 from packaging import version
 from pytorch_lightning.utilities.rank_zero import rank_zero_only
+from lightning.pytorch.profilers import SimpleProfiler, AdvancedProfiler
 from torch_geometric.data import HeteroData
 
 from anemoi.models.utils.compile import mark_for_compilation
@@ -487,10 +488,10 @@ class AnemoiTrainer(ABC):
     def train(self) -> None:
         """Training entry point."""
         LOGGER.debug("Setting up trainer..")
-
+        
         trainer = pl.Trainer(
             accelerator=self.accelerator,
-            callbacks=self.callbacks,
+            callbacks=self.callbacks, #+timing_callbacks,
             deterministic=self.config.training.deterministic,
             detect_anomaly=self.config.diagnostics.debug.anomaly_detection,
             strategy=self.strategy,

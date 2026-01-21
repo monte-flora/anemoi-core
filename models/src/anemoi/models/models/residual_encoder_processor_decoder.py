@@ -47,7 +47,7 @@ class AnemoiResidualModelEncProcDec(AnemoiModelEncProcDec):
         data_indices: dict,
         statistics: dict,
         graph_data: HeteroData,
-        truncation_data: dict,
+        **kwargs,
     ) -> None:
         """Initializes the graph neural network.
 
@@ -59,13 +59,14 @@ class AnemoiResidualModelEncProcDec(AnemoiModelEncProcDec):
             Data indices
         graph_data : HeteroData
             Graph definition
+        **kwargs
+            Additional arguments (ignored for compatibility)
         """
         super().__init__(
             model_config=model_config,
             data_indices=data_indices,
             statistics=statistics,
             graph_data=graph_data,
-            truncation_data=truncation_data,
         )
         
     def _assemble_input(self, x, batch_size, grid_shard_shapes=None, model_comm_group=None):
@@ -111,6 +112,13 @@ class AnemoiResidualModelEncProcDec(AnemoiModelEncProcDec):
             x_out = bounding(x_out)
             
         return x_out
+
+    @staticmethod
+    def _get_normalizer_buffers(pre_processors: nn.Module) -> tuple[Tensor, Tensor]:
+        for processor in pre_processors.processors.values():
+            if hasattr(processor, "_norm_mul") and hasattr(processor, "_norm_add"):
+                return processor._norm_mul, processor._norm_add
+        raise RuntimeError("InputNormalizer buffers not found in pre_processors.")
     
     def forward(
         self,
@@ -193,27 +201,31 @@ class AnemoiResidualModelEncProcDec(AnemoiModelEncProcDec):
         batch: torch.Tensor,
         pre_processors: nn.Module,
         post_processors: nn.Module,
-        residual_normalizer: nn.Module, 
-        data_indices : dict, 
+        residual_normalizer: nn.Module,
+        data_indices: dict,
         multi_step: int,
         model_comm_group: Optional[ProcessGroup] = None,
         gather_out: bool = True,
         **kwargs,
     ) -> Tensor:
-        """Prediction step for the model.
+        """Prediction step for the residual model.
 
-        Base implementation applies pre-processing, performs a forward pass, and applies post-processing.
-        Subclasses can override this for different behavior (e.g., sampling for diffusion models).
+        The model predicts normalized residuals for prognostic variables.
+        Diagnostic variables (if any) are predicted directly.
 
         Parameters
         ----------
         batch : torch.Tensor
-            Input batched data (before pre-processing)
-        pre_processors : nn.Module,
-            Pre-processing module
-        post_processors : nn.Module,
-            Post-processing module
-        multi_step : int,
+            Input batched data (before pre-processing), shape (batch, timesteps, grid, variables)
+        pre_processors : nn.Module
+            Pre-processing module (normalizer)
+        post_processors : nn.Module
+            Post-processing module (denormalizer)
+        residual_normalizer : nn.Module
+            Residual normalizer for converting residuals to physical space
+        data_indices : dict
+            Data indices for variable mapping
+        multi_step : int
             Number of input timesteps
         model_comm_group : Optional[ProcessGroup]
             Process group for distributed training
@@ -225,18 +237,19 @@ class AnemoiResidualModelEncProcDec(AnemoiModelEncProcDec):
         Returns
         -------
         Tensor
-            Model output (after post-processing)
+            Model output in physical space, shape (batch, grid, n_output)
         """
-                    
-                    
+        from anemoi.models.distributed.shapes import apply_shard_shapes
+
         with torch.no_grad():
 
             assert (
                 len(batch.shape) == 4
             ), f"The input tensor has an incorrect shape: expected a 4-dimensional tensor, got {batch.shape}!"
-            # Dimensions are
-            # batch, timesteps, grid, variables
-            x = batch[:, 0:multi_step, None, ...]  # add dummy ensemble dimension as 3rd index
+
+            # Dimensions are: batch, timesteps, grid, variables
+            # Add dummy ensemble dimension as 3rd index
+            x = batch[:, 0:multi_step, None, ...]  # shape: (batch, time, 1, grid, n_input)
 
             # Handle distributed processing
             grid_shard_shapes = None
@@ -245,38 +258,89 @@ class AnemoiResidualModelEncProcDec(AnemoiModelEncProcDec):
                 grid_shard_shapes = [shape[-2] for shape in shard_shapes]
                 x = shard_tensor(x, -2, shard_shapes, model_comm_group)
 
-            # Compute the predicted normalized residual.
-            # Unnormalize the last time step of the normalized input.
-            # Perform the inverse residual to get the prediction in physical space.     
+            # ============================================================
+            # Step 1: Normalize the input
+            # ============================================================
+            x = pre_processors(x, in_place=True)
 
-            # Workflow
-            # ------------
-            # 1. Normalize the input (x)
-            # 2. Compute the normalized predicted residual for the prognostic variables 
-            # 3. Get the last time step, unnormalize back into physical space 
-            
-            x = pre_processors(x, in_place=False) 
-            
-            # Perform forward pass
-            Δx̂_norm = self.forward(x, model_comm_group=model_comm_group, grid_shard_shapes=grid_shard_shapes, **kwargs)
+            # ============================================================
+            # Step 2: Forward pass - model predicts normalized residuals
+            # ============================================================
+            # Output shape: (batch, ensemble=1, grid, n_output)
+            model_output = self.forward(x, model_comm_group=model_comm_group, grid_shard_shapes=grid_shard_shapes, **kwargs)
 
-            # Get the last time step in physical space 
-            # We can perform the operation in-place as we no longer
-            # need normalized x. 
-            x_last = post_processors(x[:, -1, 0, ...])
-            
-            y_hat = residual_normalizer.inverse_transform(
-                # TODO, Monte : Anemoi has a input and output prognostic
-                # I wonder if I have the right indices? 
-                x_last[..., data_indices.model.input.prognostic], 
-                Δx̂_norm
+            # Get indices for prognostic and diagnostic variables
+            # model.output indices are for the model output tensor
+            model_prog_idx = data_indices.model.output.prognostic
+            model_diag_idx = data_indices.model.output.diagnostic
+            # data.input indices are for the input/batch tensor (used to index normalizer buffers)
+            input_prog_idx = data_indices.data.input.prognostic
+
+            # Get normalizer buffers
+            norm_mul, norm_add = self._get_normalizer_buffers(pre_processors)
+
+            # ============================================================
+            # Step 3: Handle PROGNOSTIC variables (residual prediction)
+            # ============================================================
+            # Extract prognostic residuals from model output
+            # model_output shape: (batch, ensemble=1, grid, n_output)
+            Δx̂_norm_prog = model_output[..., model_prog_idx]  # (batch, 1, grid, n_prog)
+
+            # Get last normalized input state for prognostic variables
+            # x shape: (batch, time, ensemble=1, grid, n_input)
+            x_last_norm_prog = x[:, -1, ..., input_prog_idx]  # (batch, 1, grid, n_prog)
+
+            # Reconstruct prognostic variables in physical space
+            # inverse_transform_physical_from_normalized expects inputs with same shape
+            y_hat_prog_phys = residual_normalizer.inverse_transform_physical_from_normalized(
+                x_last_norm_prog,
+                Δx̂_norm_prog,
+                norm_mul,
+                norm_add,
+            )  # (batch, 1, grid, n_prog)
+
+            # ============================================================
+            # Step 4: Handle DIAGNOSTIC variables (direct prediction)
+            # ============================================================
+            n_output = len(data_indices.model.output.full)
+            batch_size = model_output.shape[0]
+            ensemble_size = model_output.shape[1]
+            grid_size = model_output.shape[2]
+
+            # Initialize output tensor in physical space
+            y_hat = torch.zeros(
+                batch_size, ensemble_size, grid_size, n_output,
+                dtype=model_output.dtype, device=model_output.device
             )
-            
-            # Deprecated. 
-            # Apply post-processing
-            #y_hat = post_processors(y_hat, in_place=False)
 
-            # Gather output if needed
+            # Place prognostic predictions
+            y_hat[..., model_prog_idx] = y_hat_prog_phys
+
+            # Handle diagnostic variables if present
+            if len(model_diag_idx) > 0:
+                # Diagnostic variables are predicted directly (not as residuals)
+                # They need to be denormalized using the standard post-processor
+                diag_output_norm = model_output[..., model_diag_idx]
+                # For diagnostics, apply standard denormalization
+                # Create a temporary tensor with just diagnostics for post-processing
+                # Note: post_processors expect full output shape, so we apply denorm manually
+                input_diag_idx = data_indices.data.input.diagnostic if hasattr(data_indices.data.input, 'diagnostic') else []
+                if len(input_diag_idx) > 0:
+                    diag_mul = norm_mul[input_diag_idx].float()
+                    diag_add = norm_add[input_diag_idx].float()
+                    y_hat_diag_phys = (diag_output_norm.float() - diag_add) / diag_mul
+                    y_hat[..., model_diag_idx] = y_hat_diag_phys.to(model_output.dtype)
+                else:
+                    # If no input diagnostic indices, just pass through
+                    y_hat[..., model_diag_idx] = diag_output_norm
+
+            # ============================================================
+            # Step 5: Remove ensemble dimension and gather if needed
+            # ============================================================
+            # Squeeze ensemble dimension: (batch, 1, grid, n_output) -> (batch, grid, n_output)
+            y_hat = y_hat.squeeze(1)
+
+            # Gather output if needed for distributed processing
             if gather_out and model_comm_group is not None:
                 y_hat = gather_tensor(y_hat, -2, apply_shard_shapes(y_hat, -2, grid_shard_shapes), model_comm_group)
 

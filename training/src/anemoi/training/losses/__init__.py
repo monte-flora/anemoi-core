@@ -8,6 +8,9 @@
 # nor does it submit to any jurisdiction.
 
 from .combined import CombinedLoss
+from .graphcast_huber import GraphCastHuberLoss
+from .graphcast_logcosh import GraphCastLogCoshLoss
+from .graphcast_mse import GraphCastMSELoss
 from .huber import HuberLoss
 from .kcrps import AlmostFairKernelCRPS
 from .kcrps import KernelCRPS
@@ -16,13 +19,16 @@ from .loss import get_loss_function
 from .mae import MAELoss
 from .mse import MSELoss
 from .multiscale import MultiscaleLossWrapper
+from .normalized_rmse import RMSELossNormalized
 from .rmse import RMSELoss
 from .weighted_mse import WeightedMSELoss
-from .normalized_rmse import RMSELossNormalized
 
 __all__ = [
     "AlmostFairKernelCRPS",
     "CombinedLoss",
+    "GraphCastHuberLoss",
+    "GraphCastLogCoshLoss",
+    "GraphCastMSELoss",
     "HuberLoss",
     "KernelCRPS",
     "LogCoshLoss",
@@ -30,7 +36,7 @@ __all__ = [
     "MSELoss",
     "MultiscaleLossWrapper",
     "RMSELoss",
-    "WeightedMSELoss",
     "RMSELossNormalized",
+    "WeightedMSELoss",
     "get_loss_function",
 ]

@@ -24,28 +24,6 @@ from anemoi.training.utils.enums import TensorDim
 
 LOGGER = logging.getLogger(__name__)
 
-# Debug flag for NaN detection in loss reduction
-_DEBUG_NAN_REDUCE = False
-
-
-def _check_reduce_step(tensor: torch.Tensor, step_name: str) -> None:
-    """Check tensor for NaN/Inf during reduction and log if found."""
-    if not _DEBUG_NAN_REDUCE:
-        return
-    has_nan = torch.isnan(tensor).any().item()
-    has_inf = torch.isinf(tensor).any().item()
-    if has_nan or has_inf:
-        nan_count = torch.isnan(tensor).sum().item()
-        inf_count = torch.isinf(tensor).sum().item()
-        LOGGER.error(
-            "NaN/Inf in reduction at '%s': %d NaN, %d Inf (shape=%s, device=%s)",
-            step_name,
-            nan_count,
-            inf_count,
-            list(tensor.shape),
-            tensor.device,
-        )
-
 
 class BaseLoss(nn.Module, ABC):
     """Base loss."""
@@ -326,22 +304,51 @@ class GraphCastBaseLoss(FunctionalLoss):
     1. Mean over vertical levels within each variable group
     2. Mean over spatial (grid) and ensemble dimensions
     3. Sum over variable groups
-    4. Mean over batch
+    4. Mean over batch (optionally weighted by sample extremity)
 
     This ensures each physical quantity (e.g., temperature, humidity) contributes
     equally to the loss regardless of the number of vertical levels, unlike
     the default Anemoi reduction which weights by level count.
+
+    Optionally supports sample weighting to downweight samples with extreme
+    target values, which helps with heavy-tailed distributions common in
+    convective weather prediction.
 
     Reference:
         Lam, R., et al. (2023). "Learning skillful medium-range global weather
         forecasting." Science, 382(6677), 1416-1421.
     """
 
-    def __init__(self, *args, **kwargs) -> None:
+    def __init__(
+        self,
+        *args,
+        sample_weighting: bool = False,
+        sample_weight_threshold: float = 10.0,
+        sample_weight_min: float = 0.01,
+        **kwargs,
+    ) -> None:
+        """Initialize GraphCastBaseLoss.
+
+        Parameters
+        ----------
+        sample_weighting : bool, optional
+            If True, downweight samples with extreme target values. Default False.
+        sample_weight_threshold : float, optional
+            Target magnitude threshold for weighting. Samples with max |target| above
+            this value get progressively downweighted. Default 10.0 (10 sigma for
+            normalized tendencies).
+        sample_weight_min : float, optional
+            Minimum weight for extreme samples. Default 0.01 (1% of normal weight).
+        """
         super().__init__(*args, **kwargs)
         self.variable_groups: dict[str, list[int]] | None = None
         self.group_slices: list[tuple[int, int]] | None = None
         self.group_sizes: torch.Tensor | None = None
+
+        # Sample weighting parameters
+        self.sample_weighting = sample_weighting
+        self.sample_weight_threshold = sample_weight_threshold
+        self.sample_weight_min = sample_weight_min
 
     def _build_variable_groups(self) -> dict[str, list[int]]:
         """Build variable groups from data indices.
@@ -440,6 +447,52 @@ class GraphCastBaseLoss(FunctionalLoss):
             list(self.variable_groups.keys()),
         )
 
+        if self.sample_weighting:
+            LOGGER.info(
+                "Sample weighting enabled: threshold=%.1f, min_weight=%.3f",
+                self.sample_weight_threshold,
+                self.sample_weight_min,
+            )
+
+    def _compute_sample_weights(self, target: torch.Tensor) -> torch.Tensor:
+        """Compute per-sample weights based on target extremity.
+
+        Samples with extreme target values (large |target|) are downweighted
+        to reduce the influence of outliers during training.
+
+        The weighting scheme:
+        - weight = 1.0 for samples with max|target| <= threshold
+        - weight decreases for samples with max|target| > threshold
+        - weight is clamped to sample_weight_min to avoid zero weights
+
+        Parameters
+        ----------
+        target : torch.Tensor
+            Target tensor of shape (B, E, G, V)
+
+        Returns
+        -------
+        torch.Tensor
+            Per-sample weights of shape (B,), normalized to sum to B
+        """
+        # Compute max absolute target value per sample: (B,)
+        # Max over ensemble, grid, and variable dimensions
+        max_abs_target = torch.abs(target).amax(dim=(1, 2, 3))  # (B,)
+
+        # Compute weights: 1.0 for normal samples, decreasing for extreme samples
+        # weight = threshold / max(threshold, max_abs_target)
+        weights = self.sample_weight_threshold / torch.clamp(
+            max_abs_target, min=self.sample_weight_threshold
+        )
+
+        # Clamp to minimum weight
+        weights = torch.clamp(weights, min=self.sample_weight_min)
+
+        # Normalize weights so they sum to batch_size (preserves loss scale)
+        weights = weights * (weights.numel() / weights.sum())
+
+        return weights
+
     def _reduce_per_variable(self, out: torch.Tensor) -> torch.Tensor:
         """Reduce loss tensor to per-variable-group values.
 
@@ -457,28 +510,21 @@ class GraphCastBaseLoss(FunctionalLoss):
         torch.Tensor
             Reduced tensor of shape (B, n_groups)
         """
-        _check_reduce_step(out, "reduce_per_variable:input")
-
         per_group_means = []
-        group_names = list(self.variable_groups.keys()) if self.variable_groups else []
         for i, (start_idx, end_idx) in enumerate(self.group_slices):
             # Extract contiguous slice: (B, E, G, n_levels)
             group_data = out[..., start_idx:end_idx]
-            _check_reduce_step(group_data, f"reduce_per_variable:group_{group_names[i] if i < len(group_names) else i}_slice")
 
             # Mean over levels: (B, E, G)
             group_mean = group_data.mean(dim=-1)
-            _check_reduce_step(group_mean, f"reduce_per_variable:group_{group_names[i] if i < len(group_names) else i}_mean_levels")
 
             per_group_means.append(group_mean)
 
         # Stack: (B, E, G, n_groups)
         per_group = torch.stack(per_group_means, dim=-1)
-        _check_reduce_step(per_group, "reduce_per_variable:stacked")
 
         # Mean over ensemble and grid: (B, n_groups)
         result = per_group.mean(dim=(TensorDim.ENSEMBLE_DIM, TensorDim.GRID))
-        _check_reduce_step(result, "reduce_per_variable:mean_ensemble_grid")
 
         return result
 
@@ -488,6 +534,7 @@ class GraphCastBaseLoss(FunctionalLoss):
         squash: bool = True,
         squash_mode: str = "sum",  # Ignored, always sums for GraphCast semantics
         group: ProcessGroup | None = None,
+        sample_weights: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Reduce loss tensor using GraphCast semantics.
 
@@ -495,7 +542,7 @@ class GraphCastBaseLoss(FunctionalLoss):
         1. Mean over levels within each variable group
         2. Mean over ensemble and grid dimensions
         3. Sum over variable groups (if squash=True)
-        4. Mean over batch
+        4. Weighted mean over batch (if sample_weights provided)
 
         Parameters
         ----------
@@ -508,32 +555,46 @@ class GraphCastBaseLoss(FunctionalLoss):
             Ignored. GraphCast always uses sum over variables.
         group : ProcessGroup | None, optional
             Distributed process group for reduction. Default None.
+        sample_weights : torch.Tensor | None, optional
+            Per-sample weights of shape (B,). If provided, used for weighted
+            mean over batch dimension. Default None.
 
         Returns
         -------
         torch.Tensor
             Scalar loss if squash=True, else tensor of shape (n_groups,)
         """
-        _check_reduce_step(out, "graphcast_reduce:input")
-
         # (B, E, G, V) -> (B, n_groups)
         out = self._reduce_per_variable(out)
-        _check_reduce_step(out, "graphcast_reduce:after_reduce_per_variable")
 
         if squash:
             # Sum over variable groups: (B,)
             out = self.sum_function(out, dim=-1)
-            _check_reduce_step(out, "graphcast_reduce:sum_over_groups")
 
-            # Mean over batch: scalar
-            out = self.avg_function(out)
-            _check_reduce_step(out, "graphcast_reduce:mean_over_batch")
+            # Weighted mean over batch: scalar
+            if sample_weights is not None:
+                # Weighted average: sum(out * weights) / sum(weights)
+                out = (out * sample_weights).sum() / sample_weights.sum()
+            else:
+                out = self.avg_function(out)
 
-            return out if group is None else reduce_tensor(out, group)
+            if group is None:
+                return out
+            # reduce_tensor does all_reduce SUM, so divide by world_size to get mean
+            # This is needed because _reduce_per_variable computes LOCAL means over
+            # each GPU's grid shard, and we need the GLOBAL mean
+            out = reduce_tensor(out, group)
+            return out / torch.distributed.get_world_size(group)
 
         # For per-variable diagnostics: mean over batch -> (n_groups,)
-        out = self.avg_function(out, dim=TensorDim.BATCH_SIZE)
-        _check_reduce_step(out, "graphcast_reduce:mean_over_batch_no_squash")
+        if sample_weights is not None:
+            # Weighted average per group: (n_groups,)
+            out = (out * sample_weights.unsqueeze(-1)).sum(dim=0) / sample_weights.sum()
+        else:
+            out = self.avg_function(out, dim=TensorDim.BATCH_SIZE)
 
-        return out if group is None else reduce_tensor(out, group)
+        if group is None:
+            return out
+        out = reduce_tensor(out, group)
+        return out / torch.distributed.get_world_size(group)
           
