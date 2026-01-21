@@ -113,7 +113,17 @@ class BackwardMapperPostProcessMixin:
     """Post-processing for Backward Mapper from hidden -> data."""
 
     def post_process(self, x_dst, shapes_dst, model_comm_group=None, keep_x_dst_sharded=False):
+        # Debug: Check input to node_data_extractor
+        if not hasattr(self, '_output_debug_done'):
+            LOGGER.info(f"node_data_extractor INPUT: mean={x_dst.mean().item():.4f}, std={x_dst.std().item():.4f}, shape={x_dst.shape}")
+
         x_dst = self.node_data_extractor(x_dst)
+
+        # Debug: Check output of node_data_extractor
+        if not hasattr(self, '_output_debug_done'):
+            LOGGER.info(f"node_data_extractor OUTPUT: mean={x_dst.mean().item():.4f}, std={x_dst.std().item():.4f}")
+            self._output_debug_done = True
+
         if not keep_x_dst_sharded:
             x_dst = gather_tensor(
                 x_dst, 0, change_channels_in_shape(shapes_dst, self.out_channels_dst), model_comm_group
@@ -216,6 +226,8 @@ class GraphTransformerBaseMapper(GraphEdgeMixin, BaseMapper):
         cpu_offload: bool = False,
         layer_kernels: DotDict = None,
         shard_strategy: str = "edges",
+        graph_attention_backend: str = "triton",
+        edge_pre_mlp: bool = False,
     ) -> None:
         """Initialize GraphTransformerBaseMapper.
 
@@ -254,6 +266,10 @@ class GraphTransformerBaseMapper(GraphEdgeMixin, BaseMapper):
             Defined in config/models/<model>.yaml
         shard_strategy : str, optional
             Strategy to shard tensors, by default "edges"
+        graph_attention_backend: str, by default "triton"
+            Backend to use for graph transformer conv, options are "triton" and "pyg"
+        edge_pre_mlp: bool, by default False
+            Allow for edge feature mixing
         """
         super().__init__(
             in_channels_src=in_channels_src,
@@ -282,6 +298,8 @@ class GraphTransformerBaseMapper(GraphEdgeMixin, BaseMapper):
             qk_norm=qk_norm,
             layer_kernels=self.layer_factory,
             shard_strategy=shard_strategy,
+            graph_attention_backend=graph_attention_backend,
+            edge_pre_mlp=edge_pre_mlp,
         )
 
         self.offload_layers(cpu_offload)
@@ -539,6 +557,8 @@ class GraphTransformerForwardMapper(ForwardMapperPreProcessMixin, GraphTransform
         cpu_offload: bool = False,
         layer_kernels: DotDict = None,
         shard_strategy: str = "edges",
+        graph_attention_backend: str = "triton",
+        edge_pre_mlp: bool = False,
     ) -> None:
         """Initialize GraphTransformerForwardMapper.
 
@@ -574,6 +594,10 @@ class GraphTransformerForwardMapper(ForwardMapperPreProcessMixin, GraphTransform
             A dict of layer implementations e.g. layer_kernels.Linear = "torch.nn.Linear"
         shard_strategy : str, optional
             Strategy to shard tensors, by default "edges"
+        graph_attention_backend: str, by default "triton"
+            Backend to use for graph transformer conv, options are "triton" and "pyg"
+        edge_pre_mlp: bool, by default False
+            Allow for edge feature mixing
         """
         super().__init__(
             in_channels_src=in_channels_src,
@@ -592,6 +616,8 @@ class GraphTransformerForwardMapper(ForwardMapperPreProcessMixin, GraphTransform
             dst_grid_size=dst_grid_size,
             layer_kernels=layer_kernels,
             shard_strategy=shard_strategy,
+            graph_attention_backend=graph_attention_backend,
+            edge_pre_mlp=edge_pre_mlp,
         )
 
         self.emb_nodes_src = self.layer_factory.Linear(self.in_channels_src, self.hidden_dim)
@@ -640,9 +666,12 @@ class GraphTransformerBackwardMapper(BackwardMapperPostProcessMixin, GraphTransf
         dst_grid_size: int,
         qk_norm: bool = False,
         initialise_data_extractor_zero: bool = False,
+        final_layer_norm: bool = True,
         cpu_offload: bool = False,
         layer_kernels: DotDict = None,
         shard_strategy: str = "edges",
+        graph_attention_backend: str = "triton",
+        edge_pre_mlp: bool = False,
     ) -> None:
         """Initialize GraphTransformerBackwardMapper.
 
@@ -674,6 +703,8 @@ class GraphTransformerBackwardMapper(BackwardMapperPostProcessMixin, GraphTransf
             Destination grid size
         initialise_data_extractor_zero : bool, default False:
             Whether to initialise the data extractor to zero
+        final_layer_norm : bool, default True
+            Whether to apply LayerNorm before the final linear projection
         qk_norm : bool, optional
             Whether to use query and key normalization, default False
         cpu_offload : bool, optional
@@ -683,6 +714,10 @@ class GraphTransformerBackwardMapper(BackwardMapperPostProcessMixin, GraphTransf
             Defined in config/models/<model>.yaml
         shard_strategy : str, optional
             Strategy to shard tensors, by default "edges"
+        graph_attention_backend: str, by default "triton"
+            Backend to use for graph transformer conv, options are "triton" and "pyg"
+        edge_pre_mlp: bool, by default False
+            Allow for edge feature mixing
         """
         super().__init__(
             in_channels_src=in_channels_src,
@@ -701,17 +736,27 @@ class GraphTransformerBackwardMapper(BackwardMapperPostProcessMixin, GraphTransf
             dst_grid_size=dst_grid_size,
             layer_kernels=layer_kernels,
             shard_strategy=shard_strategy,
+            graph_attention_backend=graph_attention_backend,
+            edge_pre_mlp=edge_pre_mlp,
         )
 
-        self.node_data_extractor = nn.Sequential(
-            nn.LayerNorm(self.hidden_dim), nn.Linear(self.hidden_dim, self.out_channels_dst)
-        )
+        if final_layer_norm:
+            self.node_data_extractor = nn.Sequential(
+                nn.LayerNorm(self.hidden_dim), nn.Linear(self.hidden_dim, self.out_channels_dst)
+            )
+        else:
+            self.node_data_extractor = nn.Linear(self.hidden_dim, self.out_channels_dst)
         if initialise_data_extractor_zero:
+            LOGGER.info("Zero-initializing decoder node_data_extractor weights and biases")
             for module in self.node_data_extractor.modules():
                 if isinstance(module, nn.Linear):
                     nn.init.constant_(module.weight, 0.0)
                     if module.bias is not None:
                         nn.init.constant_(module.bias, 0.0)
+            # Verify initialization
+            for module in self.node_data_extractor.modules():
+                if isinstance(module, nn.Linear):
+                    LOGGER.info(f"  Linear weight max: {module.weight.abs().max().item():.6f}, bias max: {module.bias.abs().max().item() if module.bias is not None else 'N/A'}")
 
     def pre_process(self, x, shard_shapes, model_comm_group=None, x_src_is_sharded=False, x_dst_is_sharded=False):
         x_src, x_dst, shapes_src, shapes_dst = super().pre_process(
@@ -991,7 +1036,9 @@ class GNNBackwardMapper(BackwardMapperPostProcessMixin, GNNBaseMapper):
         src_grid_size: int,
         dst_grid_size: int,
         cpu_offload: bool = False,
-        layer_kernels: DotDict,
+        layer_kernels: DotDict = None,
+        initialise_data_extractor_zero: bool = False,
+        final_layer_norm: bool = True,
     ) -> None:
         """Initialize GNNBackwardMapper.
 
@@ -1024,6 +1071,10 @@ class GNNBackwardMapper(BackwardMapperPostProcessMixin, GNNBaseMapper):
         layer_kernels : DotDict
             A dict of layer implementations e.g. layer_kernels.Linear = "torch.nn.Linear"
             Defined in config/models/<model>.yaml
+        initialise_data_extractor_zero : bool, default False
+            Whether to initialise the data extractor to zero
+        final_layer_norm : bool, default True
+            Whether to apply LayerNorm after the final MLP projection
         """
         super().__init__(
             in_channels_src=in_channels_src,
@@ -1058,11 +1109,35 @@ class GNNBackwardMapper(BackwardMapperPostProcessMixin, GNNBaseMapper):
             out_features=self.out_channels_dst,
             layer_kernels=self.layer_factory,
             n_extra_layers=mlp_extra_layers,
-            layer_norm=False,
+            layer_norm=final_layer_norm,
             final_activation=False,
         )
+        if initialise_data_extractor_zero:
+            LOGGER.info("Zero-initializing GNN decoder node_data_extractor final layer weights and biases")
+            # Find the last Linear layer in the MLP and zero-initialize it
+            linear_layers = [m for m in self.node_data_extractor.mlp.modules() if isinstance(m, nn.Linear)]
+            if linear_layers:
+                final_linear = linear_layers[-1]
+                nn.init.constant_(final_linear.weight, 0.0)
+                if final_linear.bias is not None:
+                    nn.init.constant_(final_linear.bias, 0.0)
+                LOGGER.info(f"  Final Linear weight max: {final_linear.weight.abs().max().item():.6f}, "
+                           f"bias max: {final_linear.bias.abs().max().item() if final_linear.bias is not None else 'N/A'}")
 
     def pre_process(self, x, shard_shapes, model_comm_group=None, x_src_is_sharded=False, x_dst_is_sharded=False):
+        # One-time check that zero initialization persists
+        if not hasattr(self, '_zero_init_checked'):
+            linear_layers = [m for m in self.node_data_extractor.mlp.modules() if isinstance(m, nn.Linear)]
+            if linear_layers:
+                final_linear = linear_layers[-1]
+                w_max = final_linear.weight.abs().max().item()
+                b_max = final_linear.bias.abs().max().item() if final_linear.bias is not None else 0
+                if w_max > 0 or b_max > 0:
+                    LOGGER.warning(f"GNN decoder final Linear weights NOT zero at forward time! weight_max={w_max:.6f}, bias_max={b_max:.6f}")
+                else:
+                    LOGGER.info("GNN decoder final Linear weights confirmed zero at forward time")
+            self._zero_init_checked = True
+
         x_src, x_dst, shapes_src, shapes_dst = super().pre_process(
             x, shard_shapes, model_comm_group, x_src_is_sharded, x_dst_is_sharded
         )

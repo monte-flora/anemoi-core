@@ -43,6 +43,21 @@ class GraphTransformerProcessorSchema(TransformerModelComponent):
     qk_norm: bool = Field(example=False)
     "Normalize the query and key vectors. Default to False."
 
+    @model_validator(mode="after")
+    def check_valid_extras(self) -> Any:
+        # This is a check to allow backwards compatibilty of the configs, as the extra fields are not required.
+        allowed_extras = {"graph_attention_backend": str, "edge_pre_mlp": bool}
+        extras = getattr(self, "__pydantic_extra__", {}) or {}
+        for extra_field, value in extras.items():
+            if extra_field not in allowed_extras:
+                msg = f"Extra field '{extra_field}' is not allowed. Allowed fields are: {list(allowed_extras.keys())}."
+                raise ValueError(msg)
+            if not isinstance(value, allowed_extras[extra_field]):
+                msg = f"Extra field '{extra_field}' must be of type {allowed_extras[extra_field].__name__}."
+                raise TypeError(msg)
+
+        return self
+
 
 class TransformerProcessorSchema(TransformerModelComponent):
     target_: Literal["anemoi.models.layers.processor.TransformerProcessor"] = Field(..., alias="_target_")
@@ -69,6 +84,43 @@ class TransformerProcessorSchema(TransformerModelComponent):
         # Check for valid extra fields related to MultiHeadSelfAttention and MultiHeadCrossAttention
         # This is a check to allow backwards compatibilty of the configs, as the extra fields are not required.
         allowed_extras = {"use_rotary_embeddings": bool}
+        extras = getattr(self, "__pydantic_extra__", {}) or {}
+        for extra_field, value in extras.items():
+            if extra_field not in allowed_extras:
+                msg = f"Extra field '{extra_field}' is not allowed. Allowed fields are: {list(allowed_extras.keys())}."
+                raise ValueError(msg)
+            if not isinstance(value, allowed_extras[extra_field]):
+                msg = f"Extra field '{extra_field}' must be of type {allowed_extras[extra_field].__name__}."
+                raise TypeError(msg)
+
+        return self
+
+
+class BandedTransformerProcessorSchema(TransformerModelComponent):
+    target_: Literal["anemoi.models.layers.processor.BandedTransformerProcessor"] = Field(..., alias="_target_")
+    "Banded Transformer processor with graph-aware sparse attention."
+    num_layers: NonNegativeInt = Field(example=16)
+    "Number of layers of Banded Transformer processor. Default to 16."
+    num_chunks: NonNegativeInt = Field(example=2)
+    "Number of chunks to divide the layer into. Default to 2."
+    window_size: NonNegativeInt = Field(example=128)
+    "Attention window size in permuted sequence space. Should be >= k-hop bandwidth after RCM. Default to 128."
+    dropout_p: NonNegativeFloat = Field(example=0.0)
+    "Dropout probability used for multi-head self attention, default 0.0"
+    attention_implementation: str = Field(example="flash_attention")
+    "Attention implementation to use. Default to 'flash_attention'."
+    qk_norm: bool = Field(example=False)
+    "Normalize the query and key vectors. Default to False."
+    softcap: NonNegativeFloat = Field(example=0.0)
+    "Softcap value for attention. Default to 0.0."
+    use_alibi_slopes: bool = Field(example=False)
+    "Use alibi slopes for attention implementation. Default to False."
+    sub_graph_edge_attributes: list[str] = Field(example=["edge_length", "edge_dirs"])
+    "Edge attributes used for graph topology (required for RCM permutation computation)."
+
+    @model_validator(mode="after")
+    def check_valid_extras(self) -> Any:
+        allowed_extras = {"use_rotary_embeddings": bool, "trainable_size": int}
         extras = getattr(self, "__pydantic_extra__", {}) or {}
         for extra_field, value in extras.items():
             if extra_field not in allowed_extras:

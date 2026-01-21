@@ -29,12 +29,13 @@ class GraphExporter:
         **kwargs,
     ):
         if isinstance(graph, Path) or isinstance(graph, str):
+            graph = str(graph)
             if graph.endswith(".pt"):
                 self.graph = torch.load(graph, weights_only=False, map_location="cpu")
-            elif not graph.endswith(".yaml"):
+            elif graph.endswith(".yaml"):
+                self.graph = GraphCreator(graph).create(save_path=None).to("cpu")
+            else:
                 raise ValueError("The argument graph must be an actual graph (.pt) or a recipe to build one (.yaml).")
-
-        self.graph = GraphCreator(graph).create(save_path=None).to("cpu")
 
         self.edges_name = self.graph.edge_types if edges_name is None else edges_name
         self.edge_attribute_name = edge_attribute_name
@@ -63,9 +64,35 @@ class GraphExporter:
 
     @staticmethod
     def get_sparse_matrix(edge_index, edge_attribute, num_source_nodes, num_target_nodes):
-        # Create sparse matrix
+        """Create sparse matrix for y = A x.
+
+        x is defined on source nodes, and output is on target nodes.
+
+        Arguments
+        ---------
+        edge_index : torch.Tensor
+            (2, E) tensor with rows: target nodes, cols: source nodes
+        edge_attribute : torch.Tensor
+            Edge weights/attributes
+        num_source_nodes : int
+            Number of source nodes (n_in)
+        num_target_nodes : int
+            Number of target nodes (n_out)
+
+        Returns
+        -------
+        torch.sparse_coo_tensor
+            Sparse COO tensor on target nodes
+        """
+        rows = edge_index[1]
+        cols = edge_index[0]
+        indices = torch.stack([rows, cols])
+
         A = torch.sparse_coo_tensor(
-            edge_index, edge_attribute, (num_source_nodes, num_target_nodes), device=edge_index.device
+            indices,
+            edge_attribute,
+            (num_target_nodes, num_source_nodes),
+            device=edge_index.device,
         )
         return A.coalesce()
 
@@ -73,9 +100,10 @@ class GraphExporter:
     def convert_to_scipy_sparse(A):
         """Convert PyTorch sparse tensor to SciPy sparse matrix and save.
 
-        Args:
-            A: PyTorch sparse COO tensor
-            filename: Output filename (.npz extension)
+        Arguments
+        ---------
+        A : torch.sparse_coo_tensor
+            Sparse tensor
         """
         # Get indices and values from PyTorch sparse tensor
         indices = A.indices().cpu().numpy()

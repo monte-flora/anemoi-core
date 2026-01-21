@@ -23,6 +23,10 @@ from .common_components import TransformerModelComponent
 class GNNDecoderSchema(GNNModelComponent):
     target_: Literal["anemoi.models.layers.mapper.GNNBackwardMapper"] = Field(..., alias="_target_")
     "GNN decoder object from anemoi.models.layers.mapper."
+    initialise_data_extractor_zero: bool = Field(default=False, example=False)
+    "Initialise the data extractor with zeros. Default to False."
+    final_layer_norm: bool = Field(default=True, example=True)
+    "Apply LayerNorm before the final linear projection. Default to True."
 
 
 class GraphTransformerDecoderSchema(TransformerModelComponent):
@@ -36,11 +40,13 @@ class GraphTransformerDecoderSchema(TransformerModelComponent):
     "Normalize the query and key vectors. Default to False."
     initialise_data_extractor_zero: bool = Field(example=False)
     "Initialise the data extractor with zeros. Default to False."
+    final_layer_norm: bool = Field(default=True, example=True)
+    "Apply LayerNorm before the final linear projection. Default to True."
 
     @model_validator(mode="after")
     def check_valid_extras(self) -> Any:
         # This is a check to allow backwards compatibilty of the configs, as the extra fields are not required.
-        allowed_extras = {"shard_strategy": str}
+        allowed_extras = {"shard_strategy": str, "graph_attention_backend": str, "edge_pre_mlp": bool}
         extras = getattr(self, "__pydantic_extra__", {}) or {}
         for extra_field, value in extras.items():
             if extra_field not in allowed_extras:

@@ -61,6 +61,7 @@ class BaseLoss(nn.Module, ABC):
         self.sum_function = torch.nansum if ignore_nans else torch.sum
 
         self.supports_sharding = True
+        self.num_scales = 1
 
     @functools.wraps(ScaleTensor.add_scaler)
     def add_scaler(self, dimension: int | tuple[int], scaler: torch.Tensor, *, name: str | None = None) -> None:
@@ -204,6 +205,7 @@ class BaseLoss(nn.Module, ABC):
         without_scalers: list[str] | list[int] | None = None,
         grid_shard_slice: slice | None = None,
         group: ProcessGroup | None = None,
+        **kwargs,
     ) -> torch.Tensor:
         """Calculates the area-weighted scaled loss.
 
@@ -261,6 +263,7 @@ class FunctionalLoss(BaseLoss):
         without_scalers: list[str] | list[int] | None = None,
         grid_shard_slice: slice | None = None,
         group: ProcessGroup | None = None,
+        **kwargs,  # noqa: ARG002
     ) -> torch.Tensor:
         """Calculates the area-weighted scaled loss.
 
@@ -295,179 +298,303 @@ class FunctionalLoss(BaseLoss):
     
     
 class GraphCastBaseLoss(FunctionalLoss):
-    """
-    A minimal override that makes Anemoi's loss match GraphCast semantics:
+    """Loss with GraphCast-style reduction semantics.
 
-    - squashing over variable dimension happens at the end
-    - Grid reduction uses MEAN, not SUM
-    - Final loss = mean over batch of the sum of per-variable MSEs
+    Implements the reduction order from Lam et al. (2023) GraphCast paper:
+    1. Mean over vertical levels within each variable group
+    2. Mean over spatial (grid) and ensemble dimensions
+    3. Sum over variable groups
+    4. Mean over batch (optionally weighted by sample extremity)
+
+    This ensures each physical quantity (e.g., temperature, humidity) contributes
+    equally to the loss regardless of the number of vertical levels, unlike
+    the default Anemoi reduction which weights by level count.
+
+    Optionally supports sample weighting to downweight samples with extreme
+    target values, which helps with heavy-tailed distributions common in
+    convective weather prediction.
+
+    Reference:
+        Lam, R., et al. (2023). "Learning skillful medium-range global weather
+        forecasting." Science, 382(6677), 1416-1421.
     """
-    def __init__(self, *args, **kwargs):
+
+    def __init__(
+        self,
+        *args,
+        sample_weighting: bool = False,
+        sample_weight_threshold: float = 10.0,
+        sample_weight_min: float = 0.01,
+        **kwargs,
+    ) -> None:
+        """Initialize GraphCastBaseLoss.
+
+        Parameters
+        ----------
+        sample_weighting : bool, optional
+            If True, downweight samples with extreme target values. Default False.
+        sample_weight_threshold : float, optional
+            Target magnitude threshold for weighting. Samples with max |target| above
+            this value get progressively downweighted. Default 10.0 (10 sigma for
+            normalized tendencies).
+        sample_weight_min : float, optional
+            Minimum weight for extreme samples. Default 0.01 (1% of normal weight).
+        """
         super().__init__(*args, **kwargs)
-        # Initialize these as None so they exist on all instances
-        self.variable_groups = None
-        self.group_slices = None
-        self.group_sizes = None
-        self._per_variable_initialized = False
-    
-    def build_variable_groups_from_data_indices(self):
-        """
-        Produces a dict: basename -> list of variable indices (int)
-        Example: {"qv": [10,11,12,...], "theta": [...], "t2m":[3], ...}
-        Also builds contiguous slices for efficient indexing.
-        """
-        # Only want the prognostic variables. 
-        prognostic_indices = self.data_indices.data.output.prognostic # list of indices 
-        
-        name_to_idx = self.data_indices.data.output.name_to_index
-        var_names = list(name_to_idx.keys())
+        self.variable_groups: dict[str, list[int]] | None = None
+        self.group_slices: list[tuple[int, int]] | None = None
+        self.group_sizes: torch.Tensor | None = None
 
-        groups = {}
+        # Sample weighting parameters
+        self.sample_weighting = sample_weighting
+        self.sample_weight_threshold = sample_weight_threshold
+        self.sample_weight_min = sample_weight_min
+
+    def _build_variable_groups(self) -> dict[str, list[int]]:
+        """Build variable groups from data indices.
+
+        Groups variables by their base name (e.g., "temperature_500" -> "temperature").
+        Only includes prognostic variables in the grouping.
+
+        IMPORTANT: The indices returned are in the "prognostic-only" space (0 to n_prognostic-1),
+        not the full output space. This is because the loss function receives tensors that have
+        already been indexed to only include prognostic variables.
+
+        Returns
+        -------
+        dict[str, list[int]]
+            Mapping from base variable name to list of prognostic-space indices.
+        """
+        prognostic_indices = self.data_indices.data.output.prognostic
+        name_to_idx = self.data_indices.data.output.name_to_index
+
+        # Create mapping from full output index to prognostic-only index
+        # e.g., if prognostic_indices = [2, 5, 6, 7, 84, 85], then:
+        #   full_to_prognostic = {2: 0, 5: 1, 6: 2, 7: 3, 84: 4, 85: 5}
+        sorted_prognostic = sorted(prognostic_indices.tolist() if hasattr(prognostic_indices, 'tolist') else list(prognostic_indices))
+        full_to_prognostic = {full_idx: prog_idx for prog_idx, full_idx in enumerate(sorted_prognostic)}
+
+        LOGGER.debug(
+            "Building variable groups: %d prognostic variables, full indices range [%d, %d]",
+            len(sorted_prognostic),
+            min(sorted_prognostic) if sorted_prognostic else -1,
+            max(sorted_prognostic) if sorted_prognostic else -1,
+        )
+
+        groups: dict[str, list[int]] = {}
         for name, idx in name_to_idx.items():
-             # Skip if not a prognostic variable
             if idx not in prognostic_indices:
                 continue
-            
-            # Split on last underscore: qv_7 -> ('qv', '7')
+
+            # Parse variable name: "qv_7" -> base="qv", or "t2m" -> base="t2m"
             if "_" in name and name.split("_")[-1].isdigit():
                 base = "_".join(name.split("_")[:-1])
             else:
-                base = name  # single-level variable
+                base = name
 
-            idx = name_to_idx[name]
-            groups.setdefault(base, []).append(idx)
+            # Convert from full output index to prognostic-only index
+            prog_idx = full_to_prognostic[idx]
+            groups.setdefault(base, []).append(prog_idx)
 
-        # Sort indices within each group to ensure they're in order
+        # Sort indices within each group for consistent ordering
         for base in groups:
             groups[base].sort()
 
-        LOGGER.info(f"Prognostic variable groups for loss: {groups}")    
-            
         return groups
-    
+
     def set_data_indices(self, data_indices: IndexCollection) -> None:
-        """Build level-groups based on real Anemoi variable indices."""
+        """Initialize variable groups from data indices.
+
+        Parameters
+        ----------
+        data_indices : IndexCollection
+            Collection of data indices from the model.
+
+        Raises
+        ------
+        ValueError
+            If any variable group has non-contiguous indices.
+        """
         self.data_indices = data_indices
+        self.variable_groups = self._build_variable_groups()
 
-        # auto-build groups: basename -> [indices]
-        self.variable_groups = self.build_variable_groups_from_data_indices()
-
-        # Build contiguous slices for efficient indexing
+        # Build contiguous slices for efficient tensor indexing
         self.group_slices = []
         for basename, idxs in self.variable_groups.items():
             start_idx = min(idxs)
             end_idx = max(idxs) + 1
-            
-            # Verify contiguity
+
+            # Verify indices are contiguous for efficient slicing
             expected = list(range(start_idx, end_idx))
             if idxs != expected:
                 error_msg = (
                     f"Variable group '{basename}' has non-contiguous indices: {idxs}. "
                     f"Expected contiguous range: {expected}. "
-                    "This loss function requires variables to be stored in contiguous order."
+                    "GraphCast loss requires variables to be stored contiguously by level."
                 )
                 raise ValueError(error_msg)
-            
+
             self.group_slices.append((start_idx, end_idx))
-        
-        # Store group sizes as tensor for potential use
+
         self.group_sizes = torch.tensor(
             [len(idxs) for idxs in self.variable_groups.values()],
             dtype=torch.float,
         )
-        
-        LOGGER.info(
-            f"GraphCastLoss initialized with {len(self.variable_groups)} variable groups: "
-            f"{list(self.variable_groups.keys())}"
-            f"{self.group_slices=}"
-            f"{self.group_sizes}"
-        )
-    
-    def _per_variable_loss(self, out: torch.Tensor) -> torch.Tensor:
-        """
-        out: (B, E, G, Vflat) raw per-variable loss contributions.
-        Returns: (B, n_groups) after:
-             1. vertical-level aggregation (mean over levels within each group)
-             2. spatial + ensemble averaging
-        
-        Optimized for contiguous variable storage using direct slicing.
-        """
-        B, E, G, Vflat = out.shape
-        
-        # Process each variable group using contiguous slicing
-        per_group_means = []
-        for start_idx, end_idx in self.group_slices:
-            # Extract contiguous slice for this variable group
-            group_data = out[..., start_idx:end_idx]  # (B, E, G, group_size)
-            
-            # Mean over vertical levels (last dim) within this group
-            group_mean = group_data.mean(dim=-1)  # (B, E, G)
-            per_group_means.append(group_mean)
-        
-        # Stack into (B, E, G, n_groups)
-        per_group = torch.stack(per_group_means, dim=-1)
-        
-        # Average over ensemble + grid dims → (B, n_groups)
-        return per_group.mean(dim=(1, 2))
-    
-    def reduce(
-        self,
-        out: torch.Tensor,
-        squash: bool = True,
-        squash_mode: str = "avg",
-        group: ProcessGroup | None = None,
-    ) -> torch.Tensor:
-        """Reduce the out of the loss.
 
-        Following the procedure in Lam et al. (GraphCast)
-        
-        - Compute batch- and variable-preserving mean
-            -- variables are grouped by vertical level and averaged
-               before spatial or ensemble averaging
-        - Sum over the variable dimension 
-        - Compute batch-wise mean 
-        
-        If `squash` is False, then loss returned per-variable. 
-        
-        Irrespective of `squash`, the output is reduced over the
-        batch, ensemble and grid dimensions.
+        LOGGER.info(
+            "GraphCastBaseLoss initialized with %d variable groups: %s",
+            len(self.variable_groups),
+            list(self.variable_groups.keys()),
+        )
+
+        if self.sample_weighting:
+            LOGGER.info(
+                "Sample weighting enabled: threshold=%.1f, min_weight=%.3f",
+                self.sample_weight_threshold,
+                self.sample_weight_min,
+            )
+
+    def _compute_sample_weights(self, target: torch.Tensor) -> torch.Tensor:
+        """Compute per-sample weights based on target extremity.
+
+        Samples with extreme target values (large |target|) are downweighted
+        to reduce the influence of outliers during training.
+
+        The weighting scheme:
+        - weight = 1.0 for samples with max|target| <= threshold
+        - weight decreases for samples with max|target| > threshold
+        - weight is clamped to sample_weight_min to avoid zero weights
 
         Parameters
         ----------
-        out : torch.Tensor
-            Difference tensor, of shape TensorDim
-        squash : bool, optional
-            Whether to squash the variable dimension, by default True
-        squash_mode : str, optional
-            Ignored. 
+        target : torch.Tensor
+            Target tensor of shape (B, E, G, V)
 
         Returns
         -------
         torch.Tensor
-            Reduced output tensor
-
-        Raises
-        ------
-        ValueError
-            If squash_mode is not one of ['avg', 'sum']
+            Per-sample weights of shape (B,), normalized to sum to B
         """
-        # Compute batch- and variable group-preserving mean. 
-        # (B, ens, grid, var) -> (B, var)
-        out = self._per_variable_loss(out)
+        # Compute max absolute target value per sample: (B,)
+        # Max over ensemble, grid, and variable dimensions
+        max_abs_target = torch.abs(target).amax(dim=(1, 2, 3))  # (B,)
 
-        LOGGER.info(f"After _per_variable_loss: {out=}")
-        
+        # Compute weights: 1.0 for normal samples, decreasing for extreme samples
+        # weight = threshold / max(threshold, max_abs_target)
+        weights = self.sample_weight_threshold / torch.clamp(
+            max_abs_target, min=self.sample_weight_threshold
+        )
+
+        # Clamp to minimum weight
+        weights = torch.clamp(weights, min=self.sample_weight_min)
+
+        # Normalize weights so they sum to batch_size (preserves loss scale)
+        weights = weights * (weights.numel() / weights.sum())
+
+        return weights
+
+    def _reduce_per_variable(self, out: torch.Tensor) -> torch.Tensor:
+        """Reduce loss tensor to per-variable-group values.
+
+        Implements GraphCast reduction:
+        1. Mean over levels within each variable group
+        2. Mean over ensemble and grid dimensions
+
+        Parameters
+        ----------
+        out : torch.Tensor
+            Loss tensor of shape (B, E, G, V_flat)
+
+        Returns
+        -------
+        torch.Tensor
+            Reduced tensor of shape (B, n_groups)
+        """
+        per_group_means = []
+        for i, (start_idx, end_idx) in enumerate(self.group_slices):
+            # Extract contiguous slice: (B, E, G, n_levels)
+            group_data = out[..., start_idx:end_idx]
+
+            # Mean over levels: (B, E, G)
+            group_mean = group_data.mean(dim=-1)
+
+            per_group_means.append(group_mean)
+
+        # Stack: (B, E, G, n_groups)
+        per_group = torch.stack(per_group_means, dim=-1)
+
+        # Mean over ensemble and grid: (B, n_groups)
+        result = per_group.mean(dim=(TensorDim.ENSEMBLE_DIM, TensorDim.GRID))
+
+        return result
+
+    def reduce(
+        self,
+        out: torch.Tensor,
+        squash: bool = True,
+        squash_mode: str = "sum",  # Ignored, always sums for GraphCast semantics
+        group: ProcessGroup | None = None,
+        sample_weights: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Reduce loss tensor using GraphCast semantics.
+
+        Reduction order:
+        1. Mean over levels within each variable group
+        2. Mean over ensemble and grid dimensions
+        3. Sum over variable groups (if squash=True)
+        4. Weighted mean over batch (if sample_weights provided)
+
+        Parameters
+        ----------
+        out : torch.Tensor
+            Loss tensor of shape (B, E, G, V)
+        squash : bool, optional
+            If True, sum over variables and return scalar.
+            If False, return per-variable-group losses. Default True.
+        squash_mode : str, optional
+            Ignored. GraphCast always uses sum over variables.
+        group : ProcessGroup | None, optional
+            Distributed process group for reduction. Default None.
+        sample_weights : torch.Tensor | None, optional
+            Per-sample weights of shape (B,). If provided, used for weighted
+            mean over batch dimension. Default None.
+
+        Returns
+        -------
+        torch.Tensor
+            Scalar loss if squash=True, else tensor of shape (n_groups,)
+        """
+        # (B, E, G, V) -> (B, n_groups)
+        out = self._reduce_per_variable(out)
+
         if squash:
-            out = self.sum_function(out, dim=-1) # (B, var) -> (B,)
-            out = self.avg_function(out) #(B) -> scalar
-            
-            LOGGER.info(f"After squash: {out=}")
-            
-            return out if group is None else reduce_tensor(out, group) 
-                
-        # Average over the batch dimension for the per-variable losses
-        # (for plotting and logging)
-        out = self.avg_function(out, dim=TensorDim.BATCH_SIZE)  # (var,)
+            # Sum over variable groups: (B,)
+            out = self.sum_function(out, dim=-1)
 
-        return out if group is None else reduce_tensor(out, group)
+            # Weighted mean over batch: scalar
+            if sample_weights is not None:
+                # Weighted average: sum(out * weights) / sum(weights)
+                out = (out * sample_weights).sum() / sample_weights.sum()
+            else:
+                out = self.avg_function(out)
+
+            if group is None:
+                return out
+            # reduce_tensor does all_reduce SUM, so divide by world_size to get mean
+            # This is needed because _reduce_per_variable computes LOCAL means over
+            # each GPU's grid shard, and we need the GLOBAL mean
+            out = reduce_tensor(out, group)
+            return out / torch.distributed.get_world_size(group)
+
+        # For per-variable diagnostics: mean over batch -> (n_groups,)
+        if sample_weights is not None:
+            # Weighted average per group: (n_groups,)
+            out = (out * sample_weights.unsqueeze(-1)).sum(dim=0) / sample_weights.sum()
+        else:
+            out = self.avg_function(out, dim=TensorDim.BATCH_SIZE)
+
+        if group is None:
+            return out
+        out = reduce_tensor(out, group)
+        return out / torch.distributed.get_world_size(group)
           

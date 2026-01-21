@@ -9,20 +9,24 @@
 
 from .builders.cutoff import CutOffEdges
 from .builders.cutoff import ReversedCutOffEdges
+from .builders.healpix import HEALPixMultiScaleEdges
 from .builders.icon import ICONTopologicalDecoderEdges
 from .builders.icon import ICONTopologicalEncoderEdges
 from .builders.icon import ICONTopologicalProcessorEdges
 from .builders.knn import KNNEdges
 from .builders.knn import ReversedKNNEdges
+from .builders.mpas import MPASTopologicalEdges
 from .builders.multi_scale import MultiScaleEdges
 
 __all__ = [
     "KNNEdges",
     "CutOffEdges",
+    "HEALPixMultiScaleEdges",
     "MultiScaleEdges",
     "ReversedCutOffEdges",
     "ReversedKNNEdges",
     "ICONTopologicalProcessorEdges",
     "ICONTopologicalEncoderEdges",
     "ICONTopologicalDecoderEdges",
+    "MPASTopologicalEdges",
 ]

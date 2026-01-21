@@ -29,6 +29,10 @@ LOGGER = logging.getLogger(__name__)
 class NativeGridDataset(IterableDataset):
     """Iterable dataset for AnemoI data on the arbitrary grids."""
 
+    # Class variable to enable trajectory-diverse batching
+    # When enabled, consecutive samples come from different trajectories
+    _trajectory_diverse_batching = True
+
     def __init__(
         self,
         data_reader: Callable,
@@ -61,16 +65,11 @@ class NativeGridDataset(IterableDataset):
         num_gpus_per_model : int, optional
             Number of GPUs per model, by default 1
         """
-        self.label = label
-
         self.data = data_reader
-
         self.timestep = timestep
         self.grid_indices = grid_indices
-
-        # lazy init
-        self.n_samples_per_epoch_total: int = 0
-        self.n_samples_per_epoch_per_worker: int = 0
+        self.label = label
+        self.relative_date_indices = relative_date_indices  # relative index of dates to extract
 
         self.num_gpus_per_ens = num_gpus_per_ens
         self.num_gpus_per_model = num_gpus_per_model
@@ -95,13 +94,6 @@ class NativeGridDataset(IterableDataset):
         self.n_samples_per_worker = 0
         self.chunk_index_range: np.ndarray | None = None
         self.shuffle = shuffle
-
-        # Data dimensions
-        self.ensemble_dim: int = 2
-        self.ensemble_size = self.data.shape[self.ensemble_dim]
-
-        # relative index of dates to extract
-        self.relative_date_indices = relative_date_indices
 
     @cached_property
     def statistics(self) -> dict:
@@ -128,7 +120,7 @@ class NativeGridDataset(IterableDataset):
 
     @cached_property
     def name_to_index(self) -> dict:
-        """Return dataset statistics."""
+        """Return dataset name_to_index mapping."""
         return self.data.name_to_index
 
     @cached_property
@@ -289,6 +281,77 @@ class NativeGridDataset(IterableDataset):
             sanity_rnd,
         )
 
+    def _get_trajectory_diverse_indices(self, chunk_indices: np.ndarray) -> np.ndarray:
+        """Reorder indices to ensure consecutive samples come from different trajectories.
+
+        This ensures that when the DataLoader batches consecutive samples, each batch
+        contains samples from diverse forecast trajectories (different weather regimes).
+
+        The algorithm:
+        1. Group indices by trajectory ID
+        2. Shuffle within each trajectory group
+        3. Yield indices in round-robin fashion across trajectories
+
+        Parameters
+        ----------
+        chunk_indices : np.ndarray
+            The indices to reorder (already assigned to this worker's chunk)
+
+        Returns
+        -------
+        np.ndarray
+            Reordered indices with trajectory diversity
+        """
+        traj_ids = getattr(self.data, 'trajectory_ids', None)
+        if traj_ids is None:
+            LOGGER.debug("No trajectory_ids available, falling back to standard shuffle")
+            return chunk_indices
+
+        # Group chunk indices by their trajectory ID
+        traj_to_indices = {}
+        for idx in chunk_indices:
+            traj_id = traj_ids[idx]
+            if traj_id not in traj_to_indices:
+                traj_to_indices[traj_id] = []
+            traj_to_indices[traj_id].append(idx)
+
+        # Shuffle within each trajectory group
+        for traj_id in traj_to_indices:
+            self.rng.shuffle(traj_to_indices[traj_id])
+
+        # Get list of trajectories and shuffle their order
+        trajectory_list = list(traj_to_indices.keys())
+        self.rng.shuffle(trajectory_list)
+
+        # Round-robin across trajectories to create diverse ordering
+        diverse_indices = []
+        traj_iterators = {t: iter(indices) for t, indices in traj_to_indices.items()}
+        active_trajs = list(trajectory_list)
+
+        while active_trajs:
+            # Take one sample from each active trajectory
+            next_round_trajs = []
+            for traj_id in active_trajs:
+                try:
+                    idx = next(traj_iterators[traj_id])
+                    diverse_indices.append(idx)
+                    next_round_trajs.append(traj_id)
+                except StopIteration:
+                    # This trajectory is exhausted
+                    pass
+            active_trajs = next_round_trajs
+
+        diverse_indices = np.array(diverse_indices, dtype=chunk_indices.dtype)
+
+        LOGGER.debug(
+            "Trajectory-diverse batching (worker %d): %d indices from %d trajectories",
+            getattr(self, 'worker_id', 0),
+            len(diverse_indices),
+            len(traj_to_indices),
+        )
+
+        return diverse_indices
+
     def __iter__(self) -> torch.Tensor:
         """Return an iterator over the dataset.
 
@@ -304,6 +367,10 @@ class NativeGridDataset(IterableDataset):
                 size=len(self.valid_date_indices),
                 replace=False,
             )[self.chunk_index_range]
+
+            # Apply trajectory-diverse reordering if enabled
+            if self._trajectory_diverse_batching:
+                shuffled_chunk_indices = self._get_trajectory_diverse_indices(shuffled_chunk_indices)
         else:
             shuffled_chunk_indices = self.valid_date_indices[self.chunk_index_range]
 
@@ -322,7 +389,7 @@ class NativeGridDataset(IterableDataset):
             shuffled_chunk_indices[:10],
         )
 
-        for i in shuffled_chunk_indices:
+        for sample_count, i in enumerate(shuffled_chunk_indices):
             start = i + self.relative_date_indices[0]
             end = i + self.relative_date_indices[-1] + 1
             timeincrement = self.relative_date_indices[1] - self.relative_date_indices[0]

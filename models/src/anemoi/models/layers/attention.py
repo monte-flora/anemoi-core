@@ -14,8 +14,10 @@ import logging
 import math
 from typing import Any
 from typing import Optional
+from typing import Tuple
 
 import einops
+import numpy as np
 import torch
 from packaging import version
 from torch import Tensor
@@ -23,6 +25,8 @@ from torch import nn
 from torch.distributed.distributed_c10d import ProcessGroup
 from torch_geometric.typing import PairTensor
 
+from anemoi.models.distributed.graph import shard_tensor
+from anemoi.models.distributed.graph import sync_tensor
 from anemoi.models.distributed.transformer import shard_heads
 from anemoi.models.distributed.transformer import shard_sequence
 from anemoi.utils.config import DotDict
@@ -218,6 +222,132 @@ class MultiHeadSelfAttention(nn.Module):
 
         return self.attention_computation(query, key, value, shapes, batch_size, model_comm_group)
 
+def compute_banded_permutation(edge_index: Tensor, num_nodes: int) -> Tuple[Tensor, Tensor]:
+    """Compute a banded permutation using reverse Cuthill-McKee ordering.
+
+    This helps make graph adjacency local in sequence space so windowed
+    flash attention can approximate k-hop neighborhoods efficiently.
+    """
+    try:
+        import scipy.sparse as sp
+    except ImportError as exc:
+        raise ImportError(
+            "scipy is required to compute a banded permutation; "
+            "precompute perm/inv_perm and pass them in if scipy is unavailable."
+        ) from exc
+
+    edge_index_cpu = edge_index.detach().cpu()
+    rows = edge_index_cpu[0].numpy()
+    cols = edge_index_cpu[1].numpy()
+    rows_sym = np.concatenate([rows, cols])
+    cols_sym = np.concatenate([cols, rows])
+    data = np.ones(rows_sym.shape[0], dtype=np.bool_)
+    adj = sp.csr_matrix((data, (rows_sym, cols_sym)), shape=(num_nodes, num_nodes))
+    perm = sp.csgraph.reverse_cuthill_mckee(adj, symmetric_mode=True)
+    perm = torch.as_tensor(perm.copy(), dtype=torch.long)
+    inv_perm = torch.empty_like(perm)
+    inv_perm[perm] = torch.arange(num_nodes, dtype=torch.long)
+    return perm, inv_perm
+
+
+class BandedGraphSelfAttention(nn.Module):
+    """Self-attention with a banded graph permutation and windowed attention."""
+
+    def __init__(
+        self,
+        num_heads: int,
+        embed_dim: int,
+        layer_kernels: DotDict,
+        window_size: Optional[int] = None,
+        qkv_bias: bool = False,
+        qk_norm: bool = False,
+        is_causal: bool = False,
+        dropout_p: float = 0.0,
+        attention_implementation: str = "flash_attention",
+        softcap: Optional[float] = None,
+        use_alibi_slopes: bool = False,
+        use_rotary_embeddings: bool = False,
+    ):
+        super().__init__()
+        self.attention = MultiHeadSelfAttention(
+            num_heads=num_heads,
+            embed_dim=embed_dim,
+            layer_kernels=layer_kernels,
+            window_size=window_size,
+            qkv_bias=qkv_bias,
+            qk_norm=qk_norm,
+            is_causal=is_causal,
+            dropout_p=dropout_p,
+            attention_implementation=attention_implementation,
+            softcap=softcap,
+            use_alibi_slopes=use_alibi_slopes,
+            use_rotary_embeddings=use_rotary_embeddings,
+        )
+        self._perm = None
+        self._inv_perm = None
+
+    def set_permutation(self, perm: Tensor, inv_perm: Tensor) -> None:
+        self._perm = perm
+        self._inv_perm = inv_perm
+
+    def forward(
+        self,
+        x: Tensor,
+        shapes: list,
+        batch_size: int,
+        *,
+        perm: Optional[Tensor] = None,
+        inv_perm: Optional[Tensor] = None,
+        model_comm_group: Optional[ProcessGroup] = None,
+    ) -> Tensor:
+        perm = perm if perm is not None else self._perm
+        inv_perm = inv_perm if inv_perm is not None else self._inv_perm
+        if perm is None or inv_perm is None:
+            raise ValueError("perm and inv_perm must be provided or set via set_permutation")
+
+        num_nodes = perm.numel()
+
+        if perm.device != x.device:
+            perm = perm.to(device=x.device)
+        if inv_perm.device != x.device:
+            inv_perm = inv_perm.to(device=x.device)
+
+        # Handle distributed training: sync (gather) tensor from all GPUs before permutation
+        is_distributed = model_comm_group is not None and model_comm_group.size() > 1
+        if is_distributed:
+            # Gather all shards to get full tensor on each GPU
+            x = sync_tensor(x, dim=0, shapes=shapes, mgroup=model_comm_group)
+            # Compute full shapes for attention after sync
+            full_shapes = [[batch_size * num_nodes, x.shape[-1]]]
+        else:
+            full_shapes = shapes
+
+        # Verify shape after potential sync
+        expected = batch_size * num_nodes
+        if x.shape[0] != expected:
+            raise ValueError(f"Expected x.shape[0] == {expected}, got {x.shape[0]}")
+
+        # Apply RCM permutation to reorder nodes
+        x = x.view(batch_size, num_nodes, -1)
+        x = x.index_select(1, perm)
+        x = x.reshape(batch_size * num_nodes, -1)
+
+        # Run attention (with window_size, this approximates k-hop attention)
+        # Note: Don't pass model_comm_group here since we've already synced
+        out = self.attention(x, full_shapes, batch_size, model_comm_group=None)
+
+        # Apply inverse permutation to restore original node order
+        out = out.view(batch_size, num_nodes, -1)
+        out = out.index_select(1, inv_perm)
+        out = out.reshape(batch_size * num_nodes, -1)
+
+        # Shard output back to original distribution
+        if is_distributed:
+            out = shard_tensor(out, dim=0, shapes=shapes, mgroup=model_comm_group, gather_in_backward=True)
+
+        return out
+    
+    
 
 class SDPAAttentionWrapper(nn.Module):
     """Wrapper for Pytorch scaled dot product attention

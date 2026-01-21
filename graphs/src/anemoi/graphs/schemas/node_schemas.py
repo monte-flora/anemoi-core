@@ -43,6 +43,38 @@ class NPZnodeSchema(BaseModel):
     "The key name of the longitude field."
 
 
+class MPASCoarseNodeSchema(BaseModel):
+    target_: Literal["anemoi.graphs.nodes.MPASCoarseNodes"] = Field(..., alias="_target_")
+    "Nodes from a coarsened MPAS Voronoi mesh implementation from anemoi.graphs.nodes."
+    mpas_mesh_path: str
+    "Path to the MPAS static mesh NetCDF file."
+    target_spacing_km: PositiveFloat
+    "Target spacing in kilometers used to aggregate cells."
+    max_cells: Optional[PositiveInt] = None
+    "Optional cap on the number of fine cells to consider."
+    seed: int = 0
+    "Shuffle seed for coarse seeding."
+
+
+class LimitedAreaMPASNodeSchema(BaseModel):
+    target_: Literal["anemoi.graphs.nodes.LimitedAreaMPASNodes"] = Field(..., alias="_target_")
+    "Limited-area nodes from a coarsened MPAS Voronoi mesh implementation from anemoi.graphs.nodes."
+    mpas_mesh_path: str
+    "Path to the MPAS static mesh NetCDF file."
+    target_spacing_km: PositiveFloat
+    "Target spacing in kilometers used to aggregate cells."
+    reference_node_name: str
+    "Name of the reference nodes in the graph to consider for the area mask."
+    mask_attr_name: Optional[str] = None
+    "Name of a node to attribute to mask the reference nodes, if desired."
+    margin_radius_km: PositiveFloat = Field(example=100.0)
+    "Maximum distance to the reference nodes to consider a node as valid, in kilometers."
+    max_cells: Optional[PositiveInt] = None
+    "Optional cap on the number of fine cells to consider."
+    seed: int = 0
+    "Shuffle seed for coarse seeding."
+
+
 class TextNodeSchema(BaseModel):
     target_: Literal["anemoi.graphs.nodes.TextNodes"] = Field(..., alias="_target_")
     "Nodes from text file class implementation from anemoi.graphs.nodes."
@@ -135,7 +167,6 @@ class LimitedAreaIcosahedralandHealPixNodeSchema(BaseModel):
     "Refinement level of the mesh."
     reference_node_name: str  # TODO(Helen): Discuss check that reference nodes exists in the config
     "Name of the reference nodes in the graph to consider for the Area Mask."
-
     mask_attr_name: Optional[str] = None  # TODO(Helen): Discuss check that mask_attr_name exists in the dataset config
 
     "Name of a node to attribute to mask the reference nodes, if desired. Defaults to consider all reference nodes."
@@ -161,6 +192,8 @@ class StretchedIcosahdralNodeSchema(BaseModel):
 NodeBuilderSchemas = Annotated[
     AnemoiDatasetNodeSchema
     | NPZnodeSchema
+    | MPASCoarseNodeSchema
+    | LimitedAreaMPASNodeSchema
     | TextNodeSchema
     | ICONNodeSchema
     | ICONMeshNodeSchema

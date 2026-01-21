@@ -45,7 +45,9 @@ from anemoi.training.diagnostics.plots import plot_loss
 from anemoi.training.diagnostics.plots import plot_power_spectrum
 from anemoi.training.diagnostics.plots import plot_predicted_multilevel_flat_sample
 from anemoi.training.losses.base import BaseLoss
+from anemoi.training.losses.utils import reduce_to_last_dim
 from anemoi.training.schemas.base_schema import BaseSchema
+from anemoi.training.train.tasks import GraphInterpolator
 
 LOGGER = logging.getLogger(__name__)
 
@@ -64,7 +66,7 @@ class BasePlotCallback(Callback, ABC):
         """
         super().__init__()
         self.config = config
-        self.save_basedir = config.hardware.paths.plots
+        self.save_basedir = config.system.output.plots
 
         self.post_processors = None
         self.latlons = None
@@ -87,6 +89,18 @@ class BasePlotCallback(Callback, ABC):
         self.loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self.loop)
         self.loop.run_forever()
+
+    def _get_init_step(self, rollout_step: int, mode: tuple) -> int:
+        """Return index of initial step for plotting."""
+        return rollout_step if mode == "time_interp" else 0
+
+    def _get_output_times(self, config: BaseSchema, pl_module: pl.LightningModule) -> tuple:
+        """Return times outputted by the model."""
+        if isinstance(pl_module, GraphInterpolator):
+            output_times = (len(config.training.explicit_times.target), "time_interp")
+        else:
+            output_times = (getattr(pl_module, "rollout", 0), "forecast")
+        return output_times
 
     @rank_zero_only
     def _output_figure(
@@ -266,6 +280,8 @@ class BasePerBatchPlotCallback(BasePlotCallback):
                     post_processor.nan_locations = pl_module.allgather_batch(post_processor.nan_locations)
             self.post_processors = self.post_processors.cpu()
 
+            output_times = self._get_output_times(self.config, pl_module)
+
             self.plot(
                 trainer,
                 pl_module,
@@ -273,6 +289,7 @@ class BasePerBatchPlotCallback(BasePlotCallback):
                 batch,
                 batch_idx,
                 epoch=trainer.current_epoch,
+                output_times=output_times,
                 **kwargs,
             )
 
@@ -302,7 +319,10 @@ class BasePerEpochPlotCallback(BasePlotCallback):
         **kwargs,
     ) -> None:
         if trainer.current_epoch % self.every_n_epochs == 0:
-            self.plot(trainer, pl_module, epoch=trainer.current_epoch, **kwargs)
+
+            output_times = self._get_output_times(self.config, pl_module)
+
+            self.plot(trainer, pl_module, epoch=trainer.current_epoch, output_times=output_times, **kwargs)
 
 
 class LongRolloutPlots(BasePlotCallback):
@@ -425,7 +445,8 @@ class LongRolloutPlots(BasePlotCallback):
             for name in self.parameters
         }
         if self.latlons is None:
-            self.latlons = np.rad2deg(pl_module.latlons_data.clone().detach().cpu().numpy())
+            self.latlons = pl_module.model.model._graph_data[pl_module.model.model._graph_name_data].x.detach()
+            self.latlons = np.rad2deg(self.latlons.cpu().numpy())
 
         assert batch.shape[1] >= self.max_rollout + pl_module.multi_step, (
             "Batch length not sufficient for requested validation rollout length! "
@@ -710,7 +731,13 @@ class GraphTrainableFeaturesPlot(BasePerEpochPlotCallback):
         else:
             LOGGER.warning("There are no trainable node attributes to plot.")
 
-        if len(edge_trainable_modules := self.get_edge_trainable_modules(model)):
+        from anemoi.models.models import AnemoiModelEncProcDecHierarchical
+
+        if isinstance(model, AnemoiModelEncProcDecHierarchical):
+            LOGGER.warning(
+                "Edge trainable features are not supported for Hierarchical models, skipping plot generation.",
+            )
+        elif len(edge_trainable_modules := self.get_edge_trainable_modules(model)):
             fig = plot_graph_edge_features(model, edge_trainable_modules, q_extreme_limit=self.q_extreme_limit)
 
             self._output_figure(
@@ -722,6 +749,16 @@ class GraphTrainableFeaturesPlot(BasePerEpochPlotCallback):
             )
         else:
             LOGGER.warning("There are no trainable edge attributes to plot.")
+
+    @rank_zero_only
+    def on_validation_epoch_end(
+        self,
+        trainer: pl.Trainer,
+        pl_module: pl.LightningModule,
+        **kwargs,
+    ) -> None:
+
+        self.plot(trainer, pl_module, epoch=trainer.current_epoch, **kwargs)
 
 
 class PlotLoss(BasePerBatchPlotCallback):
@@ -861,6 +898,7 @@ class PlotLoss(BasePerBatchPlotCallback):
         batch: torch.Tensor,
         batch_idx: int,
         epoch: int,
+        output_times: tuple,
     ) -> None:
         logger = trainer.logger
         _ = batch_idx
@@ -885,9 +923,13 @@ class PlotLoss(BasePerBatchPlotCallback):
                 RuntimeWarning,
             )
 
-        rollout = getattr(pl_module, "rollout", 0)
+        # Check if this is a GraphCast-style loss (returns grouped losses)
+        is_graphcast_loss = (
+            hasattr(self.loss, "variable_groups")
+            and self.loss.variable_groups is not None
+        )
 
-        for rollout_step in range(rollout):
+        for rollout_step in range(output_times[0]):
             y_hat = outputs[1][rollout_step]
             y_true = batch[
                 :,
@@ -895,18 +937,48 @@ class PlotLoss(BasePerBatchPlotCallback):
                 ...,
                 pl_module.data_indices.data.output.full,
             ]
-            loss = self.loss(y_hat, y_true, squash=False).detach().cpu().numpy()
+            loss = reduce_to_last_dim(self.loss(y_hat, y_true, squash=False).detach().cpu().numpy())
 
-            sort_by_parameter_group, colors, xticks, legend_patches = self.sort_and_color_by_parameter_group
-            loss = loss[argsort_indices]
-            fig = plot_loss(loss[sort_by_parameter_group], colors, xticks, legend_patches)
+            if is_graphcast_loss:
+                # GraphCast loss returns per-group losses, not per-variable
+                # Use simple bar plot with group names
+                group_names = list(self.loss.variable_groups.keys())
+                n_groups = len(group_names)
+
+                if len(loss) != n_groups:
+                    LOGGER.warning(
+                        "GraphCast loss shape %s does not match variable groups %d. Skipping plot.",
+                        loss.shape,
+                        n_groups,
+                    )
+                    continue
+
+                fig, ax = plt.subplots(figsize=(max(10, n_groups * 0.5), 6))
+                sort_idx = np.argsort(group_names)
+                sorted_names = [group_names[i] for i in sort_idx]
+                sorted_loss = loss[sort_idx]
+
+                cmap = plt.cm.get_cmap("tab20", n_groups)
+                colors = [cmap(i) for i in range(n_groups)]
+                ax.bar(range(n_groups), sorted_loss, color=colors)
+                ax.set_xticks(range(n_groups))
+                ax.set_xticklabels(sorted_names, rotation=45, ha="right", fontsize=8)
+                ax.set_ylabel("Loss (per variable group)")
+                ax.set_title(f"Loss by Variable Group - Step {rollout_step}")
+                ax.set_yscale("log")
+                plt.tight_layout()
+            else:
+                # Standard per-variable loss plotting
+                sort_by_parameter_group, colors, xticks, legend_patches = self.sort_and_color_by_parameter_group
+                loss = loss[argsort_indices]
+                fig = plot_loss(loss[sort_by_parameter_group], colors, xticks, legend_patches)
 
             self._output_figure(
                 logger,
                 fig,
                 epoch=epoch,
-                tag=f"loss_rstep_rstep{rollout_step:02d}_rank{pl_module.local_rank:01d}",
-                exp_log_tag=f"loss_sample_rstep{rollout_step:02d}_rank{pl_module.local_rank:01d}",
+                tag=f"loss_step{rollout_step:02d}_rank{pl_module.local_rank:01d}",
+                exp_log_tag=f"loss_sample_step{rollout_step:02d}_rank{pl_module.local_rank:01d}",
             )
 
     def on_validation_batch_end(
@@ -938,6 +1010,146 @@ class PlotLoss(BasePerBatchPlotCallback):
             )
 
 
+class PlotGraphCastLoss(BasePerBatchPlotCallback):
+    """Plots per-variable-group loss for GraphCast-style losses.
+
+    This callback is designed for use with GraphCastMSELoss and other losses
+    that return per-variable-group losses (grouped by base variable name)
+    rather than per-flat-variable losses.
+    """
+
+    def __init__(
+        self,
+        config: OmegaConf,
+        every_n_batches: int | None = None,
+    ) -> None:
+        """Initialize the PlotGraphCastLoss callback.
+
+        Parameters
+        ----------
+        config : OmegaConf
+            Object with configuration settings
+        every_n_batches : int, optional
+            Override for batch frequency, by default None
+        """
+        super().__init__(config, every_n_batches=every_n_batches)
+        self.group_names = None
+
+    @rank_zero_only
+    def _plot(
+        self,
+        trainer: pl.Trainer,
+        pl_module: pl.LightningModule,
+        outputs: list[torch.Tensor],
+        batch: torch.Tensor,
+        batch_idx: int,
+        epoch: int,
+        output_times: tuple,
+    ) -> None:
+        logger = trainer.logger
+        _ = batch_idx
+
+        # Get variable group names from the loss function
+        if hasattr(self.loss, "variable_groups") and self.loss.variable_groups is not None:
+            self.group_names = list(self.loss.variable_groups.keys())
+        else:
+            LOGGER.warning(
+                "Loss function does not have variable_groups attribute. "
+                "PlotGraphCastLoss requires a GraphCast-style loss function."
+            )
+            return
+
+        n_groups = len(self.group_names)
+
+        for rollout_step in range(output_times[0]):
+            y_hat = outputs[1][rollout_step]
+            y_true = batch[
+                :,
+                pl_module.multi_step + rollout_step,
+                ...,
+                pl_module.data_indices.data.output.full,
+            ]
+
+            # Get per-group losses (shape: n_groups)
+            loss = reduce_to_last_dim(self.loss(y_hat, y_true, squash=False).detach().cpu().numpy())
+
+            if len(loss) != n_groups:
+                LOGGER.warning(
+                    f"Loss shape {loss.shape} does not match number of variable groups {n_groups}. "
+                    "Skipping plot."
+                )
+                return
+
+            # Create bar plot for grouped losses
+            fig, ax = plt.subplots(figsize=(max(10, n_groups * 0.5), 6))
+
+            # Sort groups alphabetically for consistent ordering
+            sort_idx = np.argsort(self.group_names)
+            sorted_names = [self.group_names[i] for i in sort_idx]
+            sorted_loss = loss[sort_idx]
+
+            # Create color map
+            cmap = plt.cm.get_cmap("tab20", n_groups)
+            colors = [cmap(i) for i in range(n_groups)]
+
+            bars = ax.bar(range(n_groups), sorted_loss, color=colors)
+
+            ax.set_xticks(range(n_groups))
+            ax.set_xticklabels(sorted_names, rotation=45, ha="right", fontsize=8)
+            ax.set_ylabel("Loss (per variable group)")
+            ax.set_title(f"GraphCast Loss by Variable Group - Step {rollout_step}")
+            ax.set_yscale("log")
+
+            # Add value labels on bars
+            for bar, val in zip(bars, sorted_loss):
+                ax.annotate(
+                    f"{val:.2e}",
+                    xy=(bar.get_x() + bar.get_width() / 2, bar.get_height()),
+                    xytext=(0, 3),
+                    textcoords="offset points",
+                    ha="center",
+                    va="bottom",
+                    fontsize=6,
+                    rotation=90,
+                )
+
+            plt.tight_layout()
+
+            self._output_figure(
+                logger,
+                fig,
+                epoch=epoch,
+                tag=f"graphcast_loss_step{rollout_step:02d}_rank{pl_module.local_rank:01d}",
+                exp_log_tag=f"graphcast_loss_sample_step{rollout_step:02d}_rank{pl_module.local_rank:01d}",
+            )
+
+    def on_validation_batch_end(
+        self,
+        trainer: pl.Trainer,
+        pl_module: pl.LightningModule,
+        output: list[torch.Tensor],
+        batch: torch.Tensor,
+        batch_idx: int,
+    ) -> None:
+        if batch_idx % self.every_n_batches == 0:
+            self.loss = copy.deepcopy(pl_module.loss)
+
+            # Gather nan-mask weight shards if needed
+            if (
+                hasattr(self.loss.scaler, "nan_mask_weights")
+                and self.loss.scaler.nan_mask_weights.shape[pl_module.grid_dim] != 1
+            ):
+                self.loss.scaler.nan_mask_weights = pl_module.allgather_batch(self.loss.scaler.nan_mask_weights)
+
+            super().on_validation_batch_end(
+                trainer,
+                pl_module,
+                output,
+                batch,
+                batch_idx,
+            )
+
+
 class BasePlotAdditionalMetrics(BasePerBatchPlotCallback):
     """Base processing class for additional metrics."""
 
@@ -946,15 +1158,17 @@ class BasePlotAdditionalMetrics(BasePerBatchPlotCallback):
         pl_module: pl.LightningModule,
         outputs: list,
         batch: torch.Tensor,
+        output_times: tuple,
     ) -> tuple[np.ndarray, np.ndarray]:
 
         if self.latlons is None:
-            self.latlons = np.rad2deg(pl_module.latlons_data.clone().detach().cpu().numpy())
+            self.latlons = pl_module.model.model._graph_data[pl_module.model.model._graph_name_data].x.detach()
+            self.latlons = np.rad2deg(self.latlons.cpu().numpy())
 
         input_tensor = (
             batch[
                 :,
-                pl_module.multi_step - 1 : pl_module.multi_step + pl_module.rollout + 1,
+                pl_module.multi_step - 1 : pl_module.multi_step + output_times[0] + 1,
                 ...,
                 pl_module.data_indices.data.output.full,
             ]
@@ -1035,6 +1249,7 @@ class PlotSample(BasePlotAdditionalMetrics):
         batch: torch.Tensor,
         batch_idx: int,
         epoch: int,
+        output_times: tuple,
     ) -> None:
         logger = trainer.logger
 
@@ -1048,44 +1263,19 @@ class PlotSample(BasePlotAdditionalMetrics):
             for name in self.parameters
         }
 
-        data, output_tensor = self.process(pl_module, outputs, batch)
+        data, output_tensor = self.process(pl_module, outputs, batch, output_times)
 
         local_rank = pl_module.local_rank
 
-        input_tensor = (
-            batch[
-                :,
-                pl_module.multi_step - 1 : pl_module.multi_step + pl_module.rollout + 1,
-                ...,
-                pl_module.data_indices.data.output.full,
-            ]
-            .detach()
-            .cpu()
-        )
-        
-        data = self.post_processors(input_tensor)[self.sample_idx]
-        output_tensor = torch.cat(
-            tuple(
-                self.post_processors(x[:, ...].detach().cpu(), in_place=False)[self.sample_idx : self.sample_idx + 1]
-                for x in outputs[1]
-            ),
-        )
-        # Monte: perhaps not accounting for ensemble dim change?
-        # So switching 1->2 
-        # Also, removing the .numpy to avoid a cuda/cpu mismatch error
-        # RuntimeError: expected self and mask to be on the same device, but got mask on cuda:0 and self on cpu
-        output_tensor = pl_module.output_mask.apply(output_tensor, dim=2, fill_value=np.nan).numpy()
-        data[1:, ...] = pl_module.output_mask.apply(data[1:, ...], dim=2, fill_value=np.nan)
-        data = data.numpy()
+        for rollout_step in range(output_times[0]):
+            init_step = self._get_init_step(rollout_step, output_times[1])
 
-        rollout = getattr(pl_module, "rollout", 0)
-        for rollout_step in range(rollout):
             fig = plot_predicted_multilevel_flat_sample(
                 plot_parameters_dict,
                 self.per_sample,
                 self.latlons,
                 self.accumulation_levels_plot,
-                data[0, ...].squeeze(),
+                data[init_step, ...].squeeze(),
                 data[rollout_step + 1, ...].squeeze(),
                 output_tensor[rollout_step, ...],
                 datashader=self.datashader_plotting,
@@ -1100,45 +1290,6 @@ class PlotSample(BasePlotAdditionalMetrics):
                 tag=f"pred_val_sample_rstep{rollout_step:02d}_batch{batch_idx:04d}_rank{local_rank:01d}",
                 exp_log_tag=f"val_pred_sample_rstep{rollout_step:02d}_rank{local_rank:01d}",
             )
-
-
-
-class BasePlotAdditionalMetrics(BasePerBatchPlotCallback):
-    """Base processing class for additional metrics."""
-
-    def process(
-        self,
-        pl_module: pl.LightningModule,
-        outputs: list,
-        batch: torch.Tensor,
-    ) -> tuple[np.ndarray, np.ndarray]:
-        if self.latlons is None:
-            self.latlons = np.rad2deg(pl_module.latlons_data.clone().detach().cpu().numpy())
-
-        input_tensor = (
-            batch[
-                :,
-                pl_module.multi_step - 1 : pl_module.multi_step + pl_module.rollout + 1,
-                ...,
-                pl_module.data_indices.data.output.full,
-            ]
-            .detach()
-            .cpu()
-        )
-        data = self.post_processors(input_tensor)[self.sample_idx]
-        
-        output_tensor = torch.cat(
-            tuple(
-                self.post_processors(x[:, ...].detach().cpu(), in_place=False)[self.sample_idx : self.sample_idx + 1]
-                for x in outputs[1]
-            ),
-        )
-        
-        # Monte: mismatch for the ens dim. 1->2
-        output_tensor = pl_module.output_mask.apply(output_tensor, dim=2, fill_value=np.nan).cpu().numpy()
-        data[1:, ...] = pl_module.output_mask.apply(data[1:, ...], dim=2, fill_value=np.nan)
-        data = data.numpy()
-        return data, output_tensor
 
 
 class PlotSpectrum(BasePlotAdditionalMetrics):
@@ -1184,15 +1335,15 @@ class PlotSpectrum(BasePlotAdditionalMetrics):
         batch: torch.Tensor,
         batch_idx: int,
         epoch: int,
+        output_times: tuple,
     ) -> None:
         logger = trainer.logger
 
         local_rank = pl_module.local_rank
-        data, output_tensor = self.process(pl_module, outputs, batch)
+        data, output_tensor = self.process(pl_module, outputs, batch, output_times)
 
-        rollout = getattr(pl_module, "rollout", 0)
-        for rollout_step in range(rollout):
-            # Build dictionary of inidicies and parameters to be plotted
+        for rollout_step in range(output_times[0]):
+            # Build dictionary of indices and parameters to be plotted
 
             diagnostics = [] if self.config.data.diagnostic is None else self.config.data.diagnostic
             plot_parameters_dict_spectrum = {
@@ -1203,10 +1354,12 @@ class PlotSpectrum(BasePlotAdditionalMetrics):
                 for name in self.parameters
             }
 
+            init_step = self._get_init_step(rollout_step, output_times[1])
+
             fig = plot_power_spectrum(
                 plot_parameters_dict_spectrum,
                 self.latlons,
-                data[0, ...].squeeze(),
+                data[init_step, ...].squeeze(),
                 data[rollout_step + 1, ...].squeeze(),
                 output_tensor[rollout_step, ...],
                 min_delta=self.min_delta,
@@ -1216,8 +1369,8 @@ class PlotSpectrum(BasePlotAdditionalMetrics):
                 logger,
                 fig,
                 epoch=epoch,
-                tag=f"pred_val_spec_rstep_{rollout_step:02d}_batch{batch_idx:04d}_rank{local_rank:01d}",
-                exp_log_tag=f"pred_val_spec_rstep_{rollout_step:02d}_rank{local_rank:01d}",
+                tag=f"pred_val_spec_step_{rollout_step:02d}_batch{batch_idx:04d}_rank{local_rank:01d}",
+                exp_log_tag=f"pred_val_spec_step_{rollout_step:02d}_rank{local_rank:01d}",
             )
 
 
@@ -1270,17 +1423,16 @@ class PlotHistogram(BasePlotAdditionalMetrics):
         batch: torch.Tensor,
         batch_idx: int,
         epoch: int,
+        output_times: tuple,
     ) -> None:
         logger = trainer.logger
 
         local_rank = pl_module.local_rank
-        data, output_tensor = self.process(pl_module, outputs, batch)
+        data, output_tensor = self.process(pl_module, outputs, batch, output_times)
 
-        rollout = getattr(pl_module, "rollout", 0)
+        for rollout_step in range(output_times[0]):
 
-        for rollout_step in range(rollout):
-
-            # Build dictionary of inidicies and parameters to be plotted
+            # Build dictionary of indices and parameters to be plotted
             diagnostics = [] if self.config.data.diagnostic is None else self.config.data.diagnostic
 
             plot_parameters_dict_histogram = {
@@ -1291,9 +1443,11 @@ class PlotHistogram(BasePlotAdditionalMetrics):
                 for name in self.parameters
             }
 
+            init_step = self._get_init_step(rollout_step, output_times[1])
+
             fig = plot_histogram(
                 plot_parameters_dict_histogram,
-                data[0, ...].squeeze(),
+                data[init_step, ...].squeeze(),
                 data[rollout_step + 1, ...].squeeze(),
                 output_tensor[rollout_step, ...],
                 self.precip_and_related_fields,
@@ -1304,6 +1458,6 @@ class PlotHistogram(BasePlotAdditionalMetrics):
                 logger,
                 fig,
                 epoch=epoch,
-                tag=f"pred_val_histo_rstep_{rollout_step:02d}_batch{batch_idx:04d}_rank{local_rank:01d}",
-                exp_log_tag=f"pred_val_histo_rstep_{rollout_step:02d}_rank{local_rank:01d}",
+                tag=f"pred_val_histo_step_{rollout_step:02d}_batch{batch_idx:04d}_rank{local_rank:01d}",
+                exp_log_tag=f"pred_val_histo_step_{rollout_step:02d}_rank{local_rank:01d}",
             )

@@ -49,6 +49,9 @@ class NonmissingAnemoiDatasetVariable(BooleanBaseNodeAttribute):
 class BaseAnemoiDatasetVariable(BooleanBaseNodeAttribute):
     """Base class for computing mask based on a variable in an Anemoi dataset."""
 
+class BaseAnemoiDatasetVariable(BooleanBaseNodeAttribute):
+    """Base class for computing mask based on a variable in an Anemoi dataset."""
+
     def __init__(self, variable: str) -> None:
         super().__init__()
         self.variable = variable
