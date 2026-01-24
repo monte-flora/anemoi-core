@@ -11,6 +11,8 @@ from .combined import CombinedLoss
 from .graphcast_huber import GraphCastHuberLoss
 from .graphcast_logcosh import GraphCastLogCoshLoss
 from .graphcast_mse import GraphCastMSELoss
+from .graphcast_robust import GraphCastClippedMSELoss
+from .graphcast_robust import GraphCastPseudoHuberLoss
 from .huber import HuberLoss
 from .kcrps import AlmostFairKernelCRPS
 from .kcrps import KernelCRPS
@@ -26,9 +28,11 @@ from .weighted_mse import WeightedMSELoss
 __all__ = [
     "AlmostFairKernelCRPS",
     "CombinedLoss",
+    "GraphCastClippedMSELoss",
     "GraphCastHuberLoss",
     "GraphCastLogCoshLoss",
     "GraphCastMSELoss",
+    "GraphCastPseudoHuberLoss",
     "HuberLoss",
     "KernelCRPS",
     "LogCoshLoss",
