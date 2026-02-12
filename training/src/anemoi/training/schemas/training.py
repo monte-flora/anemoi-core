@@ -15,6 +15,7 @@ from typing import Literal
 
 from pydantic import AfterValidator
 from pydantic import BaseModel as PydanticBaseModel
+from pydantic import ConfigDict
 from pydantic import Discriminator
 from pydantic import Field
 from pydantic import NonNegativeFloat
@@ -93,6 +94,8 @@ class LR(BaseModel):
 
 class OptimizerSchema(PydanticBaseModel):
     """Choosing the PydanticBaseModel to allow extra inputs."""
+
+    model_config = ConfigDict(extra="allow")
 
     target_: str = Field(..., alias="_target_")
     """Full path to the optimizer class, e.g. `torch.optim.AdamW`."""
