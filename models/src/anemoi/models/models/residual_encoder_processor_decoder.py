@@ -249,7 +249,9 @@ class AnemoiResidualModelEncProcDec(AnemoiModelEncProcDec):
 
             # Dimensions are: batch, timesteps, grid, variables
             # Add dummy ensemble dimension as 3rd index
-            x = batch[:, 0:multi_step, None, ...]  # shape: (batch, time, 1, grid, n_input)
+            # Clone to avoid corrupting the caller's tensor when pre_processors
+            # normalizes in-place (the slice+None creates a view that shares storage).
+            x = batch[:, 0:multi_step, None, ...].clone()  # shape: (batch, time, 1, grid, n_input)
 
             # Handle distributed processing
             grid_shard_shapes = None
