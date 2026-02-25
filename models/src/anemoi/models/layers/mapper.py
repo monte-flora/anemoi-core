@@ -33,6 +33,7 @@ from anemoi.models.distributed.khop_edges import sort_edges_1hop_sharding
 from anemoi.models.distributed.shapes import change_channels_in_shape
 from anemoi.models.distributed.shapes import get_shard_shapes
 from anemoi.models.layers.block import GraphConvMapperBlock
+from anemoi.models.layers.block import GraphInteractionNetMapperBlock
 from anemoi.models.layers.block import GraphTransformerMapperBlock
 from anemoi.models.layers.block import TransformerMapperBlock
 from anemoi.models.layers.graph import TrainableTensor
@@ -113,16 +114,7 @@ class BackwardMapperPostProcessMixin:
     """Post-processing for Backward Mapper from hidden -> data."""
 
     def post_process(self, x_dst, shapes_dst, model_comm_group=None, keep_x_dst_sharded=False):
-        # Debug: Check input to node_data_extractor
-        if not hasattr(self, '_output_debug_done'):
-            LOGGER.info(f"node_data_extractor INPUT: mean={x_dst.mean().item():.4f}, std={x_dst.std().item():.4f}, shape={x_dst.shape}")
-
         x_dst = self.node_data_extractor(x_dst)
-
-        # Debug: Check output of node_data_extractor
-        if not hasattr(self, '_output_debug_done'):
-            LOGGER.info(f"node_data_extractor OUTPUT: mean={x_dst.mean().item():.4f}, std={x_dst.std().item():.4f}")
-            self._output_debug_done = True
 
         if not keep_x_dst_sharded:
             x_dst = gather_tensor(
@@ -1125,19 +1117,272 @@ class GNNBackwardMapper(BackwardMapperPostProcessMixin, GNNBaseMapper):
                            f"bias max: {final_linear.bias.abs().max().item() if final_linear.bias is not None else 'N/A'}")
 
     def pre_process(self, x, shard_shapes, model_comm_group=None, x_src_is_sharded=False, x_dst_is_sharded=False):
-        # One-time check that zero initialization persists
-        if not hasattr(self, '_zero_init_checked'):
+        x_src, x_dst, shapes_src, shapes_dst = super().pre_process(
+            x, shard_shapes, model_comm_group, x_src_is_sharded, x_dst_is_sharded
+        )
+        shapes_src = change_channels_in_shape(shapes_src, self.hidden_dim)
+        shapes_dst = change_channels_in_shape(shapes_dst, self.hidden_dim)
+        return x_src, x_dst, shapes_src, shapes_dst
+
+    def forward(
+        self,
+        x: PairTensor,
+        batch_size: int,
+        shard_shapes: tuple[list[list[int]], list[list[int]]],
+        model_comm_group: Optional[ProcessGroup] = None,
+        x_src_is_sharded: bool = False,
+        x_dst_is_sharded: bool = False,
+        keep_x_dst_sharded: bool = False,
+        **kwargs,
+    ) -> Tensor:
+
+        _, x_dst = super().forward(
+            x,
+            batch_size,
+            shard_shapes,
+            model_comm_group,
+            x_src_is_sharded,
+            x_dst_is_sharded,
+            keep_x_dst_sharded,
+            **kwargs,
+        )
+        return x_dst
+
+
+class GraphInteractionNetForwardMapper(ForwardMapperPreProcessMixin, GNNBaseMapper):
+    """Graph Interaction Network Mapper data -> hidden.
+
+    This follows the Interaction Network architecture (Battaglia et al. 2018)
+    as used in GraphCast (Lam et al. 2022):
+
+    The correct order is:
+        1. edge_delta = EdgeMLP([sender, receiver, edge])  (NO residual inside)
+        2. aggregated = Σ(edge_delta)  (sum of DELTAS only)
+        3. node_delta = NodeMLP([node, aggregated])
+        4. new_edge = edge + edge_delta  (residual AFTER)
+        5. new_node = node + node_delta  (residual AFTER)
+
+    This differs from GNNForwardMapper which uses GraphConvMapperBlock that applies
+    edge residual INSIDE the message function.
+    """
+
+    def __init__(
+        self,
+        *,
+        in_channels_src: int,
+        in_channels_dst: int,
+        hidden_dim: int,
+        out_channels_dst: Optional[int] = None,
+        trainable_size: int,
+        num_chunks: int,
+        mlp_extra_layers: int,
+        sub_graph: HeteroData,
+        sub_graph_edge_attributes: list[str],
+        src_grid_size: int,
+        dst_grid_size: int,
+        cpu_offload: bool = False,
+        layer_kernels: DotDict,
+    ) -> None:
+        """Initialize GraphInteractionNetForwardMapper.
+
+        Parameters
+        ----------
+        in_channels_src : int
+            Input channels of the source node
+        in_channels_dst : int
+            Input channels of the destination node
+        hidden_dim : int
+            Hidden dimension
+        out_channels_dst : int
+            Output channels of the destination node, by default None
+        trainable_size : int
+            Trainable tensor of edge
+        num_chunks: int
+            Number of chunks to split into
+        mlp_extra_layers : int, optional
+            Number of extra layers in MLP, by default 0
+        sub_graph : HeteroData
+            Sub graph of the full structure
+        sub_graph_edge_attributes : list[str]
+            Edge attributes to use
+        src_grid_size : int
+            Source grid size
+        dst_grid_size : int
+            Destination grid size
+        cpu_offload : bool, optional
+            Whether to offload processing to CPU, by default False
+        layer_kernels : DotDict
+            A dict of layer implementations e.g. layer_kernels.Linear = "torch.nn.Linear"
+            Defined in config/models/<model>.yaml
+        """
+        super().__init__(
+            in_channels_src=in_channels_src,
+            in_channels_dst=in_channels_dst,
+            hidden_dim=hidden_dim,
+            out_channels_dst=out_channels_dst,
+            trainable_size=trainable_size,
+            num_chunks=num_chunks,
+            cpu_offload=cpu_offload,
+            mlp_extra_layers=mlp_extra_layers,
+            sub_graph=sub_graph,
+            sub_graph_edge_attributes=sub_graph_edge_attributes,
+            src_grid_size=src_grid_size,
+            dst_grid_size=dst_grid_size,
+            layer_kernels=layer_kernels,
+        )
+
+        # Use the new GraphInteractionNetMapperBlock with correct residual order
+        self.proc = GraphInteractionNetMapperBlock(
+            in_channels=hidden_dim,
+            out_channels=hidden_dim,
+            layer_kernels=self.layer_factory,
+            mlp_extra_layers=mlp_extra_layers,
+            update_src_nodes=True,
+            num_chunks=num_chunks,
+            f32_aggregation=True,  # Match JAX encoder's f32_aggregation=True for numerical stability
+        )
+
+        self.offload_layers(cpu_offload)
+
+        self.emb_nodes_src = MLP(
+            in_features=in_channels_src,
+            hidden_dim=hidden_dim,
+            out_features=hidden_dim,
+            layer_kernels=self.layer_factory,
+            n_extra_layers=mlp_extra_layers,
+        )
+
+        self.emb_nodes_dst = MLP(
+            in_features=in_channels_dst,
+            hidden_dim=hidden_dim,
+            out_features=hidden_dim,
+            layer_kernels=self.layer_factory,
+            n_extra_layers=mlp_extra_layers,
+        )
+
+
+class GraphInteractionNetBackwardMapper(BackwardMapperPostProcessMixin, GNNBaseMapper):
+    """Graph Interaction Network Mapper from hidden -> data.
+
+    This follows the Interaction Network architecture (Battaglia et al. 2018)
+    as used in GraphCast (Lam et al. 2022):
+
+    The correct order is:
+        1. edge_delta = EdgeMLP([sender, receiver, edge])  (NO residual inside)
+        2. aggregated = Σ(edge_delta)  (sum of DELTAS only)
+        3. node_delta = NodeMLP([node, aggregated])
+        4. new_edge = edge + edge_delta  (residual AFTER)
+        5. new_node = node + node_delta  (residual AFTER)
+
+    This differs from GNNBackwardMapper which uses GraphConvMapperBlock that applies
+    edge residual INSIDE the message function.
+    """
+
+    def __init__(
+        self,
+        *,
+        in_channels_src: int,
+        in_channels_dst: int,
+        hidden_dim: int,
+        out_channels_dst: Optional[int] = None,
+        trainable_size: int,
+        num_chunks: int,
+        mlp_extra_layers: int,
+        sub_graph: HeteroData,
+        sub_graph_edge_attributes: list[str],
+        src_grid_size: int,
+        dst_grid_size: int,
+        cpu_offload: bool = False,
+        layer_kernels: DotDict = None,
+        initialise_data_extractor_zero: bool = False,
+        final_layer_norm: bool = True,
+    ) -> None:
+        """Initialize GraphInteractionNetBackwardMapper.
+
+        Parameters
+        ----------
+        in_channels_src : int
+            Input channels of the source node
+        in_channels_dst : int
+            Input channels of the destination node
+        hidden_dim : int
+            Hidden dimension
+        out_channels_dst : int
+            Output channels of the destination node
+        trainable_size : int
+            Trainable tensor of edge
+        num_chunks: int
+            Number of chunks to split into
+        mlp_extra_layers : int
+            Number of extra layers in MLP
+        sub_graph : HeteroData
+            Sub graph of the full structure
+        sub_graph_edge_attributes : list[str]
+            Edge attributes to use
+        src_grid_size : int
+            Source grid size
+        dst_grid_size : int
+            Destination grid size
+        cpu_offload : bool
+            Whether to offload processing to CPU, by default False
+        layer_kernels : DotDict
+            A dict of layer implementations e.g. layer_kernels.Linear = "torch.nn.Linear"
+            Defined in config/models/<model>.yaml
+        initialise_data_extractor_zero : bool, default False
+            Whether to initialise the data extractor to zero
+        final_layer_norm : bool, default True
+            Whether to apply LayerNorm after the final MLP projection
+        """
+        super().__init__(
+            in_channels_src=in_channels_src,
+            in_channels_dst=in_channels_dst,
+            hidden_dim=hidden_dim,
+            trainable_size=trainable_size,
+            out_channels_dst=out_channels_dst,
+            num_chunks=num_chunks,
+            cpu_offload=cpu_offload,
+            mlp_extra_layers=mlp_extra_layers,
+            sub_graph=sub_graph,
+            sub_graph_edge_attributes=sub_graph_edge_attributes,
+            src_grid_size=src_grid_size,
+            dst_grid_size=dst_grid_size,
+            layer_kernels=layer_kernels,
+        )
+
+        # Use the new GraphInteractionNetMapperBlock with correct residual order
+        self.proc = GraphInteractionNetMapperBlock(
+            in_channels=hidden_dim,
+            out_channels=hidden_dim,
+            layer_kernels=self.layer_factory,
+            mlp_extra_layers=mlp_extra_layers,
+            update_src_nodes=False,
+            num_chunks=num_chunks,
+        )
+
+        self.offload_layers(cpu_offload)
+
+        self.node_data_extractor = MLP(
+            in_features=self.hidden_dim,
+            hidden_dim=self.hidden_dim,
+            out_features=self.out_channels_dst,
+            layer_kernels=self.layer_factory,
+            n_extra_layers=mlp_extra_layers,
+            layer_norm=final_layer_norm,
+            final_activation=False,
+        )
+        if initialise_data_extractor_zero:
+            LOGGER.info("Zero-initializing GraphInteractionNet decoder node_data_extractor final layer weights and biases")
+            # Find the last Linear layer in the MLP and zero-initialize it
             linear_layers = [m for m in self.node_data_extractor.mlp.modules() if isinstance(m, nn.Linear)]
             if linear_layers:
                 final_linear = linear_layers[-1]
-                w_max = final_linear.weight.abs().max().item()
-                b_max = final_linear.bias.abs().max().item() if final_linear.bias is not None else 0
-                if w_max > 0 or b_max > 0:
-                    LOGGER.warning(f"GNN decoder final Linear weights NOT zero at forward time! weight_max={w_max:.6f}, bias_max={b_max:.6f}")
-                else:
-                    LOGGER.info("GNN decoder final Linear weights confirmed zero at forward time")
-            self._zero_init_checked = True
+                nn.init.constant_(final_linear.weight, 0.0)
+                if final_linear.bias is not None:
+                    nn.init.constant_(final_linear.bias, 0.0)
+                LOGGER.info(f"  Final Linear weight max: {final_linear.weight.abs().max().item():.6f}, "
+                           f"bias max: {final_linear.bias.abs().max().item() if final_linear.bias is not None else 'N/A'}")
 
+    def pre_process(self, x, shard_shapes, model_comm_group=None, x_src_is_sharded=False, x_dst_is_sharded=False):
         x_src, x_dst, shapes_src, shapes_dst = super().pre_process(
             x, shard_shapes, model_comm_group, x_src_is_sharded, x_dst_is_sharded
         )

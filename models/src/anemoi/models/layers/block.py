@@ -33,6 +33,7 @@ from anemoi.models.layers.attention import BandedGraphSelfAttention
 from anemoi.models.layers.attention import MultiHeadCrossAttention
 from anemoi.models.layers.attention import MultiHeadSelfAttention
 from anemoi.models.layers.conv import GraphConv
+from anemoi.models.layers.conv import GraphConvNoResidual
 from anemoi.models.layers.conv import GraphTransformerConv
 from anemoi.models.layers.mlp import MLP
 from anemoi.models.triton.utils import edge_index_to_csc
@@ -511,6 +512,248 @@ class GraphConvMapperBlock(GraphConvBaseBlock):
         nodes_new_src = x[0] if not self.update_src_nodes else self.node_mlp(torch.cat([x[0], x[0]], dim=1)) + x[0]
 
         nodes_new = (nodes_new_src, nodes_new_dst)
+
+        return nodes_new, edges_new
+
+
+class GraphInteractionNetBaseBlock(BaseBlock):
+    """Base block implementing the correct GraphCast/Interaction Network pattern.
+
+    This follows the Interaction Network architecture (Battaglia et al. 2018)
+    as used in GraphCast (Lam et al. 2022):
+
+    The correct order is:
+        1. edge_delta = EdgeMLP([sender, receiver, edge])  (NO residual inside)
+        2. aggregated = Σ(edge_delta)  (sum of DELTAS only)
+        3. node_delta = NodeMLP([node, aggregated])
+        4. new_edge = edge + edge_delta  (residual AFTER)
+        5. new_node = node + node_delta  (residual AFTER)
+
+    This differs from the original GraphConv which applies edge residual INSIDE
+    the message function, causing the node MLP to receive Σ(delta + old_edge)
+    instead of just Σ(delta). This incorrect pattern can cause gradient collapse
+    in deep networks (16+ layers).
+    """
+
+    def __init__(
+        self,
+        *,
+        in_channels: int,
+        out_channels: int,
+        num_chunks: int,
+        mlp_extra_layers: int = 0,
+        update_src_nodes: bool = True,
+        layer_kernels: DotDict,
+        edge_dim: Optional[int] = None,
+        f32_aggregation: bool = False,
+        **kwargs,
+    ) -> None:
+        """Initialize GraphInteractionNetBaseBlock.
+
+        Parameters
+        ----------
+        in_channels : int
+            Number of input channels.
+        out_channels : int
+            Number of output channels.
+        num_chunks : int
+            Do message passing in X chunks
+        mlp_extra_layers : int
+            Extra layers in MLP, by default 0
+        update_src_nodes: bool
+            Update src if src and dst nodes are given, by default True
+        layer_kernels : DotDict
+            A dict of layer implementations e.g. layer_kernels.Linear = "torch.nn.Linear"
+            Defined in config/models/<model>.yaml
+        edge_dim : int, optional
+            Edge dimension for edge embedding, by default None
+        f32_aggregation : bool, optional
+            Cast edge features to float32 before scatter-sum for numerical stability
+            in mixed-precision training (matches JAX encoder behavior), by default False
+        """
+        super().__init__(**kwargs)
+
+        if edge_dim:
+            self.emb_edges = MLP(
+                in_features=edge_dim,
+                hidden_dim=out_channels,
+                out_features=out_channels,
+                layer_kernels=layer_kernels,
+                n_extra_layers=mlp_extra_layers,
+            )
+        else:
+            self.emb_edges = None
+
+        self.update_src_nodes = update_src_nodes
+        self.num_chunks = num_chunks
+
+        self.node_mlp = MLP(
+            in_features=2 * in_channels,
+            hidden_dim=out_channels,
+            out_features=out_channels,
+            layer_kernels=layer_kernels,
+            n_extra_layers=mlp_extra_layers,
+        )
+
+        # Use the no-residual conv that returns raw edge deltas
+        self.conv = GraphConvNoResidual(
+            in_channels=in_channels,
+            out_channels=out_channels,
+            layer_kernels=layer_kernels,
+            mlp_extra_layers=mlp_extra_layers,
+            f32_aggregation=f32_aggregation,
+        )
+
+
+class GraphInteractionNetProcessorBlock(GraphInteractionNetBaseBlock):
+    """Processor block implementing the correct GraphCast/Interaction Network pattern.
+
+    See GraphInteractionNetBaseBlock for details on the architecture.
+    """
+
+    def forward(
+        self,
+        x: OptPairTensor,
+        edge_attr: Tensor,
+        edge_index: Adj,
+        shapes: tuple,
+        model_comm_group: Optional[ProcessGroup] = None,
+        size: Optional[Size] = None,
+        **layer_kwargs,
+    ) -> tuple[Tensor, Tensor]:
+        # Optional edge embedding
+        if self.emb_edges is not None:
+            edge_attr = self.emb_edges(edge_attr)
+
+        # Sync nodes for distributed processing
+        x_in = sync_tensor(x, 0, shapes[1], model_comm_group)
+
+        # ============================================================
+        # Step 1 & 2: Compute edge DELTAS and aggregate them
+        # ============================================================
+        if self.num_chunks > 1:
+            edge_index_list = torch.tensor_split(edge_index, self.num_chunks, dim=1)
+            edge_attr_list = torch.tensor_split(edge_attr, self.num_chunks, dim=0)
+            edge_delta_list = []
+            for i in range(self.num_chunks):
+                # conv returns (aggregated_deltas, edge_deltas)
+                out1, edge_delta1 = self.conv(x_in, edge_attr_list[i], edge_index_list[i], size=size)
+                edge_delta_list.append(edge_delta1)
+                if i == 0:
+                    out = torch.zeros_like(out1)
+                out = out + out1
+            edge_delta = torch.cat(edge_delta_list, dim=0)
+        else:
+            # out = Σ(edge_delta), edge_delta = raw deltas (NO residual)
+            out, edge_delta = self.conv(x_in, edge_attr, edge_index, size=size)
+
+        # Shard output for distributed processing
+        out = shard_tensor(out, 0, shapes[1], model_comm_group, gather_in_backward=False)
+
+        # ============================================================
+        # Step 3: Compute node DELTA from aggregated edge deltas
+        # ============================================================
+        # GraphCast: v' = NodeMLP([v, Σ(e')])
+        node_delta = self.node_mlp(torch.cat([x, out], dim=1))
+
+        # ============================================================
+        # Step 4 & 5: Apply ALL residuals AFTER
+        # ============================================================
+        # GraphCast: e ← e + e', v ← v + v'
+        nodes_new = x + node_delta
+        edges_new = edge_attr + edge_delta
+
+        return nodes_new, edges_new
+
+
+class GraphInteractionNetMapperBlock(GraphInteractionNetBaseBlock):
+    """Mapper block implementing the correct GraphCast/Interaction Network pattern.
+
+    See GraphInteractionNetBaseBlock for details on the architecture.
+    Used for both forward (data→hidden) and backward (hidden→data) mappers.
+    """
+
+    def __init__(self, *, in_channels: int, out_channels: int,
+                 mlp_extra_layers: int = 0, layer_kernels: DotDict, **kwargs) -> None:
+        super().__init__(
+            in_channels=in_channels,
+            out_channels=out_channels,
+            mlp_extra_layers=mlp_extra_layers,
+            layer_kernels=layer_kernels,
+            **kwargs,
+        )
+        # JAX-faithful: separate MLP for source nodes (bipartite encoder only).
+        # Source nodes receive no messages, so they need a 512→512 MLP, not the
+        # shared 1024→512 node_mlp. Using the shared MLP with cat([x_src, x_src])
+        # causes gradient contamination (W_second ≈ W_first after training).
+        # Only created when update_src_nodes=True (encoder) so that the decoder
+        # instance (update_src_nodes=False) has no unused parameters under DDP.
+        if self.update_src_nodes:
+            self.src_node_mlp = MLP(
+                in_features=in_channels,
+                hidden_dim=out_channels,
+                out_features=out_channels,
+                layer_kernels=layer_kernels,
+                n_extra_layers=mlp_extra_layers,
+            )
+
+    def forward(
+        self,
+        x: OptPairTensor,
+        edge_attr: Tensor,
+        edge_index: Adj,
+        shapes: tuple,
+        model_comm_group: Optional[ProcessGroup] = None,
+        size: Optional[Size] = None,
+        **layer_kwargs,
+    ) -> tuple[Tensor, Tensor]:
+        # Sync nodes for distributed processing
+        x_src = sync_tensor(x[0], 0, shapes[0], model_comm_group)
+        x_dst = sync_tensor(x[1], 0, shapes[1], model_comm_group)
+        x_in = (x_src, x_dst)
+
+        # ============================================================
+        # Step 1 & 2: Compute edge DELTAS and aggregate them
+        # ============================================================
+        if self.num_chunks > 1:
+            edge_index_list = torch.tensor_split(edge_index, self.num_chunks, dim=1)
+            edge_attr_list = torch.tensor_split(edge_attr, self.num_chunks, dim=0)
+            edge_delta_list = []
+            for i in range(self.num_chunks):
+                out1, edge_delta1 = self.conv(x_in, edge_attr_list[i], edge_index_list[i], size=size)
+                edge_delta_list.append(edge_delta1)
+                if i == 0:
+                    out = torch.zeros_like(out1)
+                out = out + out1
+            edge_delta = torch.cat(edge_delta_list, dim=0)
+        else:
+            out, edge_delta = self.conv(x_in, edge_attr, edge_index, size=size)
+
+        out = shard_tensor(out, 0, shapes[1], model_comm_group, gather_in_backward=False)
+
+        # ============================================================
+        # Step 3: Compute node DELTAS
+        # ============================================================
+        # Destination nodes: always updated
+        node_delta_dst = self.node_mlp(torch.cat([x[1], out], dim=1))
+
+        # Source nodes: updated only if update_src_nodes is True
+        if self.update_src_nodes:
+            # JAX-faithful: src nodes receive no messages in the bipartite encoder.
+            # Use separate src_node_mlp (512→512) instead of the shared node_mlp (1024→512)
+            # to avoid gradient contamination from cat([x_src, x_src]).
+            node_delta_src = self.src_node_mlp(x[0])
+        else:
+            node_delta_src = torch.zeros_like(x[0])
+
+        # ============================================================
+        # Step 4 & 5: Apply ALL residuals AFTER
+        # ============================================================
+        nodes_new_dst = x[1] + node_delta_dst
+        nodes_new_src = x[0] + node_delta_src
+
+        nodes_new = (nodes_new_src, nodes_new_dst)
+        edges_new = edge_attr + edge_delta
 
         return nodes_new, edges_new
 

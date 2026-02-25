@@ -78,6 +78,95 @@ class GraphConv(MessagePassing):
         return out, edges_new
 
 
+class GraphConvNoResidual(MessagePassing):
+    """Message passing module for convolutional node and edge interactions.
+
+    This version computes edge DELTAS without applying residual connections,
+    following the GraphCast/Interaction Network pattern (Battaglia et al. 2018).
+    Residuals are applied in the block, not inside message passing.
+
+    The correct GraphCast order is:
+        1. edge_delta = EdgeMLP([sender, receiver, edge])  (NO residual)
+        2. aggregated = Σ(edge_delta)  (sum of DELTAS only)
+        3. node_delta = NodeMLP([node, aggregated])
+        4. new_edge = edge + edge_delta  (residual AFTER)
+        5. new_node = node + node_delta  (residual AFTER)
+    """
+
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        layer_kernels: DotDict,
+        mlp_extra_layers: int = 0,
+        f32_aggregation: bool = False,
+        **kwargs,
+    ) -> None:
+        """Initialize GraphConvNoResidual.
+
+        Parameters
+        ----------
+        in_channels : int
+            Number of input channels.
+        out_channels : int
+            Number of output channels.
+        layer_kernels : DotDict
+            A dict of layer implementations e.g. layer_kernels.Linear = "torch.nn.Linear"
+            Defined in config/models/<model>.yaml
+        mlp_extra_layers : int, optional
+            Extra layers in MLP, by default 0
+        f32_aggregation : bool, optional
+            Cast edge features to float32 before scatter-sum for numerical stability
+            in mixed-precision training (matches JAX encoder behavior), by default False
+        """
+        super().__init__(**kwargs)
+
+        self.f32_aggregation = f32_aggregation
+
+        self.edge_mlp = MLP(
+            3 * in_channels,
+            out_channels,
+            out_channels,
+            layer_kernels=layer_kernels,
+            n_extra_layers=mlp_extra_layers,
+        )
+
+    def forward(self, x: OptPairTensor, edge_attr: Tensor, edge_index: Adj, size: Optional[Size] = None):
+        dim_size = x.shape[0] if isinstance(x, Tensor) else x[1].shape[0]
+
+        out, edge_delta = self.propagate(edge_index, x=x, edge_attr=edge_attr, size=size, dim_size=dim_size)
+
+        return out, edge_delta
+
+    def message(self, x_i: Tensor, x_j: Tensor, edge_attr: Tensor) -> Tensor:
+        # Compute edge DELTA only - NO residual here!
+        # GraphCast pattern: e' = MLP([sender, receiver, edge])
+        edge_delta = self.edge_mlp(torch.cat([x_i, x_j, edge_attr], dim=1))
+
+        return edge_delta
+
+    def aggregate(
+        self,
+        inputs: Tensor,
+        index: Tensor,
+        ptr: Optional[Tensor] = None,
+        dim_size: Optional[int] = None,
+    ) -> tuple[Tensor, Tensor]:
+        # Aggregate edge DELTAS (not edges with residual)
+        # GraphCast pattern: Σ(e') for node update
+        # Note: 'index' is edge_index[1] (destination node indices), passed by PyG's propagate
+        if self.f32_aggregation:
+            # Cast to float32 before scatter-sum to prevent precision loss in bf16
+            # (matches JAX encoder's f32_aggregation=True behavior)
+            original_dtype = inputs.dtype
+            out = scatter(inputs.float(), index, dim=0, dim_size=dim_size, reduce="sum")
+            out = out.to(original_dtype)
+        else:
+            out = scatter(inputs, index, dim=0, dim_size=dim_size, reduce="sum")
+
+        return out, inputs  # Return (aggregated, raw edge deltas)
+
+
 class GraphTransformerConv(MessagePassing):
     """Message passing part of graph transformer operator.
 
