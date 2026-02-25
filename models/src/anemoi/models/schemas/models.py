@@ -27,13 +27,16 @@ from pydantic import model_validator
 from anemoi.utils.schemas import BaseModel
 
 from .decoder import GNNDecoderSchema  # noqa: TC001
+from .decoder import GraphInteractionNetDecoderSchema  # noqa: TC001
 from .decoder import GraphTransformerDecoderSchema  # noqa: TC001
 from .decoder import TransformerDecoderSchema  # noqa: TC001
 from .encoder import GNNEncoderSchema  # noqa: TC001
+from .encoder import GraphInteractionNetEncoderSchema  # noqa: TC001
 from .encoder import GraphTransformerEncoderSchema  # noqa: TC001
 from .encoder import TransformerEncoderSchema  # noqa: TC001
 from .processor import BandedTransformerProcessorSchema  # noqa: TC001
 from .processor import GNNProcessorSchema  # noqa: TC001
+from .processor import GraphInteractionNetProcessorSchema  # noqa: TC001
 from .processor import GraphTransformerProcessorSchema  # noqa: TC001
 from .processor import PointWiseMLPProcessorSchema  # noqa: TC001
 from .processor import TransformerProcessorSchema  # noqa: TC001
@@ -214,18 +217,18 @@ class BaseModelSchema(PydanticBaseModel):
     latent_skip: bool = True
     "Add skip connection in latent space before/after processor. Currently only in interpolator."
     processor: Union[
-        GNNProcessorSchema, GraphTransformerProcessorSchema, TransformerProcessorSchema, PointWiseMLPProcessorSchema, BandedTransformerProcessorSchema
+        GNNProcessorSchema, GraphInteractionNetProcessorSchema, GraphTransformerProcessorSchema, TransformerProcessorSchema, PointWiseMLPProcessorSchema, BandedTransformerProcessorSchema
     ] = Field(
         ...,
         discriminator="target_",
     )
     "GNN processor schema."
-    encoder: Union[GNNEncoderSchema, GraphTransformerEncoderSchema, TransformerEncoderSchema] = Field(
+    encoder: Union[GNNEncoderSchema, GraphInteractionNetEncoderSchema, GraphTransformerEncoderSchema, TransformerEncoderSchema] = Field(
         ...,
         discriminator="target_",
     )
     "GNN encoder schema."
-    decoder: Union[GNNDecoderSchema, GraphTransformerDecoderSchema, TransformerDecoderSchema] = Field(
+    decoder: Union[GNNDecoderSchema, GraphInteractionNetDecoderSchema, GraphTransformerDecoderSchema, TransformerDecoderSchema] = Field(
         ...,
         discriminator="target_",
     )

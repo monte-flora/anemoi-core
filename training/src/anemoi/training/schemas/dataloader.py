@@ -129,3 +129,5 @@ class DataLoaderSchema(PydanticBaseModel):
     "Number of GPUs per reader group. Defaults to number of GPUs (see BaseSchema validators)."
     grid_indices: FullGridIndicesSchema | MaskedGridIndicesSchema
     "Grid indice schema."
+    trajectory_diverse_batching: bool = Field(default=False, example=False)
+    "If True, reorder samples so consecutive batches contain diverse forecast trajectories."

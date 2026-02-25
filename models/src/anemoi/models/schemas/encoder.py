@@ -25,6 +25,18 @@ class GNNEncoderSchema(GNNModelComponent):
     "GNN encoder object from anemoi.models.layers.mapper."
 
 
+class GraphInteractionNetEncoderSchema(GNNModelComponent):
+    """GraphCast-style GNN Encoder with correct Interaction Network residual pattern.
+
+    This implements the Interaction Network architecture (Battaglia et al. 2018)
+    where residuals are applied AFTER edge and node updates, not inside the
+    message function. This prevents gradient collapse in deep networks.
+    """
+
+    target_: Literal["anemoi.models.layers.mapper.GraphInteractionNetForwardMapper"] = Field(..., alias="_target_")
+    "GraphInteractionNet encoder object from anemoi.models.layers.mapper."
+
+
 class GraphTransformerEncoderSchema(TransformerModelComponent):
     target_: Literal["anemoi.models.layers.mapper.GraphTransformerForwardMapper"] = Field(..., alias="_target_")
     "Graph Transfromer Encoder object from anemoi.models.layers.mapper."

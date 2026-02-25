@@ -350,6 +350,13 @@ class GraphCastBaseLoss(FunctionalLoss):
         self.sample_weight_threshold = sample_weight_threshold
         self.sample_weight_min = sample_weight_min
 
+        # Per-variable group loss logging
+        self._group_loss_log_interval = 250  # Log every N calls (matches total loss MLflow interval)
+        self._group_loss_call_count = 0
+
+        # Store last per-group losses for MLflow logging by the training task
+        self._last_per_group_losses: dict[str, float] | None = None
+
     def _build_variable_groups(self) -> dict[str, list[int]]:
         """Build variable groups from data indices.
 
@@ -498,12 +505,18 @@ class GraphCastBaseLoss(FunctionalLoss):
 
         Implements GraphCast reduction:
         1. Mean over levels within each variable group
-        2. Mean over ensemble and grid dimensions
+        2. Sum over grid dimension (requires unit-sum normalized weights)
+        3. Mean over ensemble dimension
+
+        IMPORTANT: This method assumes loss weights (e.g., limited_area_mask, node_weights)
+        are normalized to sum to 1 (norm: "unit-sum"). When weights sum to 1, summing
+        the weighted losses gives the correct weighted mean. If weights are not normalized,
+        the loss will be incorrectly scaled.
 
         Parameters
         ----------
         out : torch.Tensor
-            Loss tensor of shape (B, E, G, V_flat)
+            Loss tensor of shape (B, E, G, V_flat), already scaled by weights
 
         Returns
         -------
@@ -523,10 +536,71 @@ class GraphCastBaseLoss(FunctionalLoss):
         # Stack: (B, E, G, n_groups)
         per_group = torch.stack(per_group_means, dim=-1)
 
-        # Mean over ensemble and grid: (B, n_groups)
-        result = per_group.mean(dim=(TensorDim.ENSEMBLE_DIM, TensorDim.GRID))
+        # Sum over grid (weights are unit-sum normalized), then mean over ensemble: (B, n_groups)
+        # NOTE: Using sum over grid because weights should sum to 1 globally.
+        # This matches FunctionalLoss.reduce() behavior and correctly handles
+        # masked losses (e.g., limited_area_mask) when norm="unit-sum".
+        result = per_group.sum(dim=TensorDim.GRID).mean(dim=TensorDim.ENSEMBLE_DIM)
 
         return result
+
+    def _log_per_group_losses(self, per_group_loss: torch.Tensor, group: "ProcessGroup | None" = None) -> None:
+        """Log per-variable-group loss statistics and store for MLflow logging.
+
+        Only logs from rank 0 to avoid interleaved output from multiple GPUs.
+        Always stores per-group losses in self._last_per_group_losses for
+        retrieval by the training task (MLflow logging).
+
+        Parameters
+        ----------
+        per_group_loss : torch.Tensor
+            Loss tensor of shape (B, n_groups) after reduction over levels, ensemble, and grid.
+            When grid is sharded, this contains LOCAL sums.
+        group : ProcessGroup | None
+            Model parallel group for distributed reduction. Used to scale local values
+            to global estimates.
+        """
+        if self.variable_groups is None:
+            return
+
+        # Only log from rank 0 to avoid interleaved output
+        is_rank_zero = not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
+        if not is_rank_zero:
+            return
+
+        with torch.no_grad():
+            # Mean over batch: (n_groups,)
+            group_means = per_group_loss.mean(dim=0)
+
+            # Scale by model parallel group size to show global values
+            if group is not None:
+                model_parallel_size = torch.distributed.get_world_size(group)
+                group_means = group_means * model_parallel_size
+
+            # Get group names and sort by loss (descending)
+            group_names = list(self.variable_groups.keys())
+            losses_with_names = [(name, group_means[i].item()) for i, name in enumerate(group_names)]
+
+            # Store for MLflow logging by the training task
+            self._last_per_group_losses = {name: val for name, val in losses_with_names}
+
+            losses_with_names.sort(key=lambda x: x[1], reverse=True)
+
+            LOGGER.info("=" * 70)
+            LOGGER.info("PER-VARIABLE GROUP LOSS (sorted by loss, descending)")
+            LOGGER.info("=" * 70)
+            LOGGER.info(f"  {'Group':<25} {'Loss':>12} {'Levels':>8}")
+            LOGGER.info(f"  {'-'*25} {'-'*12} {'-'*8}")
+
+            total_loss = 0.0
+            for name, loss_val in losses_with_names:
+                n_levels = len(self.variable_groups[name])
+                total_loss += loss_val
+                LOGGER.info(f"  {name:<25} {loss_val:>12.4f} {n_levels:>8}")
+
+            LOGGER.info(f"  {'-'*25} {'-'*12} {'-'*8}")
+            LOGGER.info(f"  {'TOTAL':<25} {total_loss:>12.4f}")
+            LOGGER.info("=" * 70)
 
     def reduce(
         self,
@@ -565,11 +639,28 @@ class GraphCastBaseLoss(FunctionalLoss):
             Scalar loss if squash=True, else tensor of shape (n_groups,)
         """
         # (B, E, G, V) -> (B, n_groups)
-        out = self._reduce_per_variable(out)
+        per_group_loss = self._reduce_per_variable(out)
+
+        # Log per-variable group losses periodically and store for MLflow
+        self._group_loss_call_count += 1
+        if self._group_loss_call_count % self._group_loss_log_interval == 1:
+            self._log_per_group_losses(per_group_loss, group=group)
+        else:
+            self._last_per_group_losses = None
+
+        out = per_group_loss
 
         if squash:
             # Sum over variable groups: (B,)
             out = self.sum_function(out, dim=-1)
+
+            # For distributed training with sharded grid:
+            # 1. First reduce across GPUs to get global grid sum (per batch sample)
+            # 2. Then average over batch
+            # NOTE: No divide by world_size because weights are unit-sum normalized.
+            # When weights sum to 1 globally, all_reduce SUM of partial sums = global weighted mean.
+            if group is not None:
+                out = reduce_tensor(out, group)
 
             # Weighted mean over batch: scalar
             if sample_weights is not None:
@@ -578,23 +669,17 @@ class GraphCastBaseLoss(FunctionalLoss):
             else:
                 out = self.avg_function(out)
 
-            if group is None:
-                return out
-            # reduce_tensor does all_reduce SUM, so divide by world_size to get mean
-            # This is needed because _reduce_per_variable computes LOCAL means over
-            # each GPU's grid shard, and we need the GLOBAL mean
-            out = reduce_tensor(out, group)
-            return out / torch.distributed.get_world_size(group)
+            return out
 
-        # For per-variable diagnostics: mean over batch -> (n_groups,)
+        # For per-variable diagnostics: reduce across GPUs first, then batch
+        if group is not None:
+            out = reduce_tensor(out, group)
+
         if sample_weights is not None:
             # Weighted average per group: (n_groups,)
             out = (out * sample_weights.unsqueeze(-1)).sum(dim=0) / sample_weights.sum()
         else:
             out = self.avg_function(out, dim=TensorDim.BATCH_SIZE)
 
-        if group is None:
-            return out
-        out = reduce_tensor(out, group)
-        return out / torch.distributed.get_world_size(group)
+        return out
           

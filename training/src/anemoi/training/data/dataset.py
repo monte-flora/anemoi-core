@@ -29,10 +29,6 @@ LOGGER = logging.getLogger(__name__)
 class NativeGridDataset(IterableDataset):
     """Iterable dataset for AnemoI data on the arbitrary grids."""
 
-    # Class variable to enable trajectory-diverse batching
-    # When enabled, consecutive samples come from different trajectories
-    _trajectory_diverse_batching = True
-
     def __init__(
         self,
         data_reader: Callable,
@@ -43,6 +39,8 @@ class NativeGridDataset(IterableDataset):
         label: str = "generic",
         num_gpus_per_ens: int = 1,
         num_gpus_per_model: int = 1,
+        trajectory_diverse_batching: bool = False,
+        trajectory_filter: int | list[int] | None = None,
     ) -> None:
         """Initialize (part of) the dataset state.
 
@@ -64,11 +62,15 @@ class NativeGridDataset(IterableDataset):
             Number of GPUs per ensemble, by default 1
         num_gpus_per_model : int, optional
             Number of GPUs per model, by default 1
+        trajectory_diverse_batching : bool, optional
+            Enable trajectory-diverse batching for better batch diversity, by default False
         """
         self.data = data_reader
         self.timestep = timestep
         self.grid_indices = grid_indices
         self.label = label
+        self.trajectory_diverse_batching = trajectory_diverse_batching
+        self.trajectory_filter = trajectory_filter
         self.relative_date_indices = relative_date_indices  # relative index of dates to extract
 
         self.num_gpus_per_ens = num_gpus_per_ens
@@ -135,12 +137,22 @@ class NativeGridDataset(IterableDataset):
         A date t is valid if we can sample the elements t + i
         for every relative_date_index i.
         """
-        return get_usable_indices(
+        indices = get_usable_indices(
             self.data.missing,
             len(self.data),
             np.array(self.relative_date_indices, dtype=np.int64),
             self.data.trajectory_ids,
         )
+        if self.trajectory_filter is not None and self.data.trajectory_ids is not None:
+            traj_ids = self.data.trajectory_ids
+            if isinstance(self.trajectory_filter, int):
+                mask = traj_ids[indices] == self.trajectory_filter
+            else:
+                mask = np.isin(traj_ids[indices], self.trajectory_filter)
+            LOGGER.info("Trajectory filter: keeping %d / %d samples (trajectory_filter=%s)",
+                        mask.sum(), len(indices), self.trajectory_filter)
+            indices = indices[mask]
+        return indices
 
     def set_comm_group_info(
         self,
@@ -369,7 +381,7 @@ class NativeGridDataset(IterableDataset):
             )[self.chunk_index_range]
 
             # Apply trajectory-diverse reordering if enabled
-            if self._trajectory_diverse_batching:
+            if self.trajectory_diverse_batching:
                 shuffled_chunk_indices = self._get_trajectory_diverse_indices(shuffled_chunk_indices)
         else:
             shuffled_chunk_indices = self.valid_date_indices[self.chunk_index_range]
@@ -410,7 +422,44 @@ class NativeGridDataset(IterableDataset):
             x = rearrange(x, "dates variables ensemble gridpoints -> dates ensemble gridpoints variables")
             self.ensemble_dim = 1
 
-            yield torch.from_numpy(x)
+            # Convert to torch tensor
+            x_tensor = torch.from_numpy(x)
+
+            # Diagnostic plot: save first sample's first channel as 2D image
+            if sample_count == 0 and self.label == "train" and self.global_rank == 0:
+                try:
+                    import matplotlib
+                    matplotlib.use("Agg")
+                    import matplotlib.pyplot as plt
+
+                    # x_tensor shape: [dates, ensemble, gridpoints, variables]
+                    input_field = x_tensor[0, 0, :, 0].numpy()  # first timestep, first channel
+                    target_field = x_tensor[-1, 0, :, 0].numpy()  # last timestep, first channel
+
+                    grid_shape = (445, 595)
+
+                    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+                    inp_2d = input_field.reshape(grid_shape)
+                    tgt_2d = target_field.reshape(grid_shape)
+                    diff_2d = tgt_2d - inp_2d
+                    im0 = axes[0].imshow(inp_2d, origin="lower", aspect="auto")
+                    plt.colorbar(im0, ax=axes[0])
+                    im1 = axes[1].imshow(tgt_2d, origin="lower", aspect="auto")
+                    plt.colorbar(im1, ax=axes[1])
+                    im2 = axes[2].imshow(diff_2d, origin="lower", aspect="auto", cmap="RdBu_r")
+                    plt.colorbar(im2, ax=axes[2])
+                    axes[0].set_title(f"Input (t=0), ch0, normalized")
+                    axes[1].set_title(f"Target (t+1), ch0, normalized")
+                    axes[2].set_title(f"Target - Input, ch0")
+                    plt.suptitle(f"label={self.label}, idx={i}, npts={len(input_field)}")
+                    plt.tight_layout()
+                    plt.savefig("/home/mflora/dataloader_diagnostic.png", dpi=150)
+                    plt.close()
+                    LOGGER.info("Saved dataloader diagnostic plot to /home/mflora/dataloader_diagnostic.png")
+                except Exception as e:
+                    LOGGER.warning("Failed to save diagnostic plot: %s", e)
+
+            yield x_tensor
 
     def __repr__(self) -> str:
         return f"""

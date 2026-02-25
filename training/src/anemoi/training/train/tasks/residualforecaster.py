@@ -29,39 +29,6 @@ class GraphResidualForecaster(BaseRolloutGraphModule):
     Matches the GraphCast framework.
     """
 
-    # Diagnostic logging control
-    _diag_log_interval = 100  # Log every N batches
-    _diag_batch_counter = 0
-
-    @staticmethod
-    def _log_tensor_stats(name: str, tensor: torch.Tensor, log_fn=LOGGER.info) -> dict:
-        """Log statistics for a tensor and return them as a dict."""
-        with torch.no_grad():
-            t = tensor.float()
-            has_nan = torch.isnan(t).any().item()
-            has_inf = torch.isinf(t).any().item()
-            if has_nan or has_inf:
-                nan_count = torch.isnan(t).sum().item()
-                inf_count = torch.isinf(t).sum().item()
-                log_fn(
-                    "  %s: NaN=%d, Inf=%d, shape=%s",
-                    name, nan_count, inf_count, list(tensor.shape)
-                )
-                return {"nan": nan_count, "inf": inf_count}
-
-            stats = {
-                "mean": t.mean().item(),
-                "std": t.std().item(),
-                "min": t.min().item(),
-                "max": t.max().item(),
-                "abs_max": t.abs().max().item(),
-            }
-            log_fn(
-                "  %s: mean=%.4f, std=%.4f, min=%.4f, max=%.4f, |max|=%.4f",
-                name, stats["mean"], stats["std"], stats["min"], stats["max"], stats["abs_max"]
-            )
-            return stats
-
     @staticmethod
     def _get_normalizer_buffers(processors) -> tuple[torch.Tensor, torch.Tensor]:
         for processor in processors.processors.values():
@@ -112,10 +79,6 @@ class GraphResidualForecaster(BaseRolloutGraphModule):
         # so we must use data.input.prognostic (not data.output.prognostic) to access them.
         norm_mul, norm_add = self._get_normalizer_buffers(self.model.pre_processors)
 
-        # Increment batch counter for diagnostic logging
-        GraphResidualForecaster._diag_batch_counter += 1
-        should_log_diag = (GraphResidualForecaster._diag_batch_counter % GraphResidualForecaster._diag_log_interval == 1)
-
         for rollout_step in range(rollout or self.rollout):
             # Forward prediction (normalized residual)
             # model_output shape: (batch, ensemble, grid, n_output)
@@ -154,28 +117,6 @@ class GraphResidualForecaster(BaseRolloutGraphModule):
             )
 
             # ============================================================
-            # DIAGNOSTIC LOGGING (every N batches, rollout_step 0 only)
-            # ============================================================
-            if should_log_diag and rollout_step == 0:
-                LOGGER.info("=" * 60)
-                LOGGER.info("RESIDUAL FORECASTER DIAGNOSTICS (batch %d, step %d)",
-                           GraphResidualForecaster._diag_batch_counter, rollout_step)
-                LOGGER.info("=" * 60)
-                LOGGER.info("Input tensors (normalized state space):")
-                self._log_tensor_stats("x_last_norm", x_last_norm)
-                self._log_tensor_stats("y_true_norm", y_true_norm)
-                LOGGER.info("Physical space tensors:")
-                self._log_tensor_stats("x_last_phys", x_last_phys)
-                self._log_tensor_stats("y_true_phys", y_true_phys)
-                LOGGER.info("Residuals (normalized):")
-                self._log_tensor_stats("Δx_true_norm (target)", Δx_true_norm)
-                self._log_tensor_stats("Δx̂_norm_prog (model)", Δx̂_norm_prog)
-                LOGGER.info("Residual difference (pred - target):")
-                residual_diff = Δx̂_norm_prog.float() - Δx_true_norm.float()
-                self._log_tensor_stats("Δx̂ - Δx_true", residual_diff)
-                LOGGER.info("-" * 60)
-
-            # ============================================================
             # GraphCast-style: Reconstruct in PHYSICAL space, then renormalize
             # ============================================================
 
@@ -188,16 +129,6 @@ class GraphResidualForecaster(BaseRolloutGraphModule):
 
             # Renormalize prognostic predictions for next rollout step (normalized state space)
             y_pred_prog = (y_pred_phys_prog * norm_mul[input_prog_idx].float() + norm_add[input_prog_idx].float()).to(model_output.dtype)
-
-            # Diagnostic logging for reconstruction
-            if should_log_diag and rollout_step == 0:
-                LOGGER.info("Reconstruction:")
-                self._log_tensor_stats("y_pred_phys_prog", y_pred_phys_prog)
-                self._log_tensor_stats("y_pred_prog (renormalized)", y_pred_prog)
-                # Check if prediction drifted significantly from target
-                pred_vs_true = y_pred_prog.float() - y_true_norm.float()
-                self._log_tensor_stats("y_pred - y_true (norm space)", pred_vs_true)
-                LOGGER.info("=" * 60)
 
             # ============================================================
             # Build full prediction tensor with prognostic + diagnostic
@@ -234,31 +165,17 @@ class GraphResidualForecaster(BaseRolloutGraphModule):
                 use_reentrant=False,
             )
 
-            # Log loss and check for issues at every step (not just step 0)
-            if should_log_diag:
-                with torch.no_grad():
-                    loss_val = loss.item() if loss.numel() == 1 else loss.sum().item()
-                    has_nan = torch.isnan(loss).any().item()
-                    has_inf = torch.isinf(loss).any().item()
-                    if has_nan or has_inf or loss_val > 100:
-                        LOGGER.warning(
-                            "LOSS ALERT (batch %d, step %d): loss=%.4f, has_nan=%s, has_inf=%s",
-                            GraphResidualForecaster._diag_batch_counter, rollout_step,
-                            loss_val, has_nan, has_inf
-                        )
-                        # Log state at problematic step
-                        LOGGER.warning("State at problematic step:")
-                        self._log_tensor_stats("x (input)", x, LOGGER.warning)
-                        self._log_tensor_stats("Δx̂_norm_prog", Δx̂_norm_prog, LOGGER.warning)
-                        self._log_tensor_stats("Δx_true_norm", Δx_true_norm, LOGGER.warning)
-                    elif rollout_step == 0:
-                        LOGGER.info("Loss at step %d: %.4f", rollout_step, loss_val)
-
-            # Log multi-step rollout degradation
-            if should_log_diag and rollout_step > 0 and rollout_step % 2 == 0:
-                LOGGER.info("Rollout step %d - checking for drift:", rollout_step)
-                self._log_tensor_stats("  x (model input)", x)
-                self._log_tensor_stats("  Δx̂_norm_prog (model output)", Δx̂_norm_prog)
+            # Log per-variable-group losses to MLflow (every 250 steps, matching total loss interval)
+            if hasattr(self.loss, '_last_per_group_losses') and self.loss._last_per_group_losses is not None:
+                for group_name, group_loss in self.loss._last_per_group_losses.items():
+                    self.log(
+                        f"train_loss/{group_name}",
+                        group_loss,
+                        on_step=True,
+                        on_epoch=False,
+                        logger=True,
+                        rank_zero_only=True,
+                    )
 
             # ============================================================
             # Validation metrics in STATE space (not residual space!)

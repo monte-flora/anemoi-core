@@ -29,6 +29,22 @@ class GNNDecoderSchema(GNNModelComponent):
     "Apply LayerNorm before the final linear projection. Default to True."
 
 
+class GraphInteractionNetDecoderSchema(GNNModelComponent):
+    """GraphCast-style GNN Decoder with correct Interaction Network residual pattern.
+
+    This implements the Interaction Network architecture (Battaglia et al. 2018)
+    where residuals are applied AFTER edge and node updates, not inside the
+    message function. This prevents gradient collapse in deep networks.
+    """
+
+    target_: Literal["anemoi.models.layers.mapper.GraphInteractionNetBackwardMapper"] = Field(..., alias="_target_")
+    "GraphInteractionNet decoder object from anemoi.models.layers.mapper."
+    initialise_data_extractor_zero: bool = Field(default=False, example=False)
+    "Initialise the data extractor with zeros. Default to False."
+    final_layer_norm: bool = Field(default=True, example=True)
+    "Apply LayerNorm before the final linear projection. Default to True."
+
+
 class GraphTransformerDecoderSchema(TransformerModelComponent):
     target_: Literal["anemoi.models.layers.mapper.GraphTransformerBackwardMapper"] = Field(..., alias="_target_")
     "Graph Transformer Decoder object from anemoi.models.layers.mapper."

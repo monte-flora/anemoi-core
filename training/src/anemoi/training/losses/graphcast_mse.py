@@ -149,8 +149,8 @@ class GraphCastMSELoss(GraphCastBaseLoss):
 
         # Compute sample weights before calculating difference (need original target scale)
         sample_weights = None
-        if self.sample_weighting:
-            sample_weights = self._compute_sample_weights(target)
+        #if self.sample_weighting:
+        #    sample_weights = self._compute_sample_weights(target)
 
         out = self.calculate_difference(pred, target)
 

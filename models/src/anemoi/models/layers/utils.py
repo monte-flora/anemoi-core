@@ -9,16 +9,124 @@
 
 
 import logging
+import math
 from typing import Optional
 
 from hydra.errors import InstantiationException
 from hydra.utils import instantiate
+import torch
 from torch import nn
 from torch.utils.checkpoint import checkpoint
 
 from anemoi.utils.config import DotDict
 
 LOGGER = logging.getLogger(__name__)
+
+
+class TruncNormalLinear(nn.Linear):
+    """Linear layer with Haiku-style truncated normal weight initialization.
+
+    Matches the default initialization in JAX/Haiku's hk.Linear:
+        w_init = TruncatedNormal(stddev=1/sqrt(fan_in))
+        b_init = zeros
+
+    This differs from PyTorch's default Kaiming uniform initialization.
+    """
+
+    def __init__(self, in_features: int, out_features: int, bias: bool = True, device=None, dtype=None) -> None:
+        super().__init__(in_features, out_features, bias, device, dtype)
+        self._init_weights()
+
+    def _init_weights(self) -> None:
+        """Initialize weights with truncated normal, biases with zeros."""
+        # Haiku default: TruncatedNormal(stddev=1/sqrt(fan_in)), truncated at ±2σ
+        stddev = 1.0 / math.sqrt(self.in_features)
+        nn.init.trunc_normal_(self.weight, mean=0.0, std=stddev, a=-2 * stddev, b=2 * stddev)
+        if self.bias is not None:
+            nn.init.zeros_(self.bias)
+
+
+class XavierUniformLinear(nn.Linear):
+    """Linear layer with Xavier uniform weight initialization.
+
+    Balanced fan_in/fan_out scaling: bounds ~sqrt(6/(fan_in+fan_out)).
+    """
+
+    def __init__(self, in_features: int, out_features: int, bias: bool = True, device=None, dtype=None) -> None:
+        super().__init__(in_features, out_features, bias, device, dtype)
+        self._init_weights()
+
+    def _init_weights(self) -> None:
+        nn.init.xavier_uniform_(self.weight, gain=1.0)
+        if self.bias is not None:
+            nn.init.zeros_(self.bias)
+
+
+class XavierNormalLinear(nn.Linear):
+    """Linear layer with Xavier normal weight initialization.
+
+    Gaussian variant: stddev = sqrt(2/(fan_in+fan_out)).
+    """
+
+    def __init__(self, in_features: int, out_features: int, bias: bool = True, device=None, dtype=None) -> None:
+        super().__init__(in_features, out_features, bias, device, dtype)
+        self._init_weights()
+
+    def _init_weights(self) -> None:
+        nn.init.xavier_normal_(self.weight, gain=1.0)
+        if self.bias is not None:
+            nn.init.zeros_(self.bias)
+
+
+class KaimingNormalLinear(nn.Linear):
+    """Linear layer with Kaiming (He) normal weight initialization.
+
+    Fan_out mode preserves backward-pass variance; leaky_relu a=0.01
+    is used as a proxy for SiLU.
+    """
+
+    def __init__(self, in_features: int, out_features: int, bias: bool = True, device=None, dtype=None) -> None:
+        super().__init__(in_features, out_features, bias, device, dtype)
+        self._init_weights()
+
+    def _init_weights(self) -> None:
+        nn.init.kaiming_normal_(self.weight, a=0.01, mode="fan_out", nonlinearity="leaky_relu")
+        if self.bias is not None:
+            nn.init.zeros_(self.bias)
+
+
+class OrthogonalLinear(nn.Linear):
+    """Linear layer with orthogonal weight initialization.
+
+    All singular values = 1.0; maximal rank by construction.
+    """
+
+    def __init__(self, in_features: int, out_features: int, bias: bool = True, device=None, dtype=None) -> None:
+        super().__init__(in_features, out_features, bias, device, dtype)
+        self._init_weights()
+
+    def _init_weights(self) -> None:
+        nn.init.orthogonal_(self.weight, gain=1.0)
+        if self.bias is not None:
+            nn.init.zeros_(self.bias)
+
+
+class ScaledTruncNormalLinear(nn.Linear):
+    """Linear layer with scaled truncated normal weight initialization.
+
+    Same as TruncNormalLinear but with gain=2.0 (stddev = 2/sqrt(fan_in)).
+    Doubles stddev to spread singular values wider.
+    """
+
+    def __init__(self, in_features: int, out_features: int, bias: bool = True, device=None, dtype=None) -> None:
+        super().__init__(in_features, out_features, bias, device, dtype)
+        self._init_weights()
+
+    def _init_weights(self) -> None:
+        stddev = 2.0 / math.sqrt(self.in_features)
+        nn.init.trunc_normal_(self.weight, mean=0.0, std=stddev, a=-2 * stddev, b=2 * stddev)
+        if self.bias is not None:
+            nn.init.zeros_(self.bias)
 
 
 class CheckpointWrapper(nn.Module):

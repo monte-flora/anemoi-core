@@ -62,8 +62,11 @@ class MLP(nn.Module):
         LayerNorm = layer_kernels.LayerNorm
         Activation = layer_kernels.Activation
 
+        # MLP structure: Linear(in→hidden) → Act → [Linear(hidden→hidden) → Act]×n_extra_layers → Linear(hidden→out)
+        # With n_extra_layers=0: 2 linear layers (matches GraphCast/WoFSCast)
+        # With n_extra_layers=1: 3 linear layers
         self.mlp = nn.Sequential(Linear(in_features, hidden_dim), Activation())
-        for _ in range(n_extra_layers + 1):
+        for _ in range(n_extra_layers):
             self.mlp.append(Linear(hidden_dim, hidden_dim))
             self.mlp.append(Activation())
         self.mlp.append(Linear(hidden_dim, out_features))

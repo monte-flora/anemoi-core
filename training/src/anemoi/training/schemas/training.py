@@ -51,6 +51,18 @@ class SWA(BaseModel):
     "Learning rate for SWA."
 
 
+class EWA(BaseModel):
+    """Exponential weight averaging configuration.
+
+    See https://lightning.ai/docs/pytorch/stable/api/lightning.pytorch.callbacks.WeightAveraging.html
+    """
+
+    enabled: bool = Field(default=False)
+    "Enable exponential weight averaging."
+    ema_decay: float = Field(default=0.999, ge=0.0, le=1.0)
+    "Decay factor for exponential moving average. Higher values (closer to 1.0) give more weight to recent weights."
+
+
 class Rollout(BaseModel):
     """Rollout configuration."""
 
@@ -225,6 +237,9 @@ class ImplementedLossesUsingBaseLossSchema(str, Enum):
     graphcast_mse = "anemoi.training.losses.GraphCastMSELoss"
     graphcast_huber = "anemoi.training.losses.GraphCastHuberLoss"
     graphcast_logcosh = "anemoi.training.losses.GraphCastLogCoshLoss"
+    graphcast_clipped_mse = "anemoi.training.losses.GraphCastClippedMSELoss"
+    graphcast_pseudo_huber = "anemoi.training.losses.GraphCastPseudoHuberLoss"
+    graphcast_gaussian_nll = "anemoi.training.losses.GraphCastGaussianNLLLoss"
 
 
 class BaseLossSchema(BaseModel):
@@ -305,6 +320,49 @@ class GraphCastLogCoshLossSchema(BaseLossSchema):
     "Minimum weight for extreme samples."
 
 
+class GraphCastClippedMSELossSchema(BaseLossSchema):
+    """Schema for GraphCast-style MSE loss with per-element clipping."""
+
+    clip_value: float = 100.0
+    "Maximum squared error per element. Prevents gradient explosion from extreme errors."
+    log_clipping_stats: bool = True
+    "If True, log statistics about clipping behavior."
+    log_per_variable_loss: bool = True
+    "If True, log loss per variable group."
+    log_interval: int = 100
+    "Log statistics every N forward passes."
+
+
+class GraphCastPseudoHuberLossSchema(BaseLossSchema):
+    """Schema for GraphCast-style Pseudo-Huber loss (smooth L1)."""
+
+    delta: float = 10.0
+    "Transition point from quadratic to linear behavior."
+
+
+class GraphCastGaussianNLLLossSchema(BaseLossSchema):
+    """Schema for GraphCast-style Gaussian NLL loss with learned diagonal covariance."""
+
+    variance_mode: Literal["per_variable", "per_variable_per_level"] = "per_variable"
+    "How to parameterize variances: 'per_variable' or 'per_variable_per_level'."
+    variance_init: float = 0.0
+    "Initial value for log_var (var = exp(log_var)). Default 0.0 (var=1, equivalent to MSE)."
+    variance_eps: float = 1e-6
+    "Small constant added to variance for numerical stability."
+    variance_trainable: bool = True
+    "Whether to learn the variances. If False, keeps them fixed at init."
+    variance_min: float | None = None
+    "Minimum allowed variance (prevents collapse). If None, no minimum constraint. Recommended: 1e-4."
+    variance_max: float | None = None
+    "Maximum allowed variance (prevents explosion). If None, no maximum constraint. Recommended: 100.0."
+    sample_weighting: bool = False
+    "If True, downweight samples with extreme target values."
+    sample_weight_threshold: float = 10.0
+    "Target magnitude threshold for weighting."
+    sample_weight_min: float = 0.01
+    "Minimum weight for extreme samples."
+
+
 class CombinedLossSchema(BaseLossSchema):
     losses: list[BaseLossSchema] = Field(min_length=1)
     "Losses to combine, can be any of the normal losses."
@@ -343,6 +401,9 @@ LossSchemas = (
     | GraphCastMSELossSchema
     | GraphCastHuberLossSchema
     | GraphCastLogCoshLossSchema
+    | GraphCastClippedMSELossSchema
+    | GraphCastPseudoHuberLossSchema
+    | GraphCastGaussianNLLLossSchema
 )
 
 
@@ -407,6 +468,8 @@ class BaseTrainingSchema(BaseModel):
     "Strategy to use."
     swa: SWA = Field(default_factory=SWA)
     "Config for stochastic weight averaging."
+    ewa: EWA = Field(default_factory=EWA)
+    "Config for exponential weight averaging."
     training_loss: LossSchemas
     "Training loss configuration."
     loss_gradient_scaling: bool = False

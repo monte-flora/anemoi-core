@@ -1,0 +1,90 @@
+# GraphCast-style GNN using the correct Interaction Network pattern (Battaglia et al. 2018)
+#
+# This differs from gnn.yaml by using:
+#   - GraphInteractionNetProcessor instead of GNNProcessor
+#   - GraphInteractionNetForwardMapper instead of GNNForwardMapper
+#   - GraphInteractionNetBackwardMapper instead of GNNBackwardMapper
+#
+# The key architectural difference is the residual connection placement:
+#   - Original GNN: edge_new = EdgeMLP([s,r,e]) + e  (residual INSIDE message)
+#                   node_new = NodeMLP([n, Σ(edge_new)]) + n
+#
+#   - GraphCast/Interaction Network:
+#       1. edge_delta = EdgeMLP([s,r,e])  (NO residual inside)
+#       2. aggregated = Σ(edge_delta)     (aggregate DELTAS only)
+#       3. node_delta = NodeMLP([n, aggregated])
+#       4. edge_new = e + edge_delta      (residual AFTER)
+#       5. node_new = n + node_delta      (residual AFTER)
+#
+# This correct pattern prevents gradient collapse in deep networks (16+ layers).
+
+num_channels: 512
+cpu_offload: False
+
+keep_batch_sharded: True
+
+model:
+  _target_: anemoi.models.models.AnemoiModelEncProcDec
+
+layer_kernels:
+  LayerNorm:
+    _target_: anemoi.models.layers.normalization.AutocastLayerNorm
+  Linear:
+    # TruncNormalLinear uses truncated normal initialization (matches GraphCast/WoFSCast)
+    _target_: anemoi.models.layers.utils.TruncNormalLinear
+  Activation:
+    # SiLU/Swish activation (matches GraphCast/WoFSCast)
+    _target_: torch.nn.SiLU
+
+processor:
+  _target_: anemoi.models.layers.processor.GraphInteractionNetProcessor
+  trainable_size: ${model.trainable_parameters.hidden2hidden}
+  sub_graph_edge_attributes: ${model.attributes.edges}
+  num_layers: 16
+  num_chunks: 2
+  mlp_extra_layers: 0
+  cpu_offload: ${model.cpu_offload}
+  layer_kernels: ${model.layer_kernels}
+
+encoder:
+  _target_: anemoi.models.layers.mapper.GraphInteractionNetForwardMapper
+  trainable_size: ${model.trainable_parameters.data2hidden}
+  sub_graph_edge_attributes: ${model.attributes.edges}
+  num_chunks: 1
+  mlp_extra_layers: 0
+  cpu_offload: ${model.cpu_offload}
+  layer_kernels: ${model.layer_kernels}
+
+decoder:
+  _target_: anemoi.models.layers.mapper.GraphInteractionNetBackwardMapper
+  trainable_size: ${model.trainable_parameters.hidden2data}
+  sub_graph_edge_attributes: ${model.attributes.edges}
+  num_chunks: 1
+  mlp_extra_layers: 0
+  cpu_offload: ${model.cpu_offload}
+  layer_kernels: ${model.layer_kernels}
+
+residual:
+  _target_: anemoi.models.layers.residual.SkipConnection
+  step: -1
+
+output_mask:
+  _target_: anemoi.training.utils.masks.NoOutputMask
+
+trainable_parameters:
+  data: 8
+  hidden: 8
+  data2hidden: 8
+  hidden2data: 8
+  hidden2hidden: 8
+
+attributes:
+  edges:
+    - edge_length
+    - edge_dirs
+  nodes: []
+
+bounding:
+  - _target_: anemoi.models.layers.bounding.ReluBounding
+    variables:
+      - tp

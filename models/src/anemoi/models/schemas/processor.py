@@ -29,6 +29,22 @@ class GNNProcessorSchema(GNNModelComponent):
     "Number of chunks to divide the layer into. Default to 2."
 
 
+class GraphInteractionNetProcessorSchema(GNNModelComponent):
+    """GraphCast-style GNN Processor with correct Interaction Network residual pattern.
+
+    This implements the Interaction Network architecture (Battaglia et al. 2018)
+    where residuals are applied AFTER edge and node updates, not inside the
+    message function. This prevents gradient collapse in deep networks.
+    """
+
+    target_: Literal["anemoi.models.layers.processor.GraphInteractionNetProcessor"] = Field(..., alias="_target_")
+    "GraphInteractionNet Processor object from anemoi.models.layers.processor."
+    num_layers: NonNegativeInt = Field(example=16)
+    "Number of layers of GraphInteractionNet processor. Default to 16."
+    num_chunks: NonNegativeInt = Field(example=2)
+    "Number of chunks to divide the layer into. Default to 2."
+
+
 class GraphTransformerProcessorSchema(TransformerModelComponent):
     target_: Literal["anemoi.models.layers.processor.GraphTransformerProcessor"] = Field(..., alias="_target_")
     "Graph transformer processor object from anemoi.models.layers.processor."

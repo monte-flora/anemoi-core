@@ -22,6 +22,7 @@ from pytorch_lightning.callbacks import Callback
 from pytorch_lightning.callbacks import TQDMProgressBar
 
 from anemoi.training.diagnostics.callbacks.checkpoint import AnemoiCheckpoint
+from anemoi.training.diagnostics.callbacks.optimiser import ExponentialWeightAveraging
 from anemoi.training.diagnostics.callbacks.optimiser import LearningRateMonitor
 from anemoi.training.diagnostics.callbacks.optimiser import StochasticWeightAveraging
 from anemoi.training.diagnostics.callbacks.provenance import ParentUUIDCallback
@@ -50,6 +51,7 @@ def nestedget(config: DictConfig, key: str, default: Any) -> Any:
 # Can be function to check status from config
 CONFIG_ENABLED_CALLBACKS: list[tuple[list[str] | str | Callable[[DictConfig], bool], type[Callback]]] = [
     ("training.swa.enabled", StochasticWeightAveraging),
+    ("training.ewa.enabled", ExponentialWeightAveraging),
     (
         lambda config: nestedget(config, "diagnostics.log.wandb.enabled", False)
         or nestedget(config, "diagnostics.log.mlflow.enabled", False),

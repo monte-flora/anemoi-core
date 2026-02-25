@@ -69,6 +69,12 @@ class GraphCastGaussianNLLLoss(GraphCastBaseLoss):
         Small constant added to variance for numerical stability. Default 1e-6.
     variance_trainable : bool, optional
         Whether to learn the variances. If False, keeps them fixed at init. Default True.
+    variance_min : float, optional
+        Minimum allowed variance (prevents collapse). If None, no minimum constraint. Default None.
+        Recommended: 1e-4 to prevent numerical instability.
+    variance_max : float, optional
+        Maximum allowed variance (prevents explosion). If None, no maximum constraint. Default None.
+        Recommended: 100.0 to prevent variance from growing too large.
     ignore_nans : bool, optional
         If True, use nanmean/nansum to ignore NaN values. Default False.
     sample_weighting : bool, optional
@@ -109,6 +115,8 @@ class GraphCastGaussianNLLLoss(GraphCastBaseLoss):
         variance_init: float = 0.0,
         variance_eps: float = 1e-6,
         variance_trainable: bool = True,
+        variance_min: float | None = None,
+        variance_max: float | None = None,
         ignore_nans: bool = False,
         sample_weighting: bool = False,
         sample_weight_threshold: float = 10.0,
@@ -131,6 +139,8 @@ class GraphCastGaussianNLLLoss(GraphCastBaseLoss):
         self.variance_init = variance_init
         self.variance_eps = variance_eps
         self.variance_trainable = variance_trainable
+        self.variance_min = variance_min
+        self.variance_max = variance_max
 
         # Will be initialized in set_data_indices
         self.log_var: nn.Parameter | None = None
@@ -171,11 +181,19 @@ class GraphCastGaussianNLLLoss(GraphCastBaseLoss):
         log_var_init = torch.full(shape, self.variance_init, dtype=torch.float32)
         self.log_var = nn.Parameter(log_var_init, requires_grad=self.variance_trainable)
 
+        constraints_info = []
+        if self.variance_min is not None:
+            constraints_info.append(f"min={self.variance_min:.2e}")
+        if self.variance_max is not None:
+            constraints_info.append(f"max={self.variance_max:.2e}")
+        constraints_str = f" (constraints: {', '.join(constraints_info)})" if constraints_info else ""
+
         LOGGER.info(
-            "GraphCastGaussianNLLLoss initialized: mode=%s, init_var=%.4f, trainable=%s",
+            "GraphCastGaussianNLLLoss initialized: mode=%s, init_var=%.4f, trainable=%s%s",
             self.variance_mode,
             torch.exp(torch.tensor(self.variance_init)).item(),
             self.variance_trainable,
+            constraints_str,
         )
 
     def _get_variance_tensor(self, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
@@ -205,6 +223,12 @@ class GraphCastGaussianNLLLoss(GraphCastBaseLoss):
         # Compute var = exp(log_var) + eps
         # Cast to target dtype for computation
         var = torch.exp(self.log_var.to(dtype=dtype, device=device)) + self.variance_eps
+
+        # Apply variance clamping to prevent collapse or explosion
+        if self.variance_min is not None:
+            var = torch.clamp(var, min=self.variance_min)
+        if self.variance_max is not None:
+            var = torch.clamp(var, max=self.variance_max)
 
         if self.variance_mode == "per_variable":
             # var has shape (n_groups,)

@@ -178,8 +178,10 @@ class AnemoiDatasetsDataModule(pl.LightningDataModule):
 
     @cached_property
     def ds_train(self) -> NativeGridDataset:
+        shuffle = getattr(self.config.dataloader, "shuffle_training", True)
         return self._get_dataset(
             open_dataset(self.config.dataloader.training),
+            shuffle=shuffle,
             label="train",
         )
 
@@ -233,6 +235,8 @@ class AnemoiDatasetsDataModule(pl.LightningDataModule):
             shuffle=shuffle,
             grid_indices=self.grid_indices,
             label=label,
+            trajectory_diverse_batching=getattr(self.config.dataloader, "trajectory_diverse_batching", False),
+            trajectory_filter=getattr(self.config.dataloader, "trajectory_filter", None),
             #num_gpus_per_ens=getattr(self.config.system.hardware, "num_gpus_per_ensemble", 1),
             #num_gpus_per_model=self.config.system.hardware.num_gpus_per_model,
         )
