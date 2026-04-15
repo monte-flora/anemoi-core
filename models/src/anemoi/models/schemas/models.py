@@ -66,6 +66,9 @@ class DefinedModels(str, Enum):
     ANEMOI_RESIDUAL_ENC_PROC_DEC = "anemoi.models.models.residual_encoder_processor_decoder.AnemoiResidualModelEncProcDec"
     ANEMOI_RESIDUAL_ENC_PROC_DEC_SHORT = "anemoi.models.models.AnemoiResidualModelEncProcDec"
 
+    ANEMOI_DIT_MODEL = "anemoi.models.models.dit_wrapper.AnemoiDiTModel"
+    ANEMOI_DIT_MODEL_SHORT = "anemoi.models.models.AnemoiDiTModel"
+
 class Model(BaseModel):
     target_: DefinedModels = Field(..., alias="_target_")
     "Model object defined in anemoi.models.model."
@@ -201,6 +204,91 @@ class DiffusionSchema(BaseModel):
     "Default parameters for inference sampling"
 
 
+class DiTConfigSchema(BaseModel):
+    """Schema for DiT-specific configuration."""
+
+    field_shape: list[PositiveInt]
+    "Spatial dimensions of the data grid [H, W]."
+    mode: Literal["deterministic", "probabilistic"] = Field(default="deterministic")
+    "Training mode: deterministic (MSE) or probabilistic (diffusion)."
+    patch_size: PositiveInt = Field(default=4, examples=[4, 6])
+    "Patch size for tokenization. Each token covers patch_size x patch_size grid cells."
+    hidden_size: PositiveInt = Field(default=512, examples=[384, 512, 768])
+    "Transformer embedding dimension."
+    depth: PositiveInt = Field(default=16, examples=[12, 16, 24])
+    "Number of DiT transformer blocks."
+    num_heads: PositiveInt = Field(default=8, examples=[6, 8, 12])
+    "Number of attention heads."
+    mlp_ratio: float = Field(default=4.0)
+    "MLP hidden dimension multiplier."
+    attention_backend: Literal["timm", "natten2d", "transformer_engine"] = Field(default="natten2d")
+    "Attention backend. natten2d for O(N) neighborhood attention."
+    conditioning_embedder: Literal["zero", "dit", "edm"] = Field(default="dit")
+    "Conditioning type. dit=late-fusion (default), edm=early-fusion, zero=bias-only (not compatible with ProjLayer detokenizer)."
+    condition_dim: Optional[int] = Field(default=None)
+    "External conditioning dimension. None for unconditional."
+    tokenizer_kwargs: dict = Field(default_factory=dict)
+    "Kwargs passed to PatchEmbed2DTokenizer (e.g., pos_embed='none')."
+    attn_kwargs: dict = Field(default_factory=dict)
+    "Kwargs passed to attention module (e.g., attn_kernel=13)."
+    conditioning_embedder_kwargs: dict = Field(default_factory=dict)
+    "Kwargs passed to conditioning embedder."
+    force_tokenization_fp32: bool = Field(default=True)
+    "Force tokenizer/detokenizer to run in fp32 for numerical stability."
+    # Diffusion-specific (only used when mode='probabilistic')
+    sigma_data: Optional[PositiveFloat] = Field(default=1.0)
+    "Data scaling parameter for EDM preconditioning."
+    sigma_max: Optional[PositiveFloat] = Field(default=100.0)
+    "Maximum noise level for diffusion training."
+    sigma_min: Optional[PositiveFloat] = Field(default=0.02)
+    "Minimum noise level for diffusion training."
+    rho: Optional[PositiveFloat] = Field(default=7.0)
+    "Karras schedule parameter for training noise distribution."
+    inference_defaults: dict = Field(default_factory=dict)
+    "Default parameters for inference sampling (noise schedule, sampler)."
+
+
+class DiTModel(BaseModel):
+    """Model target schema for DiT models."""
+
+    target_: Literal[
+        DefinedModels.ANEMOI_DIT_MODEL,
+        DefinedModels.ANEMOI_DIT_MODEL_SHORT,
+    ] = Field(..., alias="_target_")
+    "DiT model object."
+    convert_: str = Field("all", alias="_convert_")
+    "The target's parameters to convert to primitive containers."
+    dit: DiTConfigSchema
+    "DiT-specific configuration."
+
+
+class DiTModelSchema(PydanticBaseModel):
+    """Schema for DiT models — replaces enc-proc-dec with a single DiT.
+
+    Unlike BaseModelSchema, this does NOT require processor, encoder, or decoder
+    fields because the DiT replaces the entire pipeline.
+    """
+
+    num_channels: NonNegativeInt = Field(example=512)
+    "Feature tensor size (DiT hidden_size)."
+    keep_batch_sharded: bool = Field(default=True)
+    "Keep the input batch and the output of the model sharded."
+    model: DiTModel = Field(...)
+    "DiT model schema."
+    trainable_parameters: TrainableParameters = Field(default_factory=TrainableParameters)
+    "Learnable node and edge parameters (typically all 0 for DiT)."
+    bounding: list[Bounding]
+    "List of bounding configurations applied to specified variables."
+    output_mask: OutputMaskSchemas
+    "Output mask configuration."
+    residual: ResidualConnectionSchema = Field(..., discriminator="target_")
+    "Residual connection schema."
+    attributes: Optional[dict] = Field(default_factory=dict)
+    "Node/edge attributes (typically empty for DiT)."
+    compile: Optional[list[dict[str, Any]]] = Field(None)
+    "Modules to be compiled."
+
+
 class BaseModelSchema(PydanticBaseModel):
     num_channels: NonNegativeInt = Field(example=512)
     "Feature tensor size in the hidden space."
@@ -329,5 +417,5 @@ class HierarchicalModelSchema(BaseModelSchema):
 
 
 ModelSchema = Union[
-    BaseModelSchema, EnsModelSchema, HierarchicalModelSchema, DiffusionModelSchema, DiffusionTendModelSchema
+    DiTModelSchema, BaseModelSchema, EnsModelSchema, HierarchicalModelSchema, DiffusionModelSchema, DiffusionTendModelSchema
 ]

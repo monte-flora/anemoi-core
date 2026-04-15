@@ -121,7 +121,8 @@ class BaseSchema(SchemaCommonMixin, BaseModel):
     def check_bounding_not_used_with_data_extractor_zero(self) -> Self:
         """Check that bounding is not used with zero data extractor."""
         if (
-            isinstance(self.model.decoder, GraphTransformerDecoderSchema)
+            hasattr(self.model, "decoder")
+            and isinstance(self.model.decoder, GraphTransformerDecoderSchema)
             and self.model.decoder.initialise_data_extractor_zero
             and self.model.bounding
         ):

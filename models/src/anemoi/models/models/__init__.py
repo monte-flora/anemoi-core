@@ -10,6 +10,7 @@
 from .base import BaseGraphModel
 from .diffusion_encoder_processor_decoder import AnemoiDiffusionModelEncProcDec
 from .diffusion_encoder_processor_decoder import AnemoiDiffusionTendModelEncProcDec
+from .dit_wrapper import AnemoiDiTModel
 from .encoder_processor_decoder import AnemoiModelEncProcDec
 from .ens_encoder_processor_decoder import AnemoiEnsModelEncProcDec
 from .hierarchical import AnemoiModelEncProcDecHierarchical
@@ -18,6 +19,7 @@ from .residual_encoder_processor_decoder import AnemoiResidualModelEncProcDec
 
 __all__ = [
     "BaseGraphModel",
+    "AnemoiDiTModel",
     "AnemoiModelEncProcDec",
     "AnemoiEnsModelEncProcDec",
     "AnemoiDiffusionModelEncProcDec",
