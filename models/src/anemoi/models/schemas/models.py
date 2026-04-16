@@ -69,6 +69,9 @@ class DefinedModels(str, Enum):
     ANEMOI_DIT_MODEL = "anemoi.models.models.dit_wrapper.AnemoiDiTModel"
     ANEMOI_DIT_MODEL_SHORT = "anemoi.models.models.AnemoiDiTModel"
 
+    ANEMOI_UNET_MODEL = "anemoi.models.models.unet_wrapper.AnemoiUNetModel"
+    ANEMOI_UNET_MODEL_SHORT = "anemoi.models.models.AnemoiUNetModel"
+
 class Model(BaseModel):
     target_: DefinedModels = Field(..., alias="_target_")
     "Model object defined in anemoi.models.model."
@@ -289,6 +292,83 @@ class DiTModelSchema(PydanticBaseModel):
     "Modules to be compiled."
 
 
+class UNetConfigSchema(BaseModel):
+    """Schema for SongUNet configuration."""
+
+    field_shape: list[PositiveInt]
+    "Spatial dimensions of the data grid [H, W]."
+    mode: Literal["deterministic", "probabilistic"] = Field(default="deterministic")
+    "Training mode: deterministic (MSE/MAE) or probabilistic (diffusion)."
+    model_channels: PositiveInt = Field(default=128, examples=[128, 192, 320])
+    "Base channel width. Channels at level i = model_channels * channel_mult[i]."
+    channel_mult: list[PositiveInt] = Field(default=[1, 2, 3, 4])
+    "Channel multipliers per level. Length determines number of U-Net levels."
+    num_blocks: PositiveInt = Field(default=4, examples=[2, 4])
+    "Number of residual convolutional blocks per level."
+    n_attn_levels: PositiveInt = Field(default=2)
+    "Number of coarsest resolution levels to apply self-attention."
+    dropout: float = Field(default=0.10)
+    "Dropout probability in U-Net blocks."
+    encoder_type: Literal["standard", "skip", "residual"] = Field(default="standard")
+    "Encoder architecture: standard (DDPM++), residual (NCSN++), skip."
+    decoder_type: Literal["standard", "skip"] = Field(default="standard")
+    "Decoder architecture: standard or skip."
+    bottleneck_attention: bool = Field(default=True)
+    "Apply self-attention at the bottleneck (innermost level)."
+    domain_parallel_size: PositiveInt = Field(default=1)
+    "Number of GPUs for domain-parallel sharding (1=disabled). Splits spatial dimension across GPUs for large domains."
+    shard_dim: PositiveInt = Field(default=2)
+    "Spatial dimension to shard for domain parallelism (2=height, 3=width)."
+    # Diffusion-specific (probabilistic mode)
+    sigma_data: Optional[PositiveFloat] = Field(default=1.0)
+    "Data scaling parameter for EDM preconditioning."
+    sigma_max: Optional[PositiveFloat] = Field(default=100.0)
+    "Maximum noise level for diffusion training."
+    sigma_min: Optional[PositiveFloat] = Field(default=0.02)
+    "Minimum noise level for diffusion training."
+    rho: Optional[PositiveFloat] = Field(default=7.0)
+    "Karras schedule parameter."
+    inference_defaults: dict = Field(default_factory=dict)
+    "Default parameters for inference sampling."
+
+
+class UNetModel(BaseModel):
+    """Model target schema for UNet models."""
+
+    target_: Literal[
+        DefinedModels.ANEMOI_UNET_MODEL,
+        DefinedModels.ANEMOI_UNET_MODEL_SHORT,
+    ] = Field(..., alias="_target_")
+    "UNet model object."
+    convert_: str = Field("all", alias="_convert_")
+    "The target's parameters to convert to primitive containers."
+    unet: UNetConfigSchema
+    "UNet-specific configuration."
+
+
+class UNetModelSchema(PydanticBaseModel):
+    """Schema for UNet models — replaces enc-proc-dec with a single SongUNet."""
+
+    num_channels: NonNegativeInt = Field(example=128)
+    "Base channel width (UNet model_channels)."
+    keep_batch_sharded: bool = Field(default=True)
+    "Keep the input batch and the output of the model sharded."
+    model: UNetModel = Field(...)
+    "UNet model schema."
+    trainable_parameters: TrainableParameters = Field(default_factory=TrainableParameters)
+    "Learnable node and edge parameters (typically all 0 for UNet)."
+    bounding: list[Bounding]
+    "List of bounding configurations applied to specified variables."
+    output_mask: OutputMaskSchemas
+    "Output mask configuration."
+    residual: ResidualConnectionSchema = Field(..., discriminator="target_")
+    "Residual connection schema."
+    attributes: Optional[dict] = Field(default_factory=dict)
+    "Node/edge attributes (typically empty for UNet)."
+    compile: Optional[list[dict[str, Any]]] = Field(None)
+    "Modules to be compiled."
+
+
 class BaseModelSchema(PydanticBaseModel):
     num_channels: NonNegativeInt = Field(example=512)
     "Feature tensor size in the hidden space."
@@ -417,5 +497,5 @@ class HierarchicalModelSchema(BaseModelSchema):
 
 
 ModelSchema = Union[
-    DiTModelSchema, BaseModelSchema, EnsModelSchema, HierarchicalModelSchema, DiffusionModelSchema, DiffusionTendModelSchema
+    DiTModelSchema, UNetModelSchema, BaseModelSchema, EnsModelSchema, HierarchicalModelSchema, DiffusionModelSchema, DiffusionTendModelSchema
 ]
