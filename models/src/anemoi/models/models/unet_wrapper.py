@@ -107,6 +107,7 @@ class AnemoiUNetModel(nn.Module):
             encoder_type=str(getattr(unet_cfg, "encoder_type", "standard")),
             decoder_type=str(getattr(unet_cfg, "decoder_type", "standard")),
             bottleneck_attention=bool(getattr(unet_cfg, "bottleneck_attention", True)),
+            amp_mode=True,  # Required for Lightning's bf16-mixed precision autocast
         )
 
         # Store data indices for predict_step
