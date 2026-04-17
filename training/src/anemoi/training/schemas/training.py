@@ -285,6 +285,29 @@ class HuberLossSchema(BaseLossSchema):
     "Threshold for Huber loss."
 
 
+class LogFFT2DistanceSchema(BaseLossSchema):
+    """Schema for LogFFT2Distance (log-spectral distance) loss.
+
+    Inherits BaseLossSchema so it's usable in any LossSchemas context including
+    as an element of CombinedLossSchema.losses.
+    """
+
+    target_: Literal["anemoi.training.losses.spatial.LogFFT2Distance"] = Field(..., alias="_target_")
+    "Spatial log-spectral distance loss from anemoi.training.losses.spatial."
+    x_dim: int = Field(..., example=246)
+    "X dimension of the 2D grid (must satisfy x_dim * y_dim == grid size)."
+    y_dim: int = Field(..., example=246)
+    "Y dimension of the 2D grid."
+
+
+class FourierCorrelationLossSchema(BaseLossSchema):
+    """Schema for FourierCorrelationLoss. Inherits BaseLossSchema for compatibility."""
+
+    target_: Literal["anemoi.training.losses.spatial.FourierCorrelationLoss"] = Field(..., alias="_target_")
+    x_dim: int = Field(..., example=246)
+    y_dim: int = Field(..., example=246)
+
+
 class GraphCastMSELossSchema(BaseLossSchema):
     """Schema for GraphCast-style MSE loss with sample weighting."""
 
@@ -364,8 +387,22 @@ class GraphCastGaussianNLLLossSchema(BaseLossSchema):
 
 
 class CombinedLossSchema(BaseLossSchema):
-    losses: list[BaseLossSchema] = Field(min_length=1)
-    "Losses to combine, can be any of the normal losses."
+    # Accept any concrete LossSchema (spatial, graphcast, base, etc.).
+    # list[BaseLossSchema] alone only matched items with an enum target_,
+    # which excluded LogFFT2Distance / FourierCorrelationLoss.
+    losses: list[
+        BaseLossSchema
+        | HuberLossSchema
+        | GraphCastMSELossSchema
+        | GraphCastHuberLossSchema
+        | GraphCastLogCoshLossSchema
+        | GraphCastClippedMSELossSchema
+        | GraphCastPseudoHuberLossSchema
+        | GraphCastGaussianNLLLossSchema
+        | LogFFT2DistanceSchema
+        | FourierCorrelationLossSchema
+    ] = Field(min_length=1)
+    "Losses to combine, can be any of the normal losses or a spatial loss (LogFFT2Distance, FourierCorrelation)."
     loss_weights: list[int | float] | None = None
     "Weightings of losses, if not set, all losses are weighted equally."
 
@@ -404,6 +441,8 @@ LossSchemas = (
     | GraphCastClippedMSELossSchema
     | GraphCastPseudoHuberLossSchema
     | GraphCastGaussianNLLLossSchema
+    | LogFFT2DistanceSchema
+    | FourierCorrelationLossSchema
 )
 
 
