@@ -188,7 +188,8 @@ class AnemoiDiTModel(nn.Module):
         y_2d = self.dit(x_2d, t)  # (B*E, V_out, H_padded, W_padded)
 
         # Optional conv refinement to smooth patch-boundary artifacts (zero-init residual)
-        if self.conv_refinement is not None:
+        # hasattr guard for backward compatibility with pre-refinement checkpoints.
+        if getattr(self, "conv_refinement", None) is not None:
             y_2d = y_2d + self.conv_refinement(y_2d)
 
         # Crop padding
@@ -234,7 +235,8 @@ class AnemoiDiTModel(nn.Module):
         out_2d = self.dit(combined, t)  # (B*E, V_out, H_padded, W_padded)
 
         # Optional conv refinement to smooth patch-boundary artifacts (zero-init residual)
-        if self.conv_refinement is not None:
+        # hasattr guard for backward compatibility with pre-refinement checkpoints.
+        if getattr(self, "conv_refinement", None) is not None:
             out_2d = out_2d + self.conv_refinement(out_2d)
 
         if pad_h > 0 or pad_w > 0:
