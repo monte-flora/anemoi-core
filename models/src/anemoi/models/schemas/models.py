@@ -238,6 +238,13 @@ class DiTConfigSchema(BaseModel):
     "Kwargs passed to conditioning embedder."
     force_tokenization_fp32: bool = Field(default=True)
     "Force tokenizer/detokenizer to run in fp32 for numerical stability."
+    # Conv refinement after detokenizer (smooths patch-boundary artifacts)
+    conv_refinement_blocks: int = Field(default=0)
+    "Number of conv3x3-GELU-conv3x3 refinement blocks after DiT detokenizer (0=disabled). Zero-init final layer so it starts as identity residual."
+    conv_refinement_kernel: int = Field(default=3)
+    "Kernel size for conv refinement blocks."
+    conv_refinement_hidden: int = Field(default=0)
+    "Hidden channel width in each refinement block (0=use num_output_channels)."
     # Diffusion-specific (only used when mode='probabilistic')
     sigma_data: Optional[PositiveFloat] = Field(default=1.0)
     "Data scaling parameter for EDM preconditioning."

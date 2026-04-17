@@ -100,6 +100,37 @@ class AnemoiDiTModel(nn.Module):
             force_tokenization_fp32=bool(getattr(dit_cfg, "force_tokenization_fp32", True)),
         )
 
+        # Optional conv refinement after DiT detokenizer to smooth patch-boundary
+        # artifacts and enforce spatial coherence. Each block is 3x3 conv + GELU +
+        # 3x3 conv with a residual skip; output is (dit_out + refinement).
+        # Enable with conv_refinement_blocks: int > 0 in the model config.
+        n_refine = int(getattr(dit_cfg, "conv_refinement_blocks", 0))
+        refine_kernel = int(getattr(dit_cfg, "conv_refinement_kernel", 3))
+        refine_hidden = int(getattr(dit_cfg, "conv_refinement_hidden", 0)) or self.num_output_channels
+        if n_refine > 0:
+            layers = []
+            c_in = self.num_output_channels
+            for i in range(n_refine):
+                c_mid = refine_hidden
+                c_out = self.num_output_channels if i == n_refine - 1 else refine_hidden
+                layers.append(nn.Conv2d(c_in, c_mid, kernel_size=refine_kernel,
+                                       padding=refine_kernel // 2, padding_mode="reflect"))
+                layers.append(nn.GELU())
+                layers.append(nn.Conv2d(c_mid, c_out, kernel_size=refine_kernel,
+                                       padding=refine_kernel // 2, padding_mode="reflect"))
+                c_in = c_out
+            self.conv_refinement = nn.Sequential(*layers)
+            # Zero-init the final layer so the refinement starts as an identity residual
+            # (training-stability trick: don't perturb a DiT checkpoint if initialized cold).
+            last_conv = [m for m in self.conv_refinement.modules() if isinstance(m, nn.Conv2d)][-1]
+            nn.init.zeros_(last_conv.weight)
+            if last_conv.bias is not None:
+                nn.init.zeros_(last_conv.bias)
+            LOGGER.info("DiT conv refinement enabled: %d blocks, kernel=%d, hidden=%d",
+                        n_refine, refine_kernel, refine_hidden)
+        else:
+            self.conv_refinement = None
+
         # Store data indices for predict_step
         self.data_indices = data_indices
         self._internal_input_idx = data_indices.model.input.prognostic
@@ -156,6 +187,10 @@ class AnemoiDiTModel(nn.Module):
         t = torch.zeros(x_2d.shape[0], device=x_2d.device, dtype=x_2d.dtype)
         y_2d = self.dit(x_2d, t)  # (B*E, V_out, H_padded, W_padded)
 
+        # Optional conv refinement to smooth patch-boundary artifacts (zero-init residual)
+        if self.conv_refinement is not None:
+            y_2d = y_2d + self.conv_refinement(y_2d)
+
         # Crop padding
         if pad_h > 0 or pad_w > 0:
             y_2d = y_2d[:, :, :H, :W]
@@ -197,6 +232,10 @@ class AnemoiDiTModel(nn.Module):
         # Use log(sigma)/4 as timestep (EDM convention)
         t = sigma.flatten()[: combined.shape[0]].log() / 4.0
         out_2d = self.dit(combined, t)  # (B*E, V_out, H_padded, W_padded)
+
+        # Optional conv refinement to smooth patch-boundary artifacts (zero-init residual)
+        if self.conv_refinement is not None:
+            out_2d = out_2d + self.conv_refinement(out_2d)
 
         if pad_h > 0 or pad_w > 0:
             out_2d = out_2d[:, :, :H, :W]
