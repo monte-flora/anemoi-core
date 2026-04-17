@@ -569,6 +569,7 @@ class GraphInteractionNetProcessor(GraphEdgeMixin, BaseProcessor):
         sub_graph_edge_attributes: list[str],
         cpu_offload: bool = False,
         layer_kernels: DotDict,
+        aggr_reduce: str = "sum",
         **kwargs,
     ) -> None:
         """Initialize GraphInteractionNetProcessor.
@@ -598,6 +599,10 @@ class GraphInteractionNetProcessor(GraphEdgeMixin, BaseProcessor):
         layer_kernels : DotDict
             A dict of layer implementations e.g. layer_kernels.Linear = "torch.nn.Linear"
             Defined in config/models/<model>.yaml
+        aggr_reduce : str, optional
+            Aggregation op over incoming edge deltas at each processor block.
+            Default "sum" (GraphCast convention). Use "mean" for the sum→mean
+            inverse test (low-pass across neighbors).
 
         """
         super().__init__(
@@ -617,6 +622,7 @@ class GraphInteractionNetProcessor(GraphEdgeMixin, BaseProcessor):
             "mlp_extra_layers": mlp_extra_layers,
             "layer_kernels": self.layer_factory,
             "edge_dim": None,
+            "aggr_reduce": aggr_reduce,
         }
 
         # Use the new GraphInteractionNetProcessorBlock with correct residual order
