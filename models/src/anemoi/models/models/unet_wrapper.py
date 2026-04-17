@@ -33,6 +33,42 @@ from physicsnemo.models.diffusion_unets import SongUNet
 LOGGER = logging.getLogger(__name__)
 
 
+class LargeKernelStem(nn.Module):
+    """Depthwise-separable large-kernel 2D conv (RepLKNet-style), drop-in
+    replacement for SongUNet's first-level encoder Conv2d.
+
+    Gives the model a ~O(kernel) receptive field on the very first layer
+    without the param/compute blowup of a dense large-kernel conv:
+      depthwise kernel × 1 (Cin params)  +  pointwise 1×1 (Cin×Cout)
+    vs dense kernel² × Cin × Cout for a vanilla large conv.
+
+    Uses reflect padding — better for atmospheric fields at domain
+    boundaries than zero or replicate.
+    """
+
+    def __init__(self, in_channels: int, out_channels: int, kernel: int = 51):
+        super().__init__()
+        assert kernel % 2 == 1, "kernel must be odd"
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.dw = nn.Conv2d(
+            in_channels, in_channels,
+            kernel_size=kernel, padding=kernel // 2,
+            padding_mode="reflect",
+            groups=in_channels,
+            bias=True,
+        )
+        self.pw = nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=True)
+        nn.init.kaiming_normal_(self.dw.weight, mode="fan_out", nonlinearity="linear")
+        nn.init.kaiming_normal_(self.pw.weight, mode="fan_out", nonlinearity="linear")
+        nn.init.zeros_(self.dw.bias)
+        nn.init.zeros_(self.pw.bias)
+
+    def forward(self, x, *args, **kwargs):
+        # SongUNet calls block(x) on the non-UNetBlock stem; *args/**kwargs absorb anything extra.
+        return self.pw(self.dw(x))
+
+
 class AnemoiUNetModel(nn.Module):
     """SongUNet model wrapped for the Anemoi training/inference pipeline.
 
@@ -109,6 +145,15 @@ class AnemoiUNetModel(nn.Module):
             bottleneck_attention=bool(getattr(unet_cfg, "bottleneck_attention", True)),
             amp_mode=True,  # Required for Lightning's bf16-mixed precision autocast
         )
+
+        # Optional: replace SongUNet's 3x3 encoder stem with a depthwise-separable
+        # large-kernel stem (RepLKNet-style). Gives the model a ~O(stem_kernel)
+        # receptive field on the very first layer, comparable to GNN encoder
+        # connectivity, at ~1% the param cost of a dense large-kernel conv.
+        stem_kernel = int(getattr(unet_cfg, "large_kernel_stem", 0))
+        if stem_kernel > 0:
+            self._patch_stem_large_kernel(stem_kernel)
+            LOGGER.info("SongUNet stem replaced with depthwise-separable %dx%d kernel", stem_kernel, stem_kernel)
 
         # Store data indices for predict_step
         self.data_indices = data_indices
@@ -209,6 +254,35 @@ class AnemoiUNetModel(nn.Module):
     def _next_multiple(n: int, d: int) -> int:
         """Round up n to the next multiple of d."""
         return n + (d - n % d) % d
+
+    def _patch_stem_large_kernel(self, kernel: int) -> None:
+        """Replace SongUNet's first-level encoder Conv2d with LargeKernelStem.
+
+        The SongUNet encoder ModuleDict keys the first-level conv as
+        f"{res}x{res}_conv" where res = img_resolution[0]. We locate it as the
+        first '_conv' (non-aux) entry and swap in the depthwise-separable
+        large-kernel module.
+        """
+        enc = self.unet.enc
+        stem_key = None
+        for key in enc:
+            if "_conv" in key and "aux" not in key:
+                stem_key = key
+                break
+        if stem_key is None:
+            raise RuntimeError("Could not locate SongUNet encoder stem conv")
+        original = enc[stem_key]
+        new_stem = LargeKernelStem(
+            in_channels=original.in_channels,
+            out_channels=original.out_channels,
+            kernel=kernel,
+        )
+        # Match device/dtype
+        new_stem = new_stem.to(
+            device=next(original.parameters()).device,
+            dtype=next(original.parameters()).dtype,
+        )
+        enc[stem_key] = new_stem
 
     def _pad_to_divisor(self, x: Tensor) -> tuple[Tensor, tuple[int, int]]:
         """Reflect-pad spatial dims to be divisible by self._pad_divisor."""

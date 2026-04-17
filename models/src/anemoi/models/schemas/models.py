@@ -315,6 +315,8 @@ class UNetConfigSchema(BaseModel):
     "Decoder architecture: standard or skip."
     bottleneck_attention: bool = Field(default=True)
     "Apply self-attention at the bottleneck (innermost level)."
+    large_kernel_stem: int = Field(default=0)
+    "If >0, replace SongUNet's 3x3 stem with a depthwise-separable Kx K conv (RepLKNet-style); 0=disabled, 51=recommended."
     domain_parallel_size: PositiveInt = Field(default=1)
     "Number of GPUs for domain-parallel sharding (1=disabled). Splits spatial dimension across GPUs for large domains."
     shard_dim: PositiveInt = Field(default=2)
