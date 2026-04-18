@@ -30,6 +30,23 @@ from anemoi.utils.config import DotDict
 LOGGER = logging.getLogger(__name__)
 
 
+def _swap_activation(module: nn.Module, old_cls: type, new_cls: type) -> int:
+    """Walk a module tree and replace every instance of ``old_cls`` with
+    ``new_cls``. Returns the number of swaps performed.
+
+    Used to retrofit activation choices (e.g., GELU→SiLU) onto the physicsnemo
+    DiT whose internal MLPs have the activation hardcoded.
+    """
+    count = 0
+    for name, child in list(module.named_children()):
+        if isinstance(child, old_cls):
+            setattr(module, name, new_cls())
+            count += 1
+        else:
+            count += _swap_activation(child, old_cls, new_cls)
+    return count
+
+
 class AnemoiDiTModel(nn.Module):
     """DiT model wrapped for the Anemoi training/inference pipeline.
 
@@ -100,6 +117,20 @@ class AnemoiDiTModel(nn.Module):
             force_tokenization_fp32=bool(getattr(dit_cfg, "force_tokenization_fp32", True)),
         )
 
+        # Optional post-init activation swap: set dit_cfg.activation to one of
+        # {"gelu", "silu", "relu"}. Replaces every nn.GELU inside the DiT
+        # transformer (including physicsnemo-internal MLPs) with the chosen
+        # activation. Default is "gelu" (no-op) to preserve existing behaviour
+        # and old checkpoints.
+        act_name = str(getattr(dit_cfg, "activation", "gelu")).lower()
+        if act_name != "gelu":
+            act_cls = {"silu": nn.SiLU, "relu": nn.ReLU, "leaky_relu": nn.LeakyReLU}.get(act_name)
+            if act_cls is None:
+                raise ValueError(f"Unknown DiT activation '{act_name}'")
+            n_replaced = _swap_activation(self.dit, nn.GELU, act_cls)
+            LOGGER.info("DiT activation swapped: %d nn.GELU -> nn.%s", n_replaced, act_cls.__name__)
+        # conv_refinement activation is configured below and can be separate
+
         # Optional conv refinement after DiT detokenizer to smooth patch-boundary
         # artifacts and enforce spatial coherence. Each block is 3x3 conv + GELU +
         # 3x3 conv with a residual skip; output is (dit_out + refinement).
@@ -107,6 +138,10 @@ class AnemoiDiTModel(nn.Module):
         n_refine = int(getattr(dit_cfg, "conv_refinement_blocks", 0))
         refine_kernel = int(getattr(dit_cfg, "conv_refinement_kernel", 3))
         refine_hidden = int(getattr(dit_cfg, "conv_refinement_hidden", 0)) or self.num_output_channels
+        raw_refine_act = getattr(dit_cfg, "conv_refinement_activation", None)
+        refine_act_name = str(raw_refine_act).lower() if raw_refine_act is not None else act_name
+        refine_act_cls = {"gelu": nn.GELU, "silu": nn.SiLU, "relu": nn.ReLU,
+                          "leaky_relu": nn.LeakyReLU}.get(refine_act_name, nn.GELU)
         if n_refine > 0:
             layers = []
             c_in = self.num_output_channels
@@ -115,7 +150,7 @@ class AnemoiDiTModel(nn.Module):
                 c_out = self.num_output_channels if i == n_refine - 1 else refine_hidden
                 layers.append(nn.Conv2d(c_in, c_mid, kernel_size=refine_kernel,
                                        padding=refine_kernel // 2, padding_mode="reflect"))
-                layers.append(nn.GELU())
+                layers.append(refine_act_cls())
                 layers.append(nn.Conv2d(c_mid, c_out, kernel_size=refine_kernel,
                                        padding=refine_kernel // 2, padding_mode="reflect"))
                 c_in = c_out
@@ -126,8 +161,8 @@ class AnemoiDiTModel(nn.Module):
             nn.init.zeros_(last_conv.weight)
             if last_conv.bias is not None:
                 nn.init.zeros_(last_conv.bias)
-            LOGGER.info("DiT conv refinement enabled: %d blocks, kernel=%d, hidden=%d",
-                        n_refine, refine_kernel, refine_hidden)
+            LOGGER.info("DiT conv refinement enabled: %d blocks, kernel=%d, hidden=%d, act=%s",
+                        n_refine, refine_kernel, refine_hidden, refine_act_cls.__name__)
         else:
             self.conv_refinement = None
 

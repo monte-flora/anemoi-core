@@ -245,6 +245,10 @@ class DiTConfigSchema(BaseModel):
     "Kernel size for conv refinement blocks."
     conv_refinement_hidden: int = Field(default=0)
     "Hidden channel width in each refinement block (0=use num_output_channels)."
+    activation: str = Field(default="gelu")
+    "Activation for the DiT transformer blocks. One of 'gelu' (default, existing checkpoints), 'silu', 'relu', 'leaky_relu'. Implemented as a post-init nn.GELU -> nn.<activation> swap inside the physicsnemo DiT."
+    conv_refinement_activation: Optional[str] = Field(default=None)
+    "Activation inside the conv_refinement block. If None (default), follows `activation`. One of 'gelu', 'silu', 'relu', 'leaky_relu'."
     # Diffusion-specific (only used when mode='probabilistic')
     sigma_data: Optional[PositiveFloat] = Field(default=1.0)
     "Data scaling parameter for EDM preconditioning."
