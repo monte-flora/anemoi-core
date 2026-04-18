@@ -11,6 +11,7 @@ import logging
 from typing import Annotated
 from typing import Any
 from typing import Literal
+from typing import Optional
 
 from omegaconf import OmegaConf
 from pydantic import Field
@@ -492,4 +493,6 @@ class DiagnosticsSchema(BaseModel):
     "Checkpoint schema for defined frequency (every_n_minutes, every_n_epochs, ...)."
     check_val_every_n_epoch: PositiveInt = Field(default=1, example=1)
     "Run validation every n epochs."
-    profiler : bool = False 
+    check_val_every_n_train_steps: Optional[PositiveInt] = Field(default=None)
+    "If set, run validation every N train-steps (PyTorch Lightning's val_check_interval with an integer argument). When set, ``check_val_every_n_epoch`` is effectively ignored by Lightning. Useful when training budgets are shorter than 1 epoch of the full dataset."
+    profiler : bool = False
