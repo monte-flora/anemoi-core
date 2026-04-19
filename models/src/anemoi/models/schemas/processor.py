@@ -43,6 +43,8 @@ class GraphInteractionNetProcessorSchema(GNNModelComponent):
     "Number of layers of GraphInteractionNet processor. Default to 16."
     num_chunks: NonNegativeInt = Field(example=2)
     "Number of chunks to divide the layer into. Default to 2."
+    aggr_reduce: Literal["sum", "mean", "max", "min", "add"] = Field(default="sum")
+    "Aggregation op for incoming edge deltas at each processor block. 'sum' = GraphCast default (preserves sparse extremes); 'mean' = low-pass across neighbors (for the sum→mean inverse test)."
 
 
 class GraphTransformerProcessorSchema(TransformerModelComponent):

@@ -100,6 +100,7 @@ class GraphConvNoResidual(MessagePassing):
         layer_kernels: DotDict,
         mlp_extra_layers: int = 0,
         f32_aggregation: bool = False,
+        aggr_reduce: str = "sum",
         **kwargs,
     ) -> None:
         """Initialize GraphConvNoResidual.
@@ -118,10 +119,16 @@ class GraphConvNoResidual(MessagePassing):
         f32_aggregation : bool, optional
             Cast edge features to float32 before scatter-sum for numerical stability
             in mixed-precision training (matches JAX encoder behavior), by default False
+        aggr_reduce : str, optional
+            Aggregation op over incoming edge deltas. Default "sum" (GraphCast
+            convention — preserves magnitude of sparse extremes, e.g. storm cells).
+            Use "mean" for the sum→mean inverse test (averaging acts as a low-pass
+            filter across the neighborhood). Must be a torch_geometric scatter reduce.
         """
         super().__init__(**kwargs)
 
         self.f32_aggregation = f32_aggregation
+        self.aggr_reduce = aggr_reduce
 
         self.edge_mlp = MLP(
             3 * in_channels,
@@ -140,7 +147,7 @@ class GraphConvNoResidual(MessagePassing):
 
     def message(self, x_i: Tensor, x_j: Tensor, edge_attr: Tensor) -> Tensor:
         # Compute edge DELTA only - NO residual here!
-        # GraphCast pattern: e' = MLP([sender, receiver, edge])
+        # GraphCast pattern: e' = MLP([receiver, sender, edge])
         edge_delta = self.edge_mlp(torch.cat([x_i, x_j, edge_attr], dim=1))
 
         return edge_delta
@@ -153,16 +160,19 @@ class GraphConvNoResidual(MessagePassing):
         dim_size: Optional[int] = None,
     ) -> tuple[Tensor, Tensor]:
         # Aggregate edge DELTAS (not edges with residual)
-        # GraphCast pattern: Σ(e') for node update
+        # GraphCast pattern: Σ(e') for node update (sum preserves magnitude of
+        # sparse extremes; mean acts as a low-pass filter across neighbors).
+        # Switch via self.aggr_reduce (default "sum").
         # Note: 'index' is edge_index[1] (destination node indices), passed by PyG's propagate
+        reduce_op = getattr(self, "aggr_reduce", "sum")
         if self.f32_aggregation:
             # Cast to float32 before scatter-sum to prevent precision loss in bf16
             # (matches JAX encoder's f32_aggregation=True behavior)
             original_dtype = inputs.dtype
-            out = scatter(inputs.float(), index, dim=0, dim_size=dim_size, reduce="sum")
+            out = scatter(inputs.float(), index, dim=0, dim_size=dim_size, reduce=reduce_op)
             out = out.to(original_dtype)
         else:
-            out = scatter(inputs, index, dim=0, dim_size=dim_size, reduce="sum")
+            out = scatter(inputs, index, dim=0, dim_size=dim_size, reduce=reduce_op)
 
         return out, inputs  # Return (aggregated, raw edge deltas)
 

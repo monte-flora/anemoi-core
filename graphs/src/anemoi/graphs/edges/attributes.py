@@ -21,6 +21,7 @@ from torch_geometric.typing import Size
 from torch_geometric.utils import scatter
 
 from anemoi.graphs.edges.directional import compute_directions
+from anemoi.graphs.generate.transforms import latlon_rad_to_cartesian
 from anemoi.graphs.normalise import NormaliserMixin
 from anemoi.graphs.utils import NodesAxis
 from anemoi.graphs.utils import get_distributed_device
@@ -373,3 +374,45 @@ class GaussianDistanceWeights(EdgeLength):
         dists = super().compute(x_i, x_j)
         gaussian_weights = torch.exp(-(dists**2) / (2 * self.sigma**2))
         return gaussian_weights
+
+
+class EdgeRelativePosition3D(BasePositionalBuilder):
+    """Computes 4D edge features matching JAX/GraphCast convention.
+
+    Returns [||rel_pos||, rel_x, rel_y, rel_z] where the relative position
+    is computed in a receiver-local coordinate frame. The rotation places
+    the receiver at the equator/prime meridian (1, 0, 0) on a unit sphere,
+    matching JAX's ``get_bipartite_relative_position_in_receiver_local_coordinates``
+    with ``relative_latitude_local_coordinates=True`` and
+    ``relative_longitude_local_coordinates=True``.
+
+    With ``norm="unit-max"``, all 4 features are divided by ``max(||rel_pos||)``
+    across all edges, giving distance in [0, 1] and positions in [-1, 1].
+    """
+
+    def compute(self, x_i: torch.Tensor, x_j: torch.Tensor) -> torch.Tensor:
+        # Convert lat/lon (radians) to 3D Cartesian on unit sphere
+        sender_xyz = latlon_rad_to_cartesian(x_j, 1.0)
+        receiver_xyz = latlon_rad_to_cartesian(x_i, 1.0)
+
+        lat = x_i[:, 0]
+        lon = x_i[:, 1]
+        cos_lat = torch.cos(lat)
+        sin_lat = torch.sin(lat)
+        cos_lon = torch.cos(lon)
+        sin_lon = torch.sin(lon)
+
+        def _apply_rotation(pos: torch.Tensor) -> torch.Tensor:
+            x, y, z = pos[:, 0], pos[:, 1], pos[:, 2]
+            rx = cos_lat * cos_lon * x + cos_lat * sin_lon * y + sin_lat * z
+            ry = -sin_lon * x + cos_lon * y
+            rz = -sin_lat * cos_lon * x - sin_lat * sin_lon * y + cos_lat * z
+            return torch.stack([rx, ry, rz], dim=-1)
+
+        sender_rotated = _apply_rotation(sender_xyz)
+        receiver_rotated = _apply_rotation(receiver_xyz)
+
+        rel_pos = sender_rotated - receiver_rotated
+        distance = torch.linalg.norm(rel_pos, dim=-1, keepdim=True)
+
+        return torch.cat([distance, rel_pos], dim=-1)

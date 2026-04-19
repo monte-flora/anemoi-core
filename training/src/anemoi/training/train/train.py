@@ -516,6 +516,14 @@ class AnemoiTrainer(ABC):
             use_distributed_sampler=False,
             enable_progress_bar=self.config.diagnostics.enable_progress_bar,
             check_val_every_n_epoch=getattr(self.config.diagnostics, "check_val_every_n_epoch", 1),
+            # Step-based validation: if set, runs validation every N train
+            # steps and effectively ignores check_val_every_n_epoch. Used by
+            # the autoresearch loop so we can hit all training samples per
+            # epoch while still validating at a known-cadence for 10K-step
+            # budgets.
+            val_check_interval=getattr(
+                self.config.diagnostics, "check_val_every_n_train_steps", None,
+            ),
         )
 
         self.prepare_compilation()

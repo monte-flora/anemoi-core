@@ -24,6 +24,7 @@ class ImplementedEdgeAttributeSchema(str, Enum):
     azimuth = "anemoi.graphs.edges.attributes.Azimuth"
     gaussian_weights = "anemoi.graphs.edges.attributes.GaussianDistanceWeights"
     radial_basis_features = "anemoi.graphs.edges.attributes.RadialBasisFeatures"
+    edge_relative_position_3d = "anemoi.graphs.edges.attributes.EdgeRelativePosition3D"
 
 
 class BaseEdgeAttributeSchema(BaseModel):
@@ -61,6 +62,17 @@ class RadialBasisFeaturesSchema(BaseModel):
     dtype: str = Field(default="float32", description="Data type for computations")
 
 
+class EdgeRelativePosition3DSchema(BaseModel):
+    target_: Literal["anemoi.graphs.edges.attributes.EdgeRelativePosition3D"] = Field(..., alias="_target_")
+    "4D relative position features [||rel_pos||, rel_x, rel_y, rel_z] in receiver-local frame"
+    norm: ImplementedNormalisationSchema = Field(example="unit-max")
+    "Normalisation method applied across all 4 feature components."
+
+
 EdgeAttributeSchema = (
-    BaseEdgeAttributeSchema | EdgeAttributeFromNodeSchema | DirectionalHarmonicsSchema | RadialBasisFeaturesSchema
+    BaseEdgeAttributeSchema
+    | EdgeAttributeFromNodeSchema
+    | DirectionalHarmonicsSchema
+    | RadialBasisFeaturesSchema
+    | EdgeRelativePosition3DSchema
 )

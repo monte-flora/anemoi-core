@@ -546,6 +546,7 @@ class GraphInteractionNetBaseBlock(BaseBlock):
         layer_kernels: DotDict,
         edge_dim: Optional[int] = None,
         f32_aggregation: bool = False,
+        aggr_reduce: str = "sum",
         **kwargs,
     ) -> None:
         """Initialize GraphInteractionNetBaseBlock.
@@ -570,6 +571,9 @@ class GraphInteractionNetBaseBlock(BaseBlock):
         f32_aggregation : bool, optional
             Cast edge features to float32 before scatter-sum for numerical stability
             in mixed-precision training (matches JAX encoder behavior), by default False
+        aggr_reduce : str, optional
+            Aggregation op over incoming edge deltas. Default "sum" (GraphCast
+            convention). Forwarded to GraphConvNoResidual.
         """
         super().__init__(**kwargs)
 
@@ -602,6 +606,7 @@ class GraphInteractionNetBaseBlock(BaseBlock):
             layer_kernels=layer_kernels,
             mlp_extra_layers=mlp_extra_layers,
             f32_aggregation=f32_aggregation,
+            aggr_reduce=aggr_reduce,
         )
 
 

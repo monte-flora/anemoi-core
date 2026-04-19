@@ -30,6 +30,80 @@ from anemoi.utils.config import DotDict
 LOGGER = logging.getLogger(__name__)
 
 
+def _swap_activation(module: nn.Module, old_cls: type, new_cls: type) -> int:
+    """Walk a module tree and replace every instance of ``old_cls`` with
+    ``new_cls``. Returns the number of swaps performed.
+
+    Used to retrofit activation choices (e.g., GELU\u2192SiLU) onto the physicsnemo
+    DiT whose internal MLPs have the activation hardcoded.
+    """
+    count = 0
+    for name, child in list(module.named_children()):
+        if isinstance(child, old_cls):
+            setattr(module, name, new_cls())
+            count += 1
+        else:
+            count += _swap_activation(child, old_cls, new_cls)
+    return count
+
+
+def _gaussian_kernel_2d(kernel_size: int, sigma: float) -> torch.Tensor:
+    """Return a normalized 2-D Gaussian kernel of shape (ks, ks)."""
+    half = (kernel_size - 1) / 2.0
+    ax = torch.arange(kernel_size, dtype=torch.float32) - half
+    gy = torch.exp(-(ax ** 2) / (2.0 * sigma ** 2))
+    k2 = torch.outer(gy, gy)
+    return k2 / k2.sum()
+
+
+class _DepthwiseGaussianLPF(nn.Module):
+    """Fixed depth-wise 2-D Gaussian low-pass filter applied per-channel.
+
+    Implemented as a reflect-padded Conv2d with non-learnable weights
+    (registered as a buffer). Used right after the DiT detokenizer to
+    enforce a physical Nyquist rolloff and kill >Nyquist content coming
+    from the tile-level projection.
+    """
+
+    def __init__(self, channels: int, kernel_size: int = 5, sigma: float = 0.7):
+        super().__init__()
+        assert kernel_size % 2 == 1, "kernel_size must be odd"
+        self.channels = channels
+        self.kernel_size = kernel_size
+        self.pad = kernel_size // 2
+        k = _gaussian_kernel_2d(kernel_size, sigma)
+        # Shape needed for groupwise conv: (out_ch=channels, in_ch/groups=1, kH, kW)
+        w = k.view(1, 1, kernel_size, kernel_size).expand(channels, 1, kernel_size, kernel_size).clone()
+        self.register_buffer("weight", w)
+
+    def forward(self, x: Tensor) -> Tensor:
+        x = F.pad(x, (self.pad, self.pad, self.pad, self.pad), mode="reflect")
+        return F.conv2d(x, self.weight, bias=None, groups=self.channels)
+
+
+def _gaussian_init_first_conv(seq: nn.Sequential, sigma: float = 0.7) -> int:
+    """Overwrite the first `nn.Conv2d` weight in `seq` with a channel-wise
+    2-D Gaussian kernel (broadcast across in/out channels with unit sum).
+
+    Returns the kernel size of the initialized conv for logging. Leaves
+    bias zero-init. Keeps the overall conv expressive (other convs in the
+    block still use Kaiming) but gives the refinement a smooth starting
+    point rather than the default Kaiming-random kernel.
+    """
+    for m in seq.modules():
+        if isinstance(m, nn.Conv2d):
+            ks = m.kernel_size[0]
+            kern = _gaussian_kernel_2d(ks, sigma)  # (ks, ks)
+            # Each (out_c, in_c) pair takes the same normalized kernel.
+            w = kern.view(1, 1, ks, ks).expand_as(m.weight).clone()
+            with torch.no_grad():
+                m.weight.copy_(w)
+                if m.bias is not None:
+                    m.bias.zero_()
+            return int(ks)
+    return 0
+
+
 class AnemoiDiTModel(nn.Module):
     """DiT model wrapped for the Anemoi training/inference pipeline.
 
@@ -100,6 +174,76 @@ class AnemoiDiTModel(nn.Module):
             force_tokenization_fp32=bool(getattr(dit_cfg, "force_tokenization_fp32", True)),
         )
 
+        # Optional post-init activation swap: set dit_cfg.activation to one of
+        # {"gelu", "silu", "relu"}. Replaces every nn.GELU inside the DiT
+        # transformer (including physicsnemo-internal MLPs) with the chosen
+        # activation. Default is "gelu" (no-op) to preserve existing behaviour
+        # and old checkpoints.
+        act_name = str(getattr(dit_cfg, "activation", "gelu")).lower()
+        if act_name != "gelu":
+            act_cls = {"silu": nn.SiLU, "relu": nn.ReLU, "leaky_relu": nn.LeakyReLU}.get(act_name)
+            if act_cls is None:
+                raise ValueError(f"Unknown DiT activation '{act_name}'")
+            n_replaced = _swap_activation(self.dit, nn.GELU, act_cls)
+            LOGGER.info("DiT activation swapped: %d nn.GELU -> nn.%s", n_replaced, act_cls.__name__)
+        # conv_refinement activation is configured below and can be separate
+
+        # Optional conv refinement after DiT detokenizer to smooth patch-boundary
+        # artifacts and enforce spatial coherence. Each block is 3x3 conv + GELU +
+        # 3x3 conv with a residual skip; output is (dit_out + refinement).
+        # Enable with conv_refinement_blocks: int > 0 in the model config.
+        n_refine = int(getattr(dit_cfg, "conv_refinement_blocks", 0))
+        refine_kernel = int(getattr(dit_cfg, "conv_refinement_kernel", 3))
+        refine_hidden = int(getattr(dit_cfg, "conv_refinement_hidden", 0)) or self.num_output_channels
+        raw_refine_act = getattr(dit_cfg, "conv_refinement_activation", None)
+        refine_act_name = str(raw_refine_act).lower() if raw_refine_act is not None else act_name
+        refine_act_cls = {"gelu": nn.GELU, "silu": nn.SiLU, "relu": nn.ReLU,
+                          "leaky_relu": nn.LeakyReLU}.get(refine_act_name, nn.GELU)
+        if n_refine > 0:
+            layers = []
+            c_in = self.num_output_channels
+            for i in range(n_refine):
+                c_mid = refine_hidden
+                c_out = self.num_output_channels if i == n_refine - 1 else refine_hidden
+                layers.append(nn.Conv2d(c_in, c_mid, kernel_size=refine_kernel,
+                                       padding=refine_kernel // 2, padding_mode="reflect"))
+                layers.append(refine_act_cls())
+                layers.append(nn.Conv2d(c_mid, c_out, kernel_size=refine_kernel,
+                                       padding=refine_kernel // 2, padding_mode="reflect"))
+                c_in = c_out
+            self.conv_refinement = nn.Sequential(*layers)
+            # Optional smooth-prior initialization: seed the FIRST conv with
+            # a normalized 2-D Gaussian kernel so the refinement starts as a
+            # smoothing filter rather than the default Kaiming-random kernel.
+            refine_init = str(getattr(dit_cfg, "conv_refinement_init", "default")).lower()
+            if refine_init in ("gaussian", "gaussian_lowpass"):
+                gi_sigma = float(getattr(dit_cfg, "conv_refinement_init_sigma", 0.7))
+                ks_init = _gaussian_init_first_conv(self.conv_refinement, sigma=gi_sigma)
+                LOGGER.info("DiT conv refinement: gaussian-init first conv (k=%d, \u03c3=%.2f)",
+                            ks_init, gi_sigma)
+            LOGGER.info("DiT conv refinement enabled: %d blocks, kernel=%d, hidden=%d, act=%s",
+                        n_refine, refine_kernel, refine_hidden, refine_act_cls.__name__)
+        else:
+            self.conv_refinement = None
+
+        # ---- Fixed Gaussian LPF right after detokenize (anti-aliasing) ----
+        # Enable by setting `detokenizer_lowpass_sigma` to a positive float
+        # (typical 0.5\u20131.0). Zero disables. This applies a depth-wise, fixed
+        # 2-D Gaussian blur to the detokenized output at full resolution and
+        # is non-learnable \u2014 a physically-motivated Nyquist rolloff filter.
+        lowpass_sigma = float(getattr(dit_cfg, "detokenizer_lowpass_sigma", 0.0))
+        lowpass_k = int(getattr(dit_cfg, "detokenizer_lowpass_kernel", 5))
+        if lowpass_sigma > 0.0:
+            self.detokenizer_lowpass = _DepthwiseGaussianLPF(
+                channels=self.num_output_channels,
+                kernel_size=lowpass_k,
+                sigma=lowpass_sigma,
+            )
+            LOGGER.info("DiT detokenizer Gaussian LPF enabled: k=%d, \u03c3=%.2f",
+                        lowpass_k, lowpass_sigma)
+        else:
+            self.detokenizer_lowpass = None
+
         # Store data indices for predict_step
         self.data_indices = data_indices
         self._internal_input_idx = data_indices.model.input.prognostic
@@ -156,6 +300,18 @@ class AnemoiDiTModel(nn.Module):
         t = torch.zeros(x_2d.shape[0], device=x_2d.device, dtype=x_2d.dtype)
         y_2d = self.dit(x_2d, t)  # (B*E, V_out, H_padded, W_padded)
 
+        # Optional Gaussian LPF (anti-aliasing) \u2014 applied in-line (not as a
+        # residual) because it models a physical rolloff rather than a
+        # correction. Safe on a cold-start checkpoint: \u03c3=0 (default) is a
+        # pure bypass via self.detokenizer_lowpass is None.
+        if getattr(self, "detokenizer_lowpass", None) is not None:
+            y_2d = self.detokenizer_lowpass(y_2d)
+
+        # Optional conv refinement to smooth patch-boundary artifacts (residual).
+        # hasattr guard for backward compatibility with pre-refinement checkpoints.
+        if getattr(self, "conv_refinement", None) is not None:
+            y_2d = y_2d + self.conv_refinement(y_2d)
+
         # Crop padding
         if pad_h > 0 or pad_w > 0:
             y_2d = y_2d[:, :, :H, :W]
@@ -198,6 +354,14 @@ class AnemoiDiTModel(nn.Module):
         t = sigma.flatten()[: combined.shape[0]].log() / 4.0
         out_2d = self.dit(combined, t)  # (B*E, V_out, H_padded, W_padded)
 
+        # Optional Gaussian LPF (anti-aliasing) applied in-line.
+        if getattr(self, "detokenizer_lowpass", None) is not None:
+            out_2d = self.detokenizer_lowpass(out_2d)
+
+        # Optional conv refinement to smooth patch-boundary artifacts (residual).
+        if getattr(self, "conv_refinement", None) is not None:
+            out_2d = out_2d + self.conv_refinement(out_2d)
+
         if pad_h > 0 or pad_w > 0:
             out_2d = out_2d[:, :, :H, :W]
 
@@ -238,7 +402,7 @@ class AnemoiDiTModel(nn.Module):
         return c_skip * y_noised + c_out * pred
 
     # ------------------------------------------------------------------
-    # Predict step (deterministic — residual prediction)
+    # Predict step (deterministic \u2014 residual prediction)
     # ------------------------------------------------------------------
 
     @staticmethod
@@ -285,7 +449,7 @@ class AnemoiDiTModel(nn.Module):
             # Normalize input
             x = pre_processors(x, in_place=True)
 
-            # Forward pass — predicts normalized residuals
+            # Forward pass \u2014 predicts normalized residuals
             model_output = self.forward(
                 x, model_comm_group=model_comm_group, grid_shard_shapes=grid_shard_shapes, **kwargs
             )  # (B, E=1, G, V_out)

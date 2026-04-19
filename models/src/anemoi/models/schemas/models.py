@@ -238,6 +238,17 @@ class DiTConfigSchema(BaseModel):
     "Kwargs passed to conditioning embedder."
     force_tokenization_fp32: bool = Field(default=True)
     "Force tokenizer/detokenizer to run in fp32 for numerical stability."
+    # Conv refinement after detokenizer (smooths patch-boundary artifacts)
+    conv_refinement_blocks: int = Field(default=0)
+    "Number of conv3x3-GELU-conv3x3 refinement blocks after DiT detokenizer (0=disabled). Zero-init final layer so it starts as identity residual."
+    conv_refinement_kernel: int = Field(default=3)
+    "Kernel size for conv refinement blocks."
+    conv_refinement_hidden: int = Field(default=0)
+    "Hidden channel width in each refinement block (0=use num_output_channels)."
+    activation: str = Field(default="gelu")
+    "Activation for the DiT transformer blocks. One of 'gelu' (default, existing checkpoints), 'silu', 'relu', 'leaky_relu'. Implemented as a post-init nn.GELU -> nn.<activation> swap inside the physicsnemo DiT."
+    conv_refinement_activation: Optional[str] = Field(default=None)
+    "Activation inside the conv_refinement block. If None (default), follows `activation`. One of 'gelu', 'silu', 'relu', 'leaky_relu'."
     # Diffusion-specific (only used when mode='probabilistic')
     sigma_data: Optional[PositiveFloat] = Field(default=1.0)
     "Data scaling parameter for EDM preconditioning."
@@ -315,6 +326,8 @@ class UNetConfigSchema(BaseModel):
     "Decoder architecture: standard or skip."
     bottleneck_attention: bool = Field(default=True)
     "Apply self-attention at the bottleneck (innermost level)."
+    large_kernel_stem: int = Field(default=0)
+    "If >0, replace SongUNet's 3x3 stem with a depthwise-separable Kx K conv (RepLKNet-style); 0=disabled, 51=recommended."
     domain_parallel_size: PositiveInt = Field(default=1)
     "Number of GPUs for domain-parallel sharding (1=disabled). Splits spatial dimension across GPUs for large domains."
     shard_dim: PositiveInt = Field(default=2)
