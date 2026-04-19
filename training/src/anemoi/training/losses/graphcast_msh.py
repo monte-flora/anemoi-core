@@ -40,7 +40,9 @@ import logging
 
 import einops
 import torch
+import torch.distributed as dist
 import torch.fft
+import torch.nn as nn
 
 from anemoi.training.losses.base import GraphCastBaseLoss
 from anemoi.training.utils.enums import TensorDim
@@ -84,19 +86,65 @@ def _gamma_k_weights(
     *,
     normalise: bool = True,
     min_weight: float = 1.0,
+    exponent: float = 3**0.5,  # FastNet Eq. 9: k^√3
 ) -> torch.Tensor:
-    """FastNet Eq. 9: γ_k = max(N_k · k/√3, 1.0)."""
-    raw = k_centres / (3**0.5)
+    """FastNet Eq. 9: γ_k = max(N_k · k^√3, 1.0).
+
+    Aggressive high-k emphasis that partially compensates the atmospheric
+    k^-3 / k^-5/3 PSD decay. N_k is a per-spectrum normaliser so that the
+    mean γ_k across bins stays ≈ 1 before the floor is applied; this
+    preserves the overall AMSE magnitude for a given variable while
+    redistributing weight toward small scales.
+    """
+    # k^exponent; guard k=0 (0^anything = 0 → clamp_min later).
+    raw = k_centres.clamp_min(0.0) ** exponent
     if normalise:
-        # N_k preserves the magnitude of the AMSE calculation — pick a scale
-        # that keeps mean(raw) == mean(γ) when γ doesn't hit the floor.
         nonzero = raw[raw > 0]
-        n_k = 1.0 if nonzero.numel() == 0 else float(nonzero.mean().item()) ** 0
-        # use multiplicative N_k so that γ_k averaged over the spectrum is ~1.
-        # N_k = 1 / mean(raw) ensures mean(N_k · raw) = 1, then the floor at
-        # min_weight prevents the low-k bins from collapsing the signal.
-        raw = raw / max(float(nonzero.mean().item()), 1e-12) if nonzero.numel() else raw
+        if nonzero.numel():
+            raw = raw / max(float(nonzero.mean().item()), 1e-12)
     return torch.clamp(raw, min=min_weight)
+
+
+class _OnlineAMSEStats(nn.Module):
+    """Per-variable AMSE running mean via Chan's parallel Welford (fp64).
+
+    Used for FastNet's β_j = 1 / <AMSE_j>_year correction. We compute the
+    running mean of the per-variable AMSE observed during training (pred
+    vs target) and use β_j = 1/mean as a per-variable multiplier so each
+    variable contributes ~O(1) to the loss regardless of its native AMSE
+    scale. Update is no-grad; β_j value changes only between optimizer
+    steps, so this can't destabilise training.
+    """
+
+    def __init__(self, n_vars: int) -> None:
+        super().__init__()
+        self.register_buffer("count", torch.zeros((), dtype=torch.float64))
+        self.register_buffer("mean",  torch.zeros(n_vars, dtype=torch.float64))
+
+    @torch.no_grad()
+    def update(self, amse_per_var: torch.Tensor, distributed: bool = False) -> None:
+        x = amse_per_var.reshape(-1, amse_per_var.shape[-1]).to(torch.float64)
+        n_new = torch.tensor(float(x.shape[0]), dtype=torch.float64, device=x.device)
+        if float(n_new) == 0.0:
+            return
+        mean_new = x.mean(dim=0)
+
+        if distributed and dist.is_available() and dist.is_initialized():
+            # Pool rank-local (n_i, μ_i) via count-weighted sum → global μ.
+            count_mean = n_new * mean_new
+            dist.all_reduce(n_new, op=dist.ReduceOp.SUM)
+            dist.all_reduce(count_mean, op=dist.ReduceOp.SUM)
+            mean_new = count_mean / n_new.clamp_min(1.0)
+
+        delta = mean_new - self.mean
+        total = self.count + n_new
+        self.mean.add_(delta * n_new / total.clamp_min(1.0))
+        self.count.copy_(total)
+
+    @property
+    def beta(self) -> torch.Tensor:
+        """β_j = 1 / <AMSE_j>, fp32 with a small floor to avoid blowup pre-warmup."""
+        return (1.0 / self.mean.clamp_min(1e-10)).float()
 
 
 def _radially_bin_sum(
@@ -151,6 +199,16 @@ class GraphCastMSHLoss(GraphCastBaseLoss):
         Apply γ_k wavenumber weighting per FastNet Eq. 9. Default True.
     gamma_k_min : float, optional
         Floor for γ_k (FastNet's `max(·, 1.0)`). Default 1.0.
+    n_vars : int, optional
+        Number of output variables. Required if `use_variable_normalization=True`
+        — sizes the online-AMSE Welford buffers. Default None (disables β_j).
+    use_variable_normalization : bool, optional
+        Apply FastNet's β_j = 1/<AMSE_j> per-variable correction (Eq. 8).
+        Uses an online Welford estimator updated from training batches; no
+        offline pass required. Default False (opt-in).
+    distributed_stats : bool, optional
+        If True, reduce the Welford partial stats across DDP ranks each
+        update. Default True.
     """
 
     # Public alias used in class docs / error messages.
@@ -164,6 +222,9 @@ class GraphCastMSHLoss(GraphCastBaseLoss):
         coherence_weight: float = 1.0,
         use_gamma_k: bool = True,
         gamma_k_min: float = 1.0,
+        n_vars: int | None = None,
+        use_variable_normalization: bool = False,
+        distributed_stats: bool = True,
         **kwargs,
     ) -> None:
         super().__init__(ignore_nans=ignore_nans, **kwargs)
@@ -172,6 +233,8 @@ class GraphCastMSHLoss(GraphCastBaseLoss):
         self.coherence_weight = float(coherence_weight)
         self.use_gamma_k = bool(use_gamma_k)
         self.gamma_k_min = float(gamma_k_min)
+        self.use_variable_normalization = bool(use_variable_normalization)
+        self.distributed_stats = bool(distributed_stats)
 
         # Precompute bin lookup + γ_k as buffers so they move with .to(device).
         flat_bin_idx, k_centres, n_bins = _build_radial_bins(self.x_dim, self.y_dim)
@@ -180,6 +243,19 @@ class GraphCastMSHLoss(GraphCastBaseLoss):
         self.register_buffer("_k_centres", k_centres, persistent=False)
         self.register_buffer("_gamma_k", gamma_k, persistent=False)
         self._n_bins = int(n_bins)
+
+        # β_j online Welford aggregator (opt-in).
+        if self.use_variable_normalization:
+            if n_vars is None:
+                raise ValueError(
+                    "GraphCastMSHLoss: n_vars is required when "
+                    "use_variable_normalization=True",
+                )
+            self.n_vars = int(n_vars)
+            self.amse_stats = _OnlineAMSEStats(self.n_vars)
+        else:
+            self.n_vars = n_vars
+            self.amse_stats = None
 
         # Register a trivial GRID-dim scaler of size 1 so BaseLoss.scale()'s
         # "scaler tensor must be at least applied to the GRID dimension" check
@@ -264,8 +340,19 @@ class GraphCastMSHLoss(GraphCastBaseLoss):
         gamma_shape = (1,) * (amse_k.dim() - 2) + (self._n_bins, 1)
         amse_k = amse_k * self._gamma_k.view(*gamma_shape)
 
-        # Sum over k bins -> (B, E, V); add sentinel grid dim -> (B, E, 1, V)
+        # Sum over k bins -> (B, E, V)
         per_var = amse_k.sum(dim=-2)
+
+        # FastNet β_j (Eq. 8): per-variable normalization so every variable
+        # contributes ~O(1) regardless of its native AMSE scale. Online
+        # Welford over training batches; no offline pass required.
+        if self.use_variable_normalization and self.amse_stats is not None:
+            if self.training:
+                self.amse_stats.update(per_var.detach(), distributed=self.distributed_stats)
+            beta = self.amse_stats.beta.to(device=per_var.device, dtype=per_var.dtype)
+            per_var = per_var * beta.view(1, 1, -1)
+
+        # Add sentinel grid dim -> (B, E, 1, V)
         per_var = per_var.unsqueeze(TensorDim.GRID)
         return per_var.to(dtype=orig_dtype)
 
