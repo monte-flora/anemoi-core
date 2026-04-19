@@ -653,7 +653,7 @@ class BaseGraphModule(pl.LightningModule, ABC):
                 metrics[metric_step_name] = metric(
                     y_pred_postprocessed,
                     y_postprocessed,
-                    scaler_indices=[..., indices],
+                    scaler_indices=(..., indices),
                     grid_shard_slice=grid_shard_slice,
                     group=self.model_comm_group,
                     model_comm_group_size=self.model_comm_group_size,
@@ -771,7 +771,14 @@ class BaseGraphModule(pl.LightningModule, ABC):
         if hasattr(opt_cfg, "model_dump"):
             opt_cfg = opt_cfg.model_dump(by_alias=True)
 
-        return instantiate(opt_cfg, params=params, lr=self.lr)
+        optimizer = instantiate(opt_cfg, params=params, lr=self.lr)
+
+        # Log the actual optimizer settings to help users verify configuration
+        defaults_to_log = {k: v for k, v in optimizer.defaults.items() if k != "params"}
+        LOGGER.info("Optimizer initialized: %s", type(optimizer).__name__)
+        LOGGER.info("Optimizer settings: %s", defaults_to_log)
+
+        return optimizer
 
     def _create_scheduler(self, optimizer: torch.optim.Optimizer) -> dict[str, Any]:
         """Helper to create the cosine LR scheduler."""
