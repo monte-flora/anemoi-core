@@ -249,6 +249,15 @@ class DiTConfigSchema(BaseModel):
     "Activation for the DiT transformer blocks. One of 'gelu' (default, existing checkpoints), 'silu', 'relu', 'leaky_relu'. Implemented as a post-init nn.GELU -> nn.<activation> swap inside the physicsnemo DiT."
     conv_refinement_activation: Optional[str] = Field(default=None)
     "Activation inside the conv_refinement block. If None (default), follows `activation`. One of 'gelu', 'silu', 'relu', 'leaky_relu'."
+    conv_refinement_init: Literal["default", "gaussian", "gaussian_lowpass"] = Field(default="default")
+    "Init of the first Conv2d in each refinement block. 'default'=Kaiming; 'gaussian' / 'gaussian_lowpass' seed with a normalised 2-D Gaussian kernel (σ = conv_refinement_init_sigma) so the refinement starts as a smoothing filter rather than random."
+    conv_refinement_init_sigma: PositiveFloat = Field(default=0.7)
+    "σ (in pixels) for the gaussian / gaussian_lowpass init. Ignored when conv_refinement_init='default'."
+    # Fixed depth-wise Gaussian LPF right after the DiT detokenizer (anti-aliasing, non-learnable)
+    detokenizer_lowpass_sigma: float = Field(default=0.0)
+    "σ of the post-detokenizer Gaussian low-pass filter. 0 (default) disables; positive float (typical 0.5–1.0) enables a non-learnable, depth-wise 2-D Gaussian blur as a Nyquist rolloff. Applied in-line before conv_refinement."
+    detokenizer_lowpass_kernel: int = Field(default=5)
+    "Odd kernel size (3/5/7) for the Gaussian LPF. Used only when detokenizer_lowpass_sigma > 0."
     # Diffusion-specific (only used when mode='probabilistic')
     sigma_data: Optional[PositiveFloat] = Field(default=1.0)
     "Data scaling parameter for EDM preconditioning."

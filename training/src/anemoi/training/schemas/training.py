@@ -12,6 +12,7 @@ from functools import partial
 from typing import Annotated
 from typing import Any
 from typing import Literal
+from typing import Optional
 
 from pydantic import AfterValidator
 from pydantic import BaseModel as PydanticBaseModel
@@ -238,6 +239,8 @@ class ImplementedLossesUsingBaseLossSchema(str, Enum):
     rmse_norm = "anemoi.training.losses.RMSELossNormalized"
     combined = "anemoi.training.losses.combined.CombinedLoss"
     graphcast_combined = "anemoi.training.losses.graphcast_combined.GraphCastCombinedLoss"
+    horizontal_gradient = "anemoi.training.losses.horizontal_gradient.HorizontalGradientLoss"
+    graphcast_wind = "anemoi.training.losses.graphcast_wind.GraphCastWindAwareLoss"
     graphcast_mse = "anemoi.training.losses.GraphCastMSELoss"
     graphcast_huber = "anemoi.training.losses.GraphCastHuberLoss"
     graphcast_logcosh = "anemoi.training.losses.GraphCastLogCoshLoss"
@@ -488,10 +491,73 @@ class CombinedLossSchema(BaseLossSchema):
         return self
 
 
+class GraphCastCombinedLossSchema(CombinedLossSchema):
+    """GraphCastCombinedLoss is a CombinedLoss subclass that routes set_data_indices to children.
+
+    Schema-wise it's identical to CombinedLossSchema — same losses list and
+    loss_weights — it only differs at runtime.
+    """
+
+    target_: Literal[
+        "anemoi.training.losses.graphcast_combined.GraphCastCombinedLoss",
+    ] = Field(..., alias="_target_")
+
+
+class _WrappedInnerLossSchema(BaseModel):
+    """Minimal schema for an `inner_loss` dict inside a loss-wrapper (HGL, Wind).
+
+    Accepts a DictConfig with a `_target_` key pointing to any known loss and
+    any extra fields that the target loss class may require. Strict key
+    checking is delegated to the target loss's own schema at runtime; the
+    wrapper itself only enforces the presence of `_target_`.
+    """
+
+    model_config = {"extra": "allow", "populate_by_name": True}
+    target_: str = Field(..., alias="_target_")
+
+
+class HorizontalGradientLossSchema(BaseLossSchema):
+    """Schema for HorizontalGradientLoss (FastNet Sec. 5 gradient augmentation)."""
+
+    target_: Literal[
+        "anemoi.training.losses.horizontal_gradient.HorizontalGradientLoss",
+    ] = Field(..., alias="_target_")
+    inner_loss: _WrappedInnerLossSchema = Field(...)
+    "Inner loss to which gradient-augmented inputs are passed."
+    x_dim: int = Field(..., example=246)
+    y_dim: int = Field(..., example=246)
+    n_vars: int = Field(..., example=117)
+    "Number of output variables — sizes the online σ_∂x / σ_∂y buffers."
+    raw_weight: float = 1.0
+    dx_weight: float = 1.0
+    dy_weight: float = 1.0
+    normalize_gradients: bool = True
+    distributed_stats: bool = True
+
+
+class GraphCastWindAwareLossSchema(BaseLossSchema):
+    """Schema for GraphCastWindAwareLoss (FastNet wind decomposition)."""
+
+    target_: Literal[
+        "anemoi.training.losses.graphcast_wind.GraphCastWindAwareLoss",
+    ] = Field(..., alias="_target_")
+    inner_loss: _WrappedInnerLossSchema = Field(...)
+    "Inner loss applied to direction-decomposed + speed-only inputs."
+    speed_weight: float = 5.0
+    "FastNet Eq. 10: λ_speed multiplier on the speed contribution."
+    epsilon: float = 1e-6
+    "Small constant inside sqrt(u² + v² + ε²) to avoid s → 0 blow-ups."
+    u_v_pairs: Optional[list[list[str]]] = None
+    "Optional override of u/v variable-name pairs. If None, auto-detect."
+
+
 LossSchemas = (
     BaseLossSchema
     | HuberLossSchema
     | CombinedLossSchema
+    | GraphCastCombinedLossSchema
+    | HorizontalGradientLossSchema
+    | GraphCastWindAwareLossSchema
     | AlmostFairKernelCRPSSchema
     | KernelCRPSSchema
     | SpectralLossSchema
