@@ -328,6 +328,24 @@ class SpectralAmplitudeLossSchema(BaseLossSchema):
     "Exponent for optional (k / k_max) ** exponent per-bin weighting. 0.0 = uniform."
 
 
+class SpatialGradientLossSchema(BaseLossSchema):
+    """Schema for SpatialGradientLoss — 2D Cartesian finite-difference gradient MSE.
+
+    Inherits BaseLossSchema so it's usable in any LossSchemas context including
+    as an element of CombinedLossSchema.losses.
+    """
+
+    target_: Literal[
+        "anemoi.training.losses.gradient.SpatialGradientLoss",
+        "anemoi.training.losses.gradient.SobelLoss",
+    ] = Field(..., alias="_target_")
+    "Spatial gradient (edge/sharpness) loss on a 2D Cartesian LAM grid."
+    x_dim: int = Field(..., example=246)
+    "X dimension of the 2D grid (must satisfy x_dim * y_dim == grid size)."
+    y_dim: int = Field(..., example=246)
+    "Y dimension of the 2D grid."
+
+
 class GraphCastMSELossSchema(BaseLossSchema):
     """Schema for GraphCast-style MSE loss with sample weighting."""
 
@@ -422,8 +440,9 @@ class CombinedLossSchema(BaseLossSchema):
         | LogFFT2DistanceSchema
         | FourierCorrelationLossSchema
         | SpectralAmplitudeLossSchema
+        | SpatialGradientLossSchema
     ] = Field(min_length=1)
-    "Losses to combine, can be any of the normal losses or a spatial loss (LogFFT2Distance, FourierCorrelation, SpectralAmplitude/MSH)."
+    "Losses to combine, can be any of the normal losses or a spatial loss (LogFFT2Distance, FourierCorrelation, SpectralAmplitude/MSH, SpatialGradient)."
     loss_weights: list[int | float] | None = None
     "Weightings of losses, if not set, all losses are weighted equally."
 
@@ -465,6 +484,7 @@ LossSchemas = (
     | LogFFT2DistanceSchema
     | FourierCorrelationLossSchema
     | SpectralAmplitudeLossSchema
+    | SpatialGradientLossSchema
 )
 
 
