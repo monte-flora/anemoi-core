@@ -308,6 +308,26 @@ class FourierCorrelationLossSchema(BaseLossSchema):
     y_dim: int = Field(..., example=246)
 
 
+class SpectralAmplitudeLossSchema(BaseLossSchema):
+    """Schema for SpectralAmplitudeLoss (MSH) — 2D Cartesian amplitude-only spectral loss.
+
+    Inherits BaseLossSchema so it's usable in any LossSchemas context including
+    as an element of CombinedLossSchema.losses.
+    """
+
+    target_: Literal[
+        "anemoi.training.losses.msh.SpectralAmplitudeLoss",
+        "anemoi.training.losses.msh.MSHLoss",
+    ] = Field(..., alias="_target_")
+    "Modified Spherical Harmonic / spectral amplitude loss."
+    x_dim: int = Field(..., example=246)
+    "X dimension of the 2D grid (must satisfy x_dim * y_dim == grid size)."
+    y_dim: int = Field(..., example=246)
+    "Y dimension of the 2D grid."
+    high_k_weight_exponent: float = 0.0
+    "Exponent for optional (k / k_max) ** exponent per-bin weighting. 0.0 = uniform."
+
+
 class GraphCastMSELossSchema(BaseLossSchema):
     """Schema for GraphCast-style MSE loss with sample weighting."""
 
@@ -401,8 +421,9 @@ class CombinedLossSchema(BaseLossSchema):
         | GraphCastGaussianNLLLossSchema
         | LogFFT2DistanceSchema
         | FourierCorrelationLossSchema
+        | SpectralAmplitudeLossSchema
     ] = Field(min_length=1)
-    "Losses to combine, can be any of the normal losses or a spatial loss (LogFFT2Distance, FourierCorrelation)."
+    "Losses to combine, can be any of the normal losses or a spatial loss (LogFFT2Distance, FourierCorrelation, SpectralAmplitude/MSH)."
     loss_weights: list[int | float] | None = None
     "Weightings of losses, if not set, all losses are weighted equally."
 
@@ -443,6 +464,7 @@ LossSchemas = (
     | GraphCastGaussianNLLLossSchema
     | LogFFT2DistanceSchema
     | FourierCorrelationLossSchema
+    | SpectralAmplitudeLossSchema
 )
 
 
