@@ -24,7 +24,7 @@ import logging
 import torch
 import torch.nn.functional as F
 
-from anemoi.training.losses.base import FunctionalLoss
+from anemoi.training.losses.base import GraphCastBaseLoss
 from anemoi.training.utils.enums import TensorDim
 
 LOGGER = logging.getLogger(__name__)
@@ -86,7 +86,7 @@ def spatial_gradient_squared_error(
     return (dx_pred - dx_real) ** 2 + (dy_pred - dy_real) ** 2
 
 
-class SpatialGradientLoss(FunctionalLoss):
+class SpatialGradientLoss(GraphCastBaseLoss):
     r"""Spatial gradient loss for 2D Cartesian LAM grids.
 
     Computes the mean squared error between forward-difference spatial

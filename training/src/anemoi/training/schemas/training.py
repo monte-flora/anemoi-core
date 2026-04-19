@@ -237,6 +237,7 @@ class ImplementedLossesUsingBaseLossSchema(str, Enum):
     huber = "anemoi.training.losses.HuberLoss"
     rmse_norm = "anemoi.training.losses.RMSELossNormalized"
     combined = "anemoi.training.losses.combined.CombinedLoss"
+    graphcast_combined = "anemoi.training.losses.graphcast_combined.GraphCastCombinedLoss"
     graphcast_mse = "anemoi.training.losses.GraphCastMSELoss"
     graphcast_huber = "anemoi.training.losses.GraphCastHuberLoss"
     graphcast_logcosh = "anemoi.training.losses.GraphCastLogCoshLoss"
@@ -333,8 +334,9 @@ class SpectralAmplitudeLossSchema(BaseLossSchema):
     """
 
     target_: Literal[
-        "anemoi.training.losses.msh.SpectralAmplitudeLoss",
-        "anemoi.training.losses.msh.MSHLoss",
+        "anemoi.training.losses.graphcast_msh.GraphCastMSHLoss",
+        "anemoi.training.losses.graphcast_msh.SpectralAmplitudeLoss",
+        "anemoi.training.losses.graphcast_msh.MSHLoss",
     ] = Field(..., alias="_target_")
     "Modified Spherical Harmonic / spectral amplitude loss."
     x_dim: int = Field(..., example=246)
