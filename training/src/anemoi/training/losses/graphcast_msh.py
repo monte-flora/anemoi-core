@@ -39,6 +39,7 @@ from __future__ import annotations
 import logging
 
 import einops
+import numpy as np
 import torch
 import torch.distributed as dist
 import torch.fft
@@ -50,6 +51,19 @@ from anemoi.training.utils.enums import TensorDim
 LOGGER = logging.getLogger(__name__)
 
 
+def _load_precomputed_array_from_zarr(zarr_path: str, name: str) -> np.ndarray:
+    """Load a 1-D statistics array from the zarr root.
+
+    Matches the raw-zarr access pattern used by
+    ``anemoi.datasets.data.stores.Store.statistics_tendencies``: opens the
+    store read-only and slices the named dataset into a numpy array.
+    """
+    import zarr  # lazy import — only needed when precomputed path is set
+
+    z = zarr.open(zarr_path, mode="r")
+    return np.asarray(z[name][:])
+
+
 # ============================================================================
 # Helpers
 # ============================================================================
@@ -58,27 +72,46 @@ def _build_radial_bins(
     y_dim: int,
     device: torch.device | None = None,
     dtype: torch.dtype = torch.float32,
-) -> tuple[torch.Tensor, torch.Tensor, int]:
-    """Precompute the (flat-pixel → k-bin) index and k-centre tensors.
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
+    """Precompute index + conjugate-pair weight + k-centres for an rfft2 layout.
+
+    The 2D real-to-complex FFT (``torch.fft.rfft2``) returns only the
+    ``(H, W//2+1)`` half-plane of the full ``(H, W)`` complex spectrum — the
+    missing half follows by conjugate symmetry ``F(-kx, -ky) = F*(kx, ky)``.
+    To make the radial-bin PSD match ``|fft2|²`` exactly, we weight the
+    interior columns (``0 < ky < W/2``) by 2× before scatter-add; the DC
+    (``ky=0``) and Nyquist (``ky=W/2``, even ``W``) columns are already
+    self-conjugate along ``kx`` and keep weight 1.
 
     Returns
     -------
-    flat_bin_idx : LongTensor, shape (x_dim * y_dim,)
-        For each FFT bin, the integer radial wavenumber it belongs to
+    flat_bin_idx : LongTensor, shape (x_dim * (y_dim//2 + 1),)
+        For each rfft bin, the integer radial wavenumber it belongs to
         (k = round(sqrt(kx² + ky²))).
+    flat_weight : FloatTensor, same shape as flat_bin_idx
+        Per-bin conjugate-pair multiplier (1.0 for DC/Nyquist columns, 2.0 for
+        interior columns).
     k_centres : FloatTensor, shape (n_bins,)
-        The integer k value at each bin centre, in same dtype as dtype.
+        The integer k value at each bin centre.
     n_bins : int
         Total number of radial bins (= 1 + floor(sqrt((x_dim/2)² + (y_dim/2)²))).
     """
     kx = torch.fft.fftfreq(x_dim, device=device, dtype=dtype) * x_dim
-    ky = torch.fft.fftfreq(y_dim, device=device, dtype=dtype) * y_dim
+    ky = torch.fft.rfftfreq(y_dim, device=device, dtype=dtype) * y_dim
     kxv, kyv = torch.meshgrid(kx, ky, indexing="ij")
-    k_mag = torch.sqrt(kxv**2 + kyv**2)  # (x_dim, y_dim)
-    bin_idx = torch.round(k_mag).to(torch.long)  # integer radial wavenumber per bin
+    k_mag = torch.sqrt(kxv**2 + kyv**2)  # (x_dim, y_dim//2 + 1)
+    bin_idx = torch.round(k_mag).to(torch.long)
+
+    # Conjugate-pair weight: non-DC-non-Nyquist rfft columns represent two
+    # modes in the full fft2 spectrum (F and F*), so count them twice.
+    weight = torch.full_like(k_mag, 2.0)
+    weight[:, 0] = 1.0  # DC column (ky = 0)
+    if y_dim % 2 == 0:
+        weight[:, -1] = 1.0  # Nyquist column (ky = y_dim/2)
+
     n_bins = int(bin_idx.max().item()) + 1
     k_centres = torch.arange(n_bins, device=device, dtype=dtype)
-    return bin_idx.flatten(), k_centres, n_bins
+    return bin_idx.flatten(), weight.flatten(), k_centres, n_bins
 
 
 def _gamma_k_weights(
@@ -225,6 +258,7 @@ class GraphCastMSHLoss(GraphCastBaseLoss):
         n_vars: int | None = None,
         use_variable_normalization: bool = False,
         distributed_stats: bool = True,
+        precomputed_stats_path: str | None = None,
         **kwargs,
     ) -> None:
         super().__init__(ignore_nans=ignore_nans, **kwargs)
@@ -235,27 +269,72 @@ class GraphCastMSHLoss(GraphCastBaseLoss):
         self.gamma_k_min = float(gamma_k_min)
         self.use_variable_normalization = bool(use_variable_normalization)
         self.distributed_stats = bool(distributed_stats)
+        self.precomputed_stats_path = str(precomputed_stats_path) if precomputed_stats_path else None
 
-        # Precompute bin lookup + γ_k as buffers so they move with .to(device).
-        flat_bin_idx, k_centres, n_bins = _build_radial_bins(self.x_dim, self.y_dim)
+        # Precompute bin lookup + conjugate-pair weight + γ_k as buffers so
+        # they move with .to(device).
+        flat_bin_idx, flat_weight, k_centres, n_bins = _build_radial_bins(self.x_dim, self.y_dim)
         gamma_k = _gamma_k_weights(k_centres, min_weight=self.gamma_k_min) if self.use_gamma_k else torch.ones_like(k_centres)
         self.register_buffer("_flat_bin_idx", flat_bin_idx, persistent=False)
+        self.register_buffer("_flat_weight", flat_weight, persistent=False)
         self.register_buffer("_k_centres", k_centres, persistent=False)
         self.register_buffer("_gamma_k", gamma_k, persistent=False)
         self._n_bins = int(n_bins)
+        self._y_rfft = int(self.y_dim // 2 + 1)
 
-        # β_j online Welford aggregator (opt-in).
-        if self.use_variable_normalization:
+        # β_j setup. Two sources:
+        #   (1) precomputed_stats_path — reads `statistics_msh_beta` from the
+        #       zarr via raw zarr access (same pattern as
+        #       anemoi.datasets.data.stores.Store.statistics_tendencies).
+        #       Data-dim (V_data) → model-output-dim (V_model) subsetting is
+        #       resolved in set_data_indices().
+        #   (2) Online Welford on AMSE(pred, target) during training.
+        # Path (1) skips the Welford allocation and update entirely.
+        self.n_vars = int(n_vars) if n_vars is not None else None
+
+        if self.use_variable_normalization and self.precomputed_stats_path is not None:
+            import zarr as _zarr
+            _z = _zarr.open(self.precomputed_stats_path, mode="r")
+            # Residual-space β matches what GraphResidualForecaster's loss sees
+            # at training time — the tendency has already been divided by
+            # statistics_tendencies_<freq>_stdev by the model's ResidualNormalizer.
+            _freq = _z.attrs.get("frequency", "15m")
+            _beta_key = f"statistics_tendencies_{_freq}_msh_beta"
+            beta_data = np.asarray(_z[_beta_key][:])
+            zarr_variables = list(_z.attrs.get("variables", []))
+            if len(zarr_variables) != beta_data.shape[0]:
+                raise ValueError(
+                    f"zarr 'variables' attr ({len(zarr_variables)}) != "
+                    f"statistics_msh_beta length ({beta_data.shape[0]})"
+                )
+            # RAW-zarr index lookup by name — bypasses anemoi-datasets' `drop`
+            # filter, which would otherwise map names into a compressed
+            # (dropped) index space that doesn't match our raw stats array.
+            self._zarr_name_to_index: dict[str, int] = {
+                name: i for i, name in enumerate(zarr_variables)
+            }
+            self.register_buffer(
+                "_precomputed_beta_data",
+                torch.as_tensor(beta_data, dtype=torch.float32),
+                persistent=False,
+            )
+            self.amse_stats = None
+            self._data_idx_for_model_output: torch.Tensor | None = None
+            LOGGER.info(
+                "%s: using precomputed β from %s (zarr dim V_data=%d)",
+                self._loss_name, self.precomputed_stats_path, beta_data.shape[0],
+            )
+        elif self.use_variable_normalization:
             if n_vars is None:
                 raise ValueError(
                     "GraphCastMSHLoss: n_vars is required when "
-                    "use_variable_normalization=True",
+                    "use_variable_normalization=True and no precomputed_stats_path is given",
                 )
-            self.n_vars = int(n_vars)
-            self.amse_stats = _OnlineAMSEStats(self.n_vars)
+            self.amse_stats = _OnlineAMSEStats(int(n_vars))
+            self._data_idx_for_model_output = None
         else:
-            self.n_vars = n_vars
             self.amse_stats = None
+            self._data_idx_for_model_output = None
 
         # Register a trivial GRID-dim scaler of size 1 so BaseLoss.scale()'s
         # "scaler tensor must be at least applied to the GRID dimension" check
@@ -301,21 +380,32 @@ class GraphCastMSHLoss(GraphCastBaseLoss):
             target, "b e (h w) v -> b e h w v", h=self.x_dim, w=self.y_dim
         )
 
-        # FFT in float32 for numerical stability under bf16-mixed precision
+        # Real-to-complex FFT (rfft2): returns (H, W//2+1) half-plane; the
+        # missing half is recovered by the conjugate-pair weight baked into
+        # self._flat_weight. ~50% memory and ~1.5-2× faster than full fft2.
+        # FP32 for numerical stability under bf16-mixed precision.
         orig_dtype = pred.dtype
-        alpha_pred = torch.fft.fft2(pred_2d.float(), dim=(-3, -2))
-        alpha_true = torch.fft.fft2(target_2d.float(), dim=(-3, -2))
+        alpha_pred = torch.fft.rfft2(pred_2d.float(), dim=(-3, -2))
+        alpha_true = torch.fft.rfft2(target_2d.float(), dim=(-3, -2))
 
-        # |α|² per (H, W) bin and Re[α_pred · α_true*]
+        # |α|² per (H, W//2+1) bin and Re[α_pred · α_true*]
         power_pred = alpha_pred.real**2 + alpha_pred.imag**2
         power_true = alpha_true.real**2 + alpha_true.imag**2
         cross = alpha_pred.real * alpha_true.real + alpha_pred.imag * alpha_true.imag
 
-        # Flatten pixels, scatter-add into radial bins
-        shape_flat = power_pred.shape[:-3] + (self.x_dim * self.y_dim, power_pred.shape[-1])
+        # Flatten pixels, apply conjugate-pair weight, scatter-add into radial bins.
+        # power/cross shapes: (..., H, W//2+1, V) -> (..., H*(W//2+1), V)
+        n_pix_rfft = self.x_dim * self._y_rfft
+        shape_flat = power_pred.shape[:-3] + (n_pix_rfft, power_pred.shape[-1])
         power_pred = power_pred.reshape(shape_flat)
         power_true = power_true.reshape(shape_flat)
         cross = cross.reshape(shape_flat)
+
+        # Weight shape (n_pix_rfft,) -> broadcast over leading dims + last V
+        w = self._flat_weight.view(*([1] * (power_pred.dim() - 2)), n_pix_rfft, 1)
+        power_pred = power_pred * w
+        power_true = power_true * w
+        cross = cross * w
 
         psd_pred = _radially_bin_sum(power_pred, self._flat_bin_idx, self._n_bins)
         psd_true = _radially_bin_sum(power_true, self._flat_bin_idx, self._n_bins)
@@ -344,9 +434,18 @@ class GraphCastMSHLoss(GraphCastBaseLoss):
         per_var = amse_k.sum(dim=-2)
 
         # FastNet β_j (Eq. 8): per-variable normalization so every variable
-        # contributes ~O(1) regardless of its native AMSE scale. Online
-        # Welford over training batches; no offline pass required.
-        if self.use_variable_normalization and self.amse_stats is not None:
+        # contributes ~O(1) regardless of its native AMSE scale.
+        # Source order: (1) pre-computed stats from zarr → (2) online Welford.
+        if self.use_variable_normalization and getattr(self, "_precomputed_beta_data", None) is not None:
+            if self._data_idx_for_model_output is None:
+                raise RuntimeError(
+                    "GraphCastMSHLoss: precomputed β enabled but set_data_indices() "
+                    "has not been called yet — no model-output→data-index mapping.",
+                )
+            idx = self._data_idx_for_model_output.to(per_var.device)
+            beta = self._precomputed_beta_data.to(device=per_var.device, dtype=per_var.dtype)[idx]
+            per_var = per_var * beta.view(1, 1, -1)
+        elif self.use_variable_normalization and self.amse_stats is not None:
             if self.training:
                 self.amse_stats.update(per_var.detach(), distributed=self.distributed_stats)
             beta = self.amse_stats.beta.to(device=per_var.device, dtype=per_var.dtype)
@@ -399,6 +498,39 @@ class GraphCastMSHLoss(GraphCastBaseLoss):
         )
         # GraphCastBaseLoss.reduce does mean-within-variable-group, sum-across
         return self.reduce(out, squash, group=None)
+
+    # ------------------------------------------------------------------
+    # Data-indices resolution — needed when precomputed_stats_path is set
+    # so we can map (V_model,) → (V_data,) for the β lookup. Same lookup
+    # pattern as BaseTendencyScaler.get_scaling_values.
+    # ------------------------------------------------------------------
+    def set_data_indices(self, data_indices) -> None:
+        super().set_data_indices(data_indices)
+        if data_indices is None:
+            return
+        if getattr(self, "_precomputed_beta_data", None) is None:
+            return
+        output_n2i = data_indices.model.output.name_to_index
+        n_model_out = len(output_n2i)
+        idx_map = torch.zeros(n_model_out, dtype=torch.long)
+        resolved = 0
+        missing: list[str] = []
+        for name, model_idx in output_n2i.items():
+            if name in self._zarr_name_to_index:
+                idx_map[model_idx] = int(self._zarr_name_to_index[name])
+                resolved += 1
+            else:
+                missing.append(name)
+        if missing:
+            raise KeyError(
+                f"{self._loss_name}: {len(missing)} output variable(s) not found in "
+                f"zarr 'variables' attr: {missing[:10]}"
+            )
+        self._data_idx_for_model_output = idx_map
+        LOGGER.info(
+            "%s: resolved %d/%d model→raw-zarr index entries for β lookup",
+            self._loss_name, resolved, n_model_out,
+        )
 
 
 # Public aliases

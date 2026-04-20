@@ -239,6 +239,7 @@ class ImplementedLossesUsingBaseLossSchema(str, Enum):
     rmse_norm = "anemoi.training.losses.RMSELossNormalized"
     combined = "anemoi.training.losses.combined.CombinedLoss"
     graphcast_combined = "anemoi.training.losses.graphcast_combined.GraphCastCombinedLoss"
+    graphcast_full = "anemoi.training.losses.graphcast_full.GraphCastFullLoss"
     horizontal_gradient = "anemoi.training.losses.horizontal_gradient.HorizontalGradientLoss"
     graphcast_wind = "anemoi.training.losses.graphcast_wind.GraphCastWindAwareLoss"
     graphcast_mse = "anemoi.training.losses.GraphCastMSELoss"
@@ -551,11 +552,46 @@ class GraphCastWindAwareLossSchema(BaseLossSchema):
     "Optional override of u/v variable-name pairs. If None, auto-detect."
 
 
+class GraphCastFullLossSchema(BaseLossSchema):
+    """Schema for GraphCastFullLoss — flat FastNet stack in one class.
+
+    Replaces the HorizontalGradient → Wind → Combined[MSE+MSH] nested stack.
+    Ablate any term by setting its weight to 0; zero-weight terms are not
+    computed and (in the MSH/Welford cases) not instantiated.
+    """
+
+    target_: Literal[
+        "anemoi.training.losses.graphcast_full.GraphCastFullLoss",
+    ] = Field(..., alias="_target_")
+    x_dim: int = Field(..., example=246)
+    y_dim: int = Field(..., example=246)
+    n_vars: int = Field(..., example=117)
+    raw_mse_weight: float = 1.0
+    raw_msh_weight: float = 1.0
+    grad_x_weight: float = 1.0
+    grad_y_weight: float = 1.0
+    wind_speed_weight: float = 5.0
+    wind_dir_weight: float = 1.0
+    coherence_weight: float = 1.0
+    use_gamma_k: bool = True
+    gamma_k_min: float = 1.0
+    use_variable_normalization: bool = True
+    normalize_gradients: bool = True
+    epsilon: float = 1.0e-6
+    u_v_pairs: Optional[list[list[str]]] = None
+    distributed_stats: bool = True
+    mse_scalers: Optional[list[str]] = None
+    msh_scalers: Optional[list[str]] = None
+    precomputed_stats_path: Optional[str] = None
+    "Path to anemoi zarr containing statistics_msh_beta / statistics_gradient_{x,y}_stdev. Skips online Welford."
+
+
 LossSchemas = (
     BaseLossSchema
     | HuberLossSchema
     | CombinedLossSchema
     | GraphCastCombinedLossSchema
+    | GraphCastFullLossSchema
     | HorizontalGradientLossSchema
     | GraphCastWindAwareLossSchema
     | AlmostFairKernelCRPSSchema
