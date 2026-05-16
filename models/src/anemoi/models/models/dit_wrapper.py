@@ -148,16 +148,29 @@ class AnemoiDiTModel(nn.Module):
         attn_kwargs = dict(getattr(dit_cfg, "attn_kwargs", {}))
         conditioning_embedder_kwargs = dict(getattr(dit_cfg, "conditioning_embedder_kwargs", {}))
 
+        # Compute padded field_shape so the tokenizer's pos_embed (sized
+        # to input_size // patch_size in PatchEmbed2DTokenizer.__init__)
+        # matches the token count produced AFTER _pad_to_patch_size at
+        # forward time. Without this, pos_embed=learnable raises a shape
+        # mismatch whenever field_shape is not divisible by patch_size
+        # (e.g. 250 % 4 = 2 → input is padded to 252 → 63² tokens but
+        # pos_embed is sized for 62² = 3844 tokens).
+        ps_h = ps_w = int(dit_cfg.patch_size)
+        _pad_h = (ps_h - self.field_shape[0] % ps_h) % ps_h
+        _pad_w = (ps_w - self.field_shape[1] % ps_w) % ps_w
+        padded_field_shape = (self.field_shape[0] + _pad_h, self.field_shape[1] + _pad_w)
+
         LOGGER.info(
             f"Initializing FlexibleDiT: mode={self.mode}, in_channels={in_channels}, "
             f"out_channels={self.num_output_channels}, field_shape={self.field_shape}, "
+            f"padded_field_shape={padded_field_shape}, "
             f"patch_size={dit_cfg.patch_size}, hidden_size={dit_cfg.hidden_size}, "
             f"depth={dit_cfg.depth}, num_heads={dit_cfg.num_heads}, "
             f"attention_backend={dit_cfg.attention_backend}"
         )
 
         self.dit = FlexibleDiT(
-            input_size=self.field_shape,
+            input_size=padded_field_shape,
             in_channels=in_channels,
             out_channels=self.num_output_channels,
             patch_size=int(dit_cfg.patch_size),
@@ -172,7 +185,47 @@ class AnemoiDiTModel(nn.Module):
             attn_kwargs=attn_kwargs,
             conditioning_embedder_kwargs=conditioning_embedder_kwargs,
             force_tokenization_fp32=bool(getattr(dit_cfg, "force_tokenization_fp32", True)),
+            detokenizer_type=str(getattr(dit_cfg, "detokenizer_type", "linear_reshape")),
         )
+
+        # Architecture summary at instantiation time. Printed once per rank
+        # construction; surfaces the actual detokenizer class so config-vs-
+        # instantiation mismatches (Hydra override silently dropped, schema
+        # not plumbed, etc.) are caught immediately rather than after a
+        # full training run with a wrong head.
+        def _fmt_params(n):
+            return f"{n / 1e6:>7.2f}M" if n >= 1e5 else f"{n:>9d}"
+
+        configured_detok = str(getattr(dit_cfg, "detokenizer_type", "linear_reshape"))
+        actual_detok = type(self.dit.detokenizer).__name__
+        LOGGER.info("=" * 78)
+        LOGGER.info("DiT model summary")
+        LOGGER.info("-" * 78)
+        LOGGER.info("  configured detokenizer_type:  %s", configured_detok)
+        LOGGER.info("  instantiated detokenizer cls: %s", actual_detok)
+        if configured_detok in ("pixel_shuffle", "linear_reshape"):
+            pass
+        elif (
+            (configured_detok.startswith("pixel_shuffle") and "PixelShuffle" not in actual_detok)
+            or (configured_detok.startswith("conv_transpose") and "ConvTranspose" not in actual_detok)
+            or (configured_detok.startswith("bilinear") and "Bilinear" not in actual_detok)
+            or (configured_detok.startswith("hierarchical") and "Hierarchical" not in actual_detok)
+        ):
+            LOGGER.warning(
+                "  configured detokenizer_type=%r but instantiated %s — config likely not "
+                "plumbed through. Check dit_wrapper.py and FlexibleDiT.__init__ dispatch.",
+                configured_detok, actual_detok,
+            )
+        total_dit = 0
+        for name, sub in self.dit.named_children():
+            n = sum(p.numel() for p in sub.parameters())
+            total_dit += n
+            LOGGER.info(
+                "  dit.%-25s %s params  (%s)",
+                name + ":", _fmt_params(n), type(sub).__name__,
+            )
+        LOGGER.info("  dit total: %s params", _fmt_params(total_dit))
+        LOGGER.info("=" * 78)
 
         # Optional post-init activation swap: set dit_cfg.activation to one of
         # {"gelu", "silu", "relu"}. Replaces every nn.GELU inside the DiT
@@ -249,8 +302,39 @@ class AnemoiDiTModel(nn.Module):
         self._internal_input_idx = data_indices.model.input.prognostic
         self._internal_output_idx = data_indices.model.output.prognostic
 
-        # Boundings (e.g., ReLU for precipitation)
+        # output_mode controls what the model's forward returns + how boundings
+        # are applied (see _forward_deterministic):
+        #   "residual" (default, back-compat): forward returns whatever the DiT
+        #       backbone produces. Interpreted as a normalised residual at the
+        #       task level by GraphResidualForecaster (which adds it to the
+        #       previous state after physical-space reconstruction). Boundings
+        #       are NOT applied (clipping a residual to >=0 would force
+        #       monotonic increase, which is wrong).
+        #   "state": forward returns predicted state in normalised space. An
+        #       internal skip adds the input prognostic state to the DiT output
+        #       (mirroring AnemoiModelEncProcDec._assemble_output), making the
+        #       DiT effectively predict a delta-from-input. Boundings ARE then
+        #       applied (e.g. ReluBounding on apcp/qv enforces x_phys >= 0 in
+        #       normalised space — works directly if the variable is std-norm,
+        #       otherwise use NormalizedReluBounding). Task should be the
+        #       default GraphForecaster.
+        self.output_mode = str(getattr(dit_cfg, "output_mode", "residual")).lower()
+        if self.output_mode not in ("residual", "state"):
+            raise ValueError(
+                f"AnemoiDiTModel: output_mode must be 'residual' or 'state', got {self.output_mode!r}."
+            )
+        LOGGER.info("AnemoiDiTModel: output_mode = %s", self.output_mode)
+
+        # Boundings (e.g., ReLU for precipitation). Applied only in state mode;
+        # see _forward_deterministic.
         self.boundings = build_boundings(config, data_indices, statistics)
+        if self.boundings and self.output_mode == "residual":
+            LOGGER.warning(
+                "AnemoiDiTModel: %d bounding(s) configured but output_mode='residual' — "
+                "boundings will NOT be applied (clipping residuals is incorrect). "
+                "Set output_mode='state' to enable bounding.",
+                len(self.boundings),
+            )
 
         # Diffusion parameters (probabilistic mode)
         if self.mode == "probabilistic":
@@ -319,8 +403,23 @@ class AnemoiDiTModel(nn.Module):
         # Reshape back and cast to input dtype (matches GNN's _assemble_output pattern)
         y = einops.rearrange(y_2d, "(b e) v h w -> b e (h w) v", b=B, e=E).to(dtype=input_dtype).clone()
 
-        for bounding in self.boundings:
-            y = bounding(y)
+        if getattr(self, "output_mode", "residual") == "state":
+            # State-space skip: add the input prognostic state to the DiT output
+            # so the model effectively predicts a delta-from-input, and the
+            # return value is the predicted state in normalised space. This
+            # mirrors AnemoiModelEncProcDec._assemble_output line 105:
+            #   x_out[..., output_prog_idx] += x_skip[..., input_prog_idx]
+            # x has shape (B, T, E, G, V_in); take the last input timestep.
+            x_last = x[:, -1, ...]
+            y[..., self._internal_output_idx] = (
+                y[..., self._internal_output_idx]
+                + x_last[..., self._internal_input_idx]
+            )
+            # Apply boundings (e.g. ReluBounding on apcp/comp_refl/qv) in
+            # normalised state space.
+            for bounding in self.boundings:
+                y = bounding(y)
+        # NB: residual mode does NOT apply boundings (see __init__ warning).
 
         return y
 
@@ -449,10 +548,19 @@ class AnemoiDiTModel(nn.Module):
             # Normalize input
             x = pre_processors(x, in_place=True)
 
-            # Forward pass \u2014 predicts normalized residuals
+            # Forward pass \u2014 output interpretation depends on output_mode:
+            #   "residual" \u2192 model output is a normalised RESIDUAL; reconstruct
+            #               physical state by adding the previous step.
+            #   "state"    \u2192 model output is the predicted STATE in normalised
+            #               space (with state-skip already applied inside
+            #               _forward_deterministic). Just denormalise the
+            #               output through the input normaliser; the residual
+            #               normaliser path would double-add the input state
+            #               and produce explosive rollouts.
             model_output = self.forward(
                 x, model_comm_group=model_comm_group, grid_shard_shapes=grid_shard_shapes, **kwargs
             )  # (B, E=1, G, V_out)
+            output_mode = getattr(self, "output_mode", "residual")
 
             # Variable indices
             model_prog_idx = data_indices.model.output.prognostic
@@ -462,16 +570,25 @@ class AnemoiDiTModel(nn.Module):
             # Normalizer buffers
             norm_mul, norm_add = self._get_normalizer_buffers(pre_processors)
 
-            # Prognostic: residual denormalization
-            delta_norm_prog = model_output[..., model_prog_idx]  # (B, 1, G, n_prog)
-            x_last_norm_prog = x[:, -1, ..., input_prog_idx]  # (B, 1, G, n_prog)
-
-            y_hat_prog_phys = residual_normalizer.inverse_transform_physical_from_normalized(
-                x_last_norm_prog,
-                delta_norm_prog,
-                norm_mul,
-                norm_add,
-            )
+            if output_mode == "state":
+                # Output is normalised state. Denormalise prognostic outputs
+                # via input normaliser (state-stats), no residual reconstruction.
+                # x_phys = (x_norm \u2212 norm_add) / norm_mul   <=>   x_norm = x_phys\u00b7norm_mul + norm_add
+                state_norm_prog = model_output[..., model_prog_idx].float()
+                prog_mul = norm_mul[input_prog_idx].float()
+                prog_add = norm_add[input_prog_idx].float()
+                y_hat_prog_phys = ((state_norm_prog - prog_add) / prog_mul).to(model_output.dtype)
+            else:
+                # Residual mode (legacy): output is delta-from-input in residual
+                # normalised space; reconstruct physical state.
+                delta_norm_prog = model_output[..., model_prog_idx]  # (B, 1, G, n_prog)
+                x_last_norm_prog = x[:, -1, ..., input_prog_idx]  # (B, 1, G, n_prog)
+                y_hat_prog_phys = residual_normalizer.inverse_transform_physical_from_normalized(
+                    x_last_norm_prog,
+                    delta_norm_prog,
+                    norm_mul,
+                    norm_add,
+                )
 
             # Build output tensor
             n_output = len(data_indices.model.output.full)
