@@ -67,7 +67,7 @@ class ResidualNormalizer(BasePreprocessor):
     precision issues with bfloat16, then cast back to the original dtype.
     """
 
-    def __init__(self, data_indices: IndexCollection, statistics_tendencies: dict, min_stdev: float = 1e-6):
+    def __init__(self, data_indices: IndexCollection, statistics_tendencies: dict, min_stdev: float = 1e-7):
         # Passing an empty dict for the config
         super().__init__({}, data_indices, statistics_tendencies)
 

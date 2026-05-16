@@ -62,6 +62,11 @@ class FFT2D(SpectralTransform):
         y_dim : int
             size of the spatial dimension y of the original data in 2D
         """
+        super().__init__()  # required so nn.Module._modules is initialised;
+                            # without it, Lightning's named_modules() walk
+                            # crashes when a SpectralLoss is registered as a
+                            # validation metric (a ModuleDict child of the
+                            # LightningModule).
         self.x_dim = x_dim
         self.y_dim = y_dim
         self.nodes_slice = slice(*nodes_slice)
@@ -70,9 +75,15 @@ class FFT2D(SpectralTransform):
         self,
         data: torch.Tensor,
     ) -> torch.Tensor:
-        data = torch.index_select(
-            data, TensorDim.GRID, torch.arange(*self.nodes_slice.indices(data.size(TensorDim.GRID)))
+        # `torch.arange(...)` returns a CPU tensor by default; `data` may
+        # be on cuda:N during validation, which makes index_select raise
+        # `Expected all tensors to be on the same device`. Materialise
+        # the index on data.device so this works under DDP/CUDA.
+        idx = torch.arange(
+            *self.nodes_slice.indices(data.size(TensorDim.GRID)),
+            device=data.device,
         )
+        data = torch.index_select(data, TensorDim.GRID, idx)
         var = data.shape[-1]
         try:
             data = einops.rearrange(data, "... (y x) v -> ... y x v", x=self.x_dim, y=self.y_dim, v=var)
