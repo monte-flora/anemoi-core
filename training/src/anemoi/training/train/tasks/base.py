@@ -227,15 +227,15 @@ class BaseGraphModule(pl.LightningModule, ABC):
 
         self.is_first_step = True
         self.multi_step = config.training.multistep_input
-        self.lr = (
-            config.system.hardware.num_nodes
-            * config.system.hardware.num_gpus_per_node
-            * config.training.lr.rate
-            / config.system.hardware.num_gpus_per_model
-        )
+        # Resolve peak/floor LR via the central helper (see
+        # anemoi.training.utils.lr_resolution.resolve_lr).
+        from anemoi.training.utils.lr_resolution import log_lr_banner, resolve_lr
+        peak_lr, floor_lr, _ = resolve_lr(config)
+        log_lr_banner(config, source="BaseForecaster")
+        self.lr = peak_lr
         self.lr_iterations = config.training.lr.iterations
         self.lr_warmup = config.training.lr.warmup
-        self.lr_min = config.training.lr.min
+        self.lr_min = floor_lr
         self.optimizer_settings = config.training.optimizer
 
         self.model_comm_group = None
@@ -411,7 +411,14 @@ class BaseGraphModule(pl.LightningModule, ABC):
         torch.Tensor
             Computed loss
         """
-        return self.loss(y_pred, y, grid_shard_slice=grid_shard_slice, group=self.model_comm_group, kwargs=_kwargs)
+        # NB: dropping the legacy `kwargs=_kwargs` named-arg here — it was a
+        # dict literally named ``kwargs`` (not unpacked), which only worked for
+        # losses whose forward signature absorbs it via ``**kwargs: Any``
+        # (e.g. GraphCastFullLoss). Losses with explicit kwonly args (e.g.
+        # WeightedMSELoss) would crash with "unexpected keyword argument
+        # 'kwargs'". No loss currently reads ``kwargs[...]``, so the wrap is
+        # dead code.
+        return self.loss(y_pred, y, grid_shard_slice=grid_shard_slice, group=self.model_comm_group)
 
     def _compute_metrics(
         self,
