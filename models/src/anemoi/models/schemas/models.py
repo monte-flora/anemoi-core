@@ -249,6 +249,26 @@ class DiTConfigSchema(BaseModel):
     "Activation for the DiT transformer blocks. One of 'gelu' (default, existing checkpoints), 'silu', 'relu', 'leaky_relu'. Implemented as a post-init nn.GELU -> nn.<activation> swap inside the physicsnemo DiT."
     conv_refinement_activation: Optional[str] = Field(default=None)
     "Activation inside the conv_refinement block. If None (default), follows `activation`. One of 'gelu', 'silu', 'relu', 'leaky_relu'."
+    conv_refinement_init: Literal["default", "gaussian", "gaussian_lowpass"] = Field(default="default")
+    "Init of the first Conv2d in each refinement block. 'default'=Kaiming; 'gaussian' / 'gaussian_lowpass' seed with a normalised 2-D Gaussian kernel (σ = conv_refinement_init_sigma) so the refinement starts as a smoothing filter rather than random."
+    conv_refinement_init_sigma: PositiveFloat = Field(default=0.7)
+    "σ (in pixels) for the gaussian / gaussian_lowpass init. Ignored when conv_refinement_init='default'."
+    # Fixed depth-wise Gaussian LPF right after the DiT detokenizer (anti-aliasing, non-learnable)
+    detokenizer_lowpass_sigma: float = Field(default=0.0)
+    "σ of the post-detokenizer Gaussian low-pass filter. 0 (default) disables; positive float (typical 0.5–1.0) enables a non-learnable, depth-wise 2-D Gaussian blur as a Nyquist rolloff. Applied in-line before conv_refinement."
+    detokenizer_lowpass_kernel: int = Field(default=5)
+    "Odd kernel size (3/5/7) for the Gaussian LPF. Used only when detokenizer_lowpass_sigma > 0."
+    detokenizer_type: Literal[
+        "linear_reshape",
+        "pixel_shuffle",
+        "pixel_shuffle_3x3x2",
+        "pixel_shuffle_5x5x2",
+        "pixel_shuffle_7x7x1",
+        "conv_transpose_k12_s4",
+        "bilinear_3x3x2",
+        "hierarchical_2stage",
+    ] = Field(default="linear_reshape")
+    "Detokenizer head architecture. 'linear_reshape' (default) is the stock DiT ProjLayer + reshape (per-token Linear, no cross-patch blending; structurally pixelates). The other variants are Tier-A1/A3 cross-patch-mixing heads from the literature survey: 'pixel_shuffle' (alias for 3x3x2), 'pixel_shuffle_5x5x2' (RF=9 cells), 'pixel_shuffle_7x7x1' (single 7x7 conv, RF=7), 'conv_transpose_k12_s4' (3x overlap, no Odena checkerboard), 'bilinear_3x3x2' (smooth + learned recovery), 'hierarchical_2stage' (SegFormer-style two-step PixelShuffle)."
     # Diffusion-specific (only used when mode='probabilistic')
     sigma_data: Optional[PositiveFloat] = Field(default=1.0)
     "Data scaling parameter for EDM preconditioning."
@@ -260,6 +280,11 @@ class DiTConfigSchema(BaseModel):
     "Karras schedule parameter for training noise distribution."
     inference_defaults: dict = Field(default_factory=dict)
     "Default parameters for inference sampling (noise schedule, sampler)."
+    output_mode: Literal["residual", "state"] = Field(default="residual")
+    "How the model output is interpreted. 'residual' (default, back-compat): " \
+    "DiT output is a normalised residual; the task reconstructs state externally. " \
+    "'state': DiT output + input-state skip = predicted state in normalised space; " \
+    "use with default GraphForecaster task. Boundings are applied only in 'state' mode."
 
 
 class DiTModel(BaseModel):

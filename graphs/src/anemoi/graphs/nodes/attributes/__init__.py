@@ -16,6 +16,7 @@ from .area_weights import UniformWeights
 from .boolean_op import BooleanAndMask
 from .boolean_op import BooleanNot
 from .boolean_op import BooleanOrMask
+from .grid_index import GridIndexPosition
 from .masks import CutOutMask
 from .masks import GridsMask
 from .masks import LimitedAreaMask
@@ -39,4 +40,5 @@ __all__ = [
     "BooleanOrMask",
     "CosineLatWeightedAttribute",
     "IsolatitudeAreaWeights",
+    "GridIndexPosition",
 ]

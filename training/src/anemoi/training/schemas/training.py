@@ -12,6 +12,7 @@ from functools import partial
 from typing import Annotated
 from typing import Any
 from typing import Literal
+from typing import Optional
 
 from pydantic import AfterValidator
 from pydantic import BaseModel as PydanticBaseModel
@@ -78,16 +79,34 @@ class Rollout(BaseModel):
 class LR(BaseModel):
     """Learning rate configuration.
 
-    Changes in per-gpu batch_size should come with a rescaling of the local_lr,
-    in order to keep a constant global_lr global_lr = local_lr * num_gpus_per_node * num_nodes / gpus_per_model.
+    ``semantics`` controls how ``rate`` and ``min`` are interpreted relative
+    to the actual optimizer LR the model sees during training:
+
+    - ``"per_rank_legacy"`` (default): legacy anemoi behaviour. ``rate`` is
+      multiplied by ``num_nodes × num_gpus_per_node / num_gpus_per_model``
+      to obtain the optimizer peak, but ``min`` is passed through literally
+      (no multiplier). Kept as the default so existing configs continue to
+      reproduce historical results; the asymmetry is a known footgun.
+    - ``"per_rank"``: same multiplier applied to ``rate`` AND ``min``. The
+      asymmetry is gone — cosine sweep span is now hardware-independent.
+      Recommended when migrating a per-rank config away from the legacy
+      behaviour without rewriting the literal numbers.
+    - ``"global"``: ``rate`` and ``min`` are the literal values the
+      optimizer will use, regardless of GPU count. Cleanest semantics.
+      Recommended for all new configs.
+
+    Changes in per-gpu batch_size still warrant rescaling: in ``"global"``
+    semantics, just multiply ``rate`` and ``min`` by the batch ratio.
     """
 
-    rate: NonNegativeFloat = Field(example=0.625e-4)  # TODO(Helen): Could be computed by pydantic
-    "Initial learning rate. Is adjusteed according to the hardware configuration"
+    semantics: Literal["per_rank_legacy", "per_rank", "global"] = "per_rank_legacy"
+    "How rate/min are interpreted relative to optimizer LR. See class docstring."
+    rate: NonNegativeFloat = Field(example=0.625e-4)
+    "Initial learning rate, interpreted per ``semantics``."
     iterations: NonNegativeInt = Field(example=300000)
     "Number of iterations."
     min: NonNegativeFloat = Field(example=3e-7)
-    "Minimum learning rate."
+    "Minimum learning rate, interpreted per ``semantics``."
     warmup: NonNegativeInt = Field(example=1000)
     "Number of warm up iteration. Default to 1000."
 
@@ -172,6 +191,7 @@ class VariableLevelScalerTargets(str, Enum):
     polynomial_sclaer = "anemoi.training.losses.scalers.PolynomialVariableLevelScaler"
     no_scaler = "anemoi.training.losses.scalers.NoVariableLevelScaler"
     model_level_scaler = "anemoi.training.losses.scalers.ModelLevelReluVariableLevelScaler"
+    level_average_scaler = "anemoi.training.losses.scalers.LevelAverageScaler"
 
 
 class VariableLevelScalerSchema(BaseModel):
@@ -181,10 +201,10 @@ class VariableLevelScalerSchema(BaseModel):
     )
     group: str = Field(example="pl")
     "Group of variables to scale."
-    slope: float = Field(example=1.0)
-    "Slope of scaling function."
-    y_intercept: float = Field(example=0.001)
-    "Y-axis shift of scaling function."
+    slope: float = Field(default=0.0, example=1.0)
+    "Slope of scaling function (unused by NoVariableLevelScaler / LevelAverageScaler)."
+    y_intercept: float = Field(default=1.0, example=0.001)
+    "Y-axis shift of scaling function (unused by NoVariableLevelScaler / LevelAverageScaler)."
 
 
 class GraphNodeAttributeScalerSchema(BaseModel):
@@ -237,12 +257,18 @@ class ImplementedLossesUsingBaseLossSchema(str, Enum):
     huber = "anemoi.training.losses.HuberLoss"
     rmse_norm = "anemoi.training.losses.RMSELossNormalized"
     combined = "anemoi.training.losses.combined.CombinedLoss"
+    graphcast_combined = "anemoi.training.losses.graphcast_combined.GraphCastCombinedLoss"
+    graphcast_full = "anemoi.training.losses.graphcast_full.GraphCastFullLoss"
+    horizontal_gradient = "anemoi.training.losses.horizontal_gradient.HorizontalGradientLoss"
+    graphcast_wind = "anemoi.training.losses.graphcast_wind.GraphCastWindAwareLoss"
     graphcast_mse = "anemoi.training.losses.GraphCastMSELoss"
     graphcast_huber = "anemoi.training.losses.GraphCastHuberLoss"
     graphcast_logcosh = "anemoi.training.losses.GraphCastLogCoshLoss"
     graphcast_clipped_mse = "anemoi.training.losses.GraphCastClippedMSELoss"
     graphcast_pseudo_huber = "anemoi.training.losses.GraphCastPseudoHuberLoss"
     graphcast_gaussian_nll = "anemoi.training.losses.GraphCastGaussianNLLLoss"
+    fcl = "anemoi.training.losses.spectral.FourierCorrelationLoss"
+    lsd = "anemoi.training.losses.spectral.LogSpectralDistance"
 
 
 class BaseLossSchema(BaseModel):
@@ -288,6 +314,18 @@ class HuberLossSchema(BaseLossSchema):
     "Threshold for Huber loss."
 
 
+class SpectralLossSchema(BaseLossSchema):
+    """Spectral loss class (upstream consolidated module)."""
+
+    transform: Literal["fft2d", "sht"] = Field(..., example="fft2d")
+    """Type of spectral transform to use."""
+
+    class Config(BaseModel.Config):
+        """Override to allow extra parameters for spectral transforms."""
+
+        extra = "allow"
+
+
 class LogFFT2DistanceSchema(BaseLossSchema):
     """Schema for LogFFT2Distance (log-spectral distance) loss.
 
@@ -319,8 +357,9 @@ class SpectralAmplitudeLossSchema(BaseLossSchema):
     """
 
     target_: Literal[
-        "anemoi.training.losses.msh.SpectralAmplitudeLoss",
-        "anemoi.training.losses.msh.MSHLoss",
+        "anemoi.training.losses.graphcast_msh.GraphCastMSHLoss",
+        "anemoi.training.losses.graphcast_msh.SpectralAmplitudeLoss",
+        "anemoi.training.losses.graphcast_msh.MSHLoss",
     ] = Field(..., alias="_target_")
     "Modified Spherical Harmonic / spectral amplitude loss."
     x_dim: int = Field(..., example=246)
@@ -444,8 +483,9 @@ class CombinedLossSchema(BaseLossSchema):
         | FourierCorrelationLossSchema
         | SpectralAmplitudeLossSchema
         | SpatialGradientLossSchema
+        | SpectralLossSchema
     ] = Field(min_length=1)
-    "Losses to combine, can be any of the normal losses or a spatial loss (LogFFT2Distance, FourierCorrelation, SpectralAmplitude/MSH, SpatialGradient)."
+    "Losses to combine, can be any of the normal losses or a spatial/spectral loss."
     loss_weights: list[int | float] | None = None
     "Weightings of losses, if not set, all losses are weighted equally."
 
@@ -471,12 +511,153 @@ class CombinedLossSchema(BaseLossSchema):
         return self
 
 
+class GraphCastCombinedLossSchema(CombinedLossSchema):
+    """GraphCastCombinedLoss is a CombinedLoss subclass that routes set_data_indices to children.
+
+    Schema-wise it's identical to CombinedLossSchema — same losses list and
+    loss_weights — it only differs at runtime.
+    """
+
+    target_: Literal[
+        "anemoi.training.losses.graphcast_combined.GraphCastCombinedLoss",
+    ] = Field(..., alias="_target_")
+
+
+class _WrappedInnerLossSchema(BaseModel):
+    """Minimal schema for an `inner_loss` dict inside a loss-wrapper (HGL, Wind).
+
+    Accepts a DictConfig with a `_target_` key pointing to any known loss and
+    any extra fields that the target loss class may require. Strict key
+    checking is delegated to the target loss's own schema at runtime; the
+    wrapper itself only enforces the presence of `_target_`.
+    """
+
+    model_config = {"extra": "allow", "populate_by_name": True}
+    target_: str = Field(..., alias="_target_")
+
+
+class HorizontalGradientLossSchema(BaseLossSchema):
+    """Schema for HorizontalGradientLoss (FastNet Sec. 5 gradient augmentation)."""
+
+    target_: Literal[
+        "anemoi.training.losses.horizontal_gradient.HorizontalGradientLoss",
+    ] = Field(..., alias="_target_")
+    inner_loss: _WrappedInnerLossSchema = Field(...)
+    "Inner loss to which gradient-augmented inputs are passed."
+    x_dim: int = Field(..., example=246)
+    y_dim: int = Field(..., example=246)
+    n_vars: int = Field(..., example=117)
+    "Number of output variables — sizes the online σ_∂x / σ_∂y buffers."
+    raw_weight: float = 1.0
+    dx_weight: float = 1.0
+    dy_weight: float = 1.0
+    normalize_gradients: bool = True
+    distributed_stats: bool = True
+
+
+class GraphCastWindAwareLossSchema(BaseLossSchema):
+    """Schema for GraphCastWindAwareLoss (FastNet wind decomposition)."""
+
+    target_: Literal[
+        "anemoi.training.losses.graphcast_wind.GraphCastWindAwareLoss",
+    ] = Field(..., alias="_target_")
+    inner_loss: _WrappedInnerLossSchema = Field(...)
+    "Inner loss applied to direction-decomposed + speed-only inputs."
+    speed_weight: float = 5.0
+    "FastNet Eq. 10: λ_speed multiplier on the speed contribution."
+    epsilon: float = 1e-6
+    "Small constant inside sqrt(u² + v² + ε²) to avoid s → 0 blow-ups."
+    u_v_pairs: Optional[list[list[str]]] = None
+    "Optional override of u/v variable-name pairs. If None, auto-detect."
+
+
+class GraphCastFullLossSchema(BaseLossSchema):
+    """Schema for GraphCastFullLoss — flat FastNet stack in one class.
+
+    Replaces the HorizontalGradient → Wind → Combined[MSE+MSH] nested stack.
+    Ablate any term by setting its weight to 0; zero-weight terms are not
+    computed and (in the MSH/Welford cases) not instantiated.
+    """
+
+    target_: Literal[
+        "anemoi.training.losses.graphcast_full.GraphCastFullLoss",
+    ] = Field(..., alias="_target_")
+    x_dim: int = Field(..., example=246)
+    y_dim: int = Field(..., example=246)
+    n_vars: int = Field(..., example=117)
+    raw_mse_weight: float = 1.0
+    raw_msh_weight: float = 1.0
+    grad_x_weight: float = 1.0
+    grad_y_weight: float = 1.0
+    wind_speed_weight: float = 5.0
+    wind_dir_weight: float = 1.0
+    coherence_weight: float = 1.0
+    use_gamma_k: bool = True
+    gamma_k_min: float = 1.0
+    use_variable_normalization: bool = True
+    normalize_gradients: bool = True
+    epsilon: float = 1.0e-6
+    grad_var_weights: Optional[dict[str, NonNegativeFloat]] = None
+    "Per-variable weights for the ∂x/∂y terms only. Keys are output-variable names "
+    "(e.g. ``qv_33``) or level-stripped group stems (e.g. ``pressure``). 0 fully ablates "
+    "that variable's gradient contribution; ``default`` (if set) covers unmatched names."
+    u_v_pairs: Optional[list[list[str]]] = None
+    distributed_stats: bool = True
+    mse_scalers: Optional[list[str]] = None
+    msh_scalers: Optional[list[str]] = None
+    precomputed_stats_path: Optional[str] = None
+    column_mass_flux_weight: NonNegativeFloat = 0.0
+    "Weight on the column-mass-flux conservation term. Penalises domain-mean "
+    "(Σ w_lev · Δp_lev) mismatch between prediction and target. 0 disables. "
+    "Targets the compensating-subsidence failure mode: ML emulators often fail to "
+    "produce mass-balanced compensating flow around convective columns, leading to "
+    "spurious net upward mass flux that drives upper-level theta drift over rollout."
+    w_var_names: Optional[list[str]] = None
+    "Output-variable names representing W at each retained vertical level, ordered "
+    "low-to-high in altitude. If None, autodetected by matching ``w_<level_int>``."
+    w_level_pressure_weights: Optional[list[float]] = None
+    "Δp weights (Pa) per W level for the column integral, same length and order as "
+    "``w_var_names``. If None, uniform weighting is used (less physical but works). "
+    "Typically computed from US Standard Atmosphere at each level's zeta height."
+    hydrostatic_weight: NonNegativeFloat = 0.0
+    "Weight on the hydrostatic-balance soft constraint. Penalises per-pixel deviation "
+    "from the hypsometric equation at each adjacent level pair via an error-tolerant "
+    "loss f(r/α) = (r/α)² / (1 + exp(1 - (r/α)²)). Below α the loss is ≈0 (tolerates "
+    "GRAF's natural non-hydrostatic imbalance from convection); above α it approaches "
+    "MSE. 0 disables. Targets the same lid-drift failure mode as column_mass_flux but "
+    "by enforcing the underlying invariant directly."
+    hydrostatic_alphas: Optional[list[float]] = None
+    "Per-level-pair tolerance α_k (K) for the error-tolerant loss. Length must be "
+    "len(hydrostatic_z_levels) - 1. Calibrated from the training-zarr natural "
+    "distribution of r_k via α_k = Q_k(p) · √(W₀(1) + 1) ≈ Q_k(50%) × 1.252 "
+    "(precompute_hydrostatic_alphas.py)."
+    hydrostatic_z_levels: Optional[list[float]] = None
+    "Fixed zeta-level heights (m), ordered low-to-high in altitude, one per resolved "
+    "pressure/theta/qv output variable. dz_k = z_k - z_{k-1} is computed internally."
+    hydrostatic_p_var_names: Optional[list[str]] = None
+    "Output-variable names for pressure at each retained vertical level, ordered to "
+    "match ``hydrostatic_z_levels``. If None, autodetected by matching "
+    "``pressure_<level_int>`` and sorting by level."
+    hydrostatic_theta_var_names: Optional[list[str]] = None
+    "Output-variable names for potential temperature at each level, same ordering as "
+    "``hydrostatic_p_var_names``. If None, autodetected by matching ``theta_<level_int>``."
+    hydrostatic_qv_var_names: Optional[list[str]] = None
+    "Output-variable names for water-vapor mixing ratio at each level, same ordering "
+    "as ``hydrostatic_p_var_names``. If None, autodetected by matching ``qv_<level_int>``."
+    "Path to anemoi zarr containing statistics_msh_beta / statistics_gradient_{x,y}_stdev. Skips online Welford."
+
+
 LossSchemas = (
     BaseLossSchema
     | HuberLossSchema
     | CombinedLossSchema
+    | GraphCastCombinedLossSchema
+    | GraphCastFullLossSchema
+    | HorizontalGradientLossSchema
+    | GraphCastWindAwareLossSchema
     | AlmostFairKernelCRPSSchema
     | KernelCRPSSchema
+    | SpectralLossSchema
     | MultiScaleLossSchema
     | GraphCastMSELossSchema
     | GraphCastHuberLossSchema
@@ -554,6 +735,11 @@ class BaseTrainingSchema(BaseModel):
     "Config for stochastic weight averaging."
     ewa: EWA = Field(default_factory=EWA)
     "Config for exponential weight averaging."
+    input_noise_sigma: NonNegativeFloat = Field(default=0.0)
+    """Standard deviation of Gaussian noise added to model inputs during training
+    (in normalized state space). Only honored when ``training.model_task`` resolves
+    to a forecaster that reads it (e.g. grafai.training.NoisyResidualForecaster).
+    0.0 disables noise. Typical values: 0.01-0.10."""
     training_loss: LossSchemas
     "Training loss configuration."
     loss_gradient_scaling: bool = False

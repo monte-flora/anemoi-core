@@ -418,13 +418,19 @@ class GraphCastBaseLoss(FunctionalLoss):
         Parameters
         ----------
         data_indices : IndexCollection
-            Collection of data indices from the model.
+            Collection of data indices from the model. May be None when
+            this loss is a child inside ``GraphCastCombinedLoss``; in that
+            case the parent will re-invoke set_data_indices with the real
+            data_indices once it receives them, so skipping here is safe.
 
         Raises
         ------
         ValueError
             If any variable group has non-contiguous indices.
         """
+        if data_indices is None:
+            # Child-of-CombinedLoss init path: parent will set it properly later.
+            return
         self.data_indices = data_indices
         self.variable_groups = self._build_variable_groups()
 

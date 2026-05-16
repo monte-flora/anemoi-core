@@ -13,6 +13,7 @@ from .node_attributes import GraphNodeAttributeScaler
 from .node_attributes import ReweightedGraphNodeAttributeScaler
 from .scalers import create_scalers
 from .variable import GeneralVariableLossScaler
+from .level_average import LevelAverageScaler
 from .variable_level import LinearVariableLevelScaler
 from .variable_level import NoVariableLevelScaler
 from .variable_level import PolynomialVariableLevelScaler
@@ -26,6 +27,7 @@ from .variable_tendency import VarTendencyScaler
 __all__ = [
     "GeneralVariableLossScaler",
     "GraphNodeAttributeScaler",
+    "LevelAverageScaler",
     "LinearVariableLevelScaler",
     "NaNMaskScaler",
     "NoTendencyScaler",

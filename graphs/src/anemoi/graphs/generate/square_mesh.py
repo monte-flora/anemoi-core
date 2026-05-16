@@ -40,73 +40,77 @@ class TriangularMesh(NamedTuple):
 
 def rectangular_tri_mesh(ncells_x: int, ncells_y: int,
                          x_min: float, x_max: float,
-                         y_min: float, y_max: float) -> TriangularMesh:
+                         y_min: float, y_max: float,
+                         include_cell_centers: bool = True) -> TriangularMesh:
     """Create a rectangular triangular mesh using linspace coordinates.
 
     Creates a uniform grid via linspace (guaranteeing coverage of [x_min, x_max]
-    and [y_min, y_max]), adds cell centers, and builds 4 counter-clockwise
-    triangles per cell.
+    and [y_min, y_max]) and builds the triangulation.
+
+    Two triangulation modes:
+
+    * ``include_cell_centers=True`` (default): adds a vertex at each cell
+      center and connects it to the 4 corners, producing 4 isotropic triangles
+      per cell (8 edges per cell before dedup). Vertices live at both corner
+      and half-step positions.
+    * ``include_cell_centers=False``: splits each cell with a single
+      bottom-left-to-top-right diagonal, producing 2 triangles per cell
+      (5 edges per cell before dedup). Every vertex coincides exactly with
+      a linspace corner — so when used with ``create_rectangular_mesh_hierarchy``
+      and factor-2 doubling, **every coarse-level vertex is a vertex of every
+      finer level** and coarse edges are straight unions of collinear fine
+      edges (perfect multi-scale nesting, no off-grid spoke vertices).
 
     Parameters
     ----------
-    ncells_x : int
-        Number of cells in x-direction.
-    ncells_y : int
-        Number of cells in y-direction.
-    x_min, x_max : float
-        Domain bounds in x (grid-point units).
-    y_min, y_max : float
-        Domain bounds in y (grid-point units).
-
-    Returns
-    -------
-    TriangularMesh
-        Mesh with vertices in grid-point coordinates and triangular faces.
+    ncells_x, ncells_y : int
+        Number of cells in each direction.
+    x_min, x_max, y_min, y_max : float
+        Domain bounds in grid-point units.
+    include_cell_centers : bool
+        See mode description above.
     """
     x_coords = np.linspace(x_min, x_max, ncells_x + 1, dtype=np.float64)
     y_coords = np.linspace(y_min, y_max, ncells_y + 1, dtype=np.float64)
 
     n_x = len(x_coords)  # ncells_x + 1
-    n_y = len(y_coords)  # ncells_y + 1
 
     # Create 2D grid: vertices[j, i] at position (x_coords[i], y_coords[j])
     xx, yy = np.meshgrid(x_coords, y_coords)
     grid_vertices = np.stack([xx.ravel(), yy.ravel()], axis=-1)
     n_grid = len(grid_vertices)
 
-    # Compute cell centers
-    cx = (x_coords[:-1] + x_coords[1:]) / 2.0
-    cy = (y_coords[:-1] + y_coords[1:]) / 2.0
-    cxx, cyy = np.meshgrid(cx, cy)
-    centers = np.stack([cxx.ravel(), cyy.ravel()], axis=-1)
-
-    # Concatenate grid vertices + cell centers
-    vertices = np.concatenate([grid_vertices, centers], axis=0)
-
-    # Build 4 triangles per cell
-    # For cell (j, i): corners are grid indices [j*n_x+i, j*n_x+i+1, (j+1)*n_x+i, (j+1)*n_x+i+1]
-    # Center index is n_grid + j*(n_x-1) + i
     jj, ii = np.meshgrid(np.arange(ncells_y), np.arange(ncells_x), indexing="ij")
     jj = jj.ravel()
     ii = ii.ravel()
 
-    bl = jj * n_x + ii          # bottom-left
-    br = jj * n_x + ii + 1      # bottom-right
-    tl = (jj + 1) * n_x + ii    # top-left
+    bl = jj * n_x + ii            # bottom-left
+    br = jj * n_x + ii + 1        # bottom-right
+    tl = (jj + 1) * n_x + ii      # top-left
     tr = (jj + 1) * n_x + ii + 1  # top-right
-    c = n_grid + jj * ncells_x + ii  # center
 
-    # 4 triangles per cell (counter-clockwise orientation)
-    faces = np.stack([
-        np.stack([bl, br, c], axis=-1),  # bottom
-        np.stack([br, tr, c], axis=-1),  # right
-        np.stack([tr, tl, c], axis=-1),  # top
-        np.stack([tl, bl, c], axis=-1),  # left
-    ], axis=1).reshape(-1, 3)
+    if include_cell_centers:
+        cx = (x_coords[:-1] + x_coords[1:]) / 2.0
+        cy = (y_coords[:-1] + y_coords[1:]) / 2.0
+        cxx, cyy = np.meshgrid(cx, cy)
+        centers = np.stack([cxx.ravel(), cyy.ravel()], axis=-1)
+        vertices = np.concatenate([grid_vertices, centers], axis=0)
+        c = n_grid + jj * ncells_x + ii
+        faces = np.stack([
+            np.stack([bl, br, c], axis=-1),  # bottom
+            np.stack([br, tr, c], axis=-1),  # right
+            np.stack([tr, tl, c], axis=-1),  # top
+            np.stack([tl, bl, c], axis=-1),  # left
+        ], axis=1).reshape(-1, 3)
+    else:
+        # 2 triangles per cell, split by the BL -> TR diagonal (CCW).
+        vertices = grid_vertices
+        faces = np.stack([
+            np.stack([bl, br, tr], axis=-1),  # lower-right triangle
+            np.stack([bl, tr, tl], axis=-1),  # upper-left triangle
+        ], axis=1).reshape(-1, 3)
 
-    # Verify counter-clockwise orientation
     _ensure_ccw(vertices, faces)
-
     return TriangularMesh(vertices=vertices, faces=faces)
 
 
@@ -122,7 +126,8 @@ def _ensure_ccw(vertices: np.ndarray, faces: np.ndarray) -> None:
 
 
 def create_rectangular_mesh_hierarchy(ny: int, nx_: int, resolution: int,
-                                      dx_finest: float, offset: int = 2) -> list[TriangularMesh]:
+                                      dx_finest: float, offset: int = 2,
+                                      include_cell_centers: bool = True) -> list[TriangularMesh]:
     """Create nested mesh hierarchy with full domain coverage at every level.
 
     Uses linspace (coverage-first) so every level spans the full domain
@@ -168,7 +173,8 @@ def create_rectangular_mesh_hierarchy(ny: int, nx_: int, resolution: int,
         ncells_x = ncells_x_fine // divisor
         ncells_y = ncells_y_fine // divisor
 
-        mesh = rectangular_tri_mesh(ncells_x, ncells_y, x_min, x_max, y_min, y_max)
+        mesh = rectangular_tri_mesh(ncells_x, ncells_y, x_min, x_max, y_min, y_max,
+                                    include_cell_centers=include_cell_centers)
         meshes.append(mesh)
 
     return meshes

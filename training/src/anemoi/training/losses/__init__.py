@@ -11,6 +11,7 @@ from .combined import CombinedLoss
 from .graphcast_gaussian_nll import GraphCastGaussianNLLLoss
 from .graphcast_huber import GraphCastHuberLoss
 from .graphcast_logcosh import GraphCastLogCoshLoss
+from .graphcast_mahalanobis import GraphCastMahalanobisLoss
 from .graphcast_mse import GraphCastMSELoss
 from .graphcast_robust import GraphCastClippedMSELoss
 from .graphcast_robust import GraphCastPseudoHuberLoss
@@ -24,25 +25,32 @@ from .mse import MSELoss
 from .multiscale import MultiscaleLossWrapper
 from .normalized_rmse import RMSELossNormalized
 from .rmse import RMSELoss
+from .spectral import FourierCorrelationLoss
+from .spectral import LogSpectralDistance
+from .spectral import SpectralL2Loss
 from .weighted_mse import WeightedMSELoss
 
 __all__ = [
     "AlmostFairKernelCRPS",
     "CombinedLoss",
+    "FourierCorrelationLoss",
     "GraphCastClippedMSELoss",
     "GraphCastGaussianNLLLoss",
     "GraphCastHuberLoss",
     "GraphCastLogCoshLoss",
+    "GraphCastMahalanobisLoss",
     "GraphCastMSELoss",
     "GraphCastPseudoHuberLoss",
     "HuberLoss",
     "KernelCRPS",
     "LogCoshLoss",
+    "LogSpectralDistance",
     "MAELoss",
     "MSELoss",
     "MultiscaleLossWrapper",
     "RMSELoss",
     "RMSELossNormalized",
+    "SpectralL2Loss",
     "WeightedMSELoss",
     "get_loss_function",
 ]

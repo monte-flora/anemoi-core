@@ -33,8 +33,14 @@ def migrate(ckpt: CkptType) -> CkptType:
     CkptType
         The migrated checkpoint dict.
     """
-    num_layers = ckpt["hyper_parameters"]["config"].model.processor.num_layers
-    num_chunks = ckpt["hyper_parameters"]["config"].model.processor.num_chunks
+    # No-op for model schemas without a `processor` block (e.g. DiT models,
+    # whose state_dict has no `processor.proc.*` keys to rewrite).
+    config = ckpt["hyper_parameters"]["config"]
+    if not hasattr(config.model, "processor"):
+        return ckpt
+
+    num_layers = config.model.processor.num_layers
+    num_chunks = config.model.processor.num_chunks
     state_dict = ckpt["state_dict"]
 
     blocks_per_chunk = num_layers // num_chunks

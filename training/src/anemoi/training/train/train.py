@@ -371,21 +371,18 @@ class AnemoiTrainer(ABC):
         LOGGER.info("Total number of prognostic variables: %d", num_fc_features)
         LOGGER.info("Total number of auxiliary variables: %d", len(self.config.data.forcing))
 
-        # Log learning rate multiplier when running single-node, multi-GPU and/or multi-node
+        # Resolve and log the actual optimizer LR via the central helper.
+        from anemoi.training.utils.lr_resolution import log_lr_banner
         total_number_of_model_instances = (
             self.config.system.hardware.num_nodes
             * self.config.system.hardware.num_gpus_per_node
             / self.config.system.hardware.num_gpus_per_model
         )
-
         LOGGER.info(
-            "Total GPU count / model group size: %d - NB: the learning rate will be scaled by this factor!",
+            "Total GPU count / model group size: %d (legacy LR multiplier).",
             total_number_of_model_instances,
         )
-        LOGGER.info(
-            "Effective learning rate: %.3e",
-            int(total_number_of_model_instances) * self.config.training.lr.rate,
-        )
+        log_lr_banner(self.config, source="trainer_setup")
 
         if self.config.training.max_epochs is not None and self.config.training.max_steps not in (None, -1):
             LOGGER.info(

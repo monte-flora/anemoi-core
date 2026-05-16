@@ -71,12 +71,14 @@ class LimitedAreaSquareNodes(LimitedAreaIcosahedralNodes):
         offset: int = 2,
         margin_radius_km: float = 100.0,
         mask_attr_name: str | None = None,
+        include_cell_centers: bool = True,
     ) -> None:
         self.nx_grid = nx_grid
         self.ny_grid = ny_grid
         self.offset = offset
         self.dx_finest = dx_finest
         self._resolution = resolution
+        self.include_cell_centers = include_cell_centers
 
         super().__init__(
             resolution=resolution,
@@ -136,6 +138,7 @@ class LimitedAreaSquareNodes(LimitedAreaIcosahedralNodes):
             resolution=self._resolution,
             dx_finest=self.dx_finest,
             offset=self.offset,
+            include_cell_centers=self.include_cell_centers,
         )
 
         # Finest mesh is last in hierarchy

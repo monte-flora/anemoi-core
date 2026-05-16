@@ -25,6 +25,8 @@ class ImplementedEdgeAttributeSchema(str, Enum):
     gaussian_weights = "anemoi.graphs.edges.attributes.GaussianDistanceWeights"
     radial_basis_features = "anemoi.graphs.edges.attributes.RadialBasisFeatures"
     edge_relative_position_3d = "anemoi.graphs.edges.attributes.EdgeRelativePosition3D"
+    edge_tangent_plane_position = "anemoi.graphs.edges.attributes.EdgeTangentPlanePosition"
+    edge_grid_index_position = "anemoi.graphs.edges.attributes.EdgeGridIndexPosition"
 
 
 class BaseEdgeAttributeSchema(BaseModel):
@@ -69,10 +71,28 @@ class EdgeRelativePosition3DSchema(BaseModel):
     "Normalisation method applied across all 4 feature components."
 
 
+class EdgeTangentPlanePositionSchema(BaseModel):
+    target_: Literal["anemoi.graphs.edges.attributes.EdgeTangentPlanePosition"] = Field(..., alias="_target_")
+    "3D location-invariant edge features [distance_km, dx_east_km, dy_north_km] in receiver's tangent plane"
+    norm: ImplementedNormalisationSchema = Field(example="unit-max")
+    "Normalisation method applied across all 3 feature components."
+
+
+class EdgeGridIndexPositionSchema(BaseModel):
+    target_: Literal["anemoi.graphs.edges.attributes.EdgeGridIndexPosition"] = Field(..., alias="_target_")
+    "3D grid-index edge features [distance_pix, di, dj] — bit-invariant across patches"
+    norm: ImplementedNormalisationSchema | None = Field(default="unit-max", example="unit-max")
+    "Normalisation method (empirical, per-graph). Ignored if ``divisor`` is set."
+    divisor: float | None = Field(default=None, example=4.5)
+    "Fixed divisor in cell-units (overrides ``norm``). Pin for cross-graph stability."
+
+
 EdgeAttributeSchema = (
     BaseEdgeAttributeSchema
     | EdgeAttributeFromNodeSchema
     | DirectionalHarmonicsSchema
     | RadialBasisFeaturesSchema
     | EdgeRelativePosition3DSchema
+    | EdgeTangentPlanePositionSchema
+    | EdgeGridIndexPositionSchema
 )
