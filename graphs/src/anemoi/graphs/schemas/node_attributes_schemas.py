@@ -75,13 +75,29 @@ class NonmissingAnemoiDatasetVariableSchema(BaseModel):
 class DatasetVariableMaskSchema(BaseModel):
     target_: Literal["anemoi.graphs.nodes.attributes.DatasetVariableMask"] = Field(..., alias="_target_")
     (
-        
+
         "Implementation of a mask read directly from an Anemoi dataset (Zarr store) "
         "from anemoi.graphs.nodes.attributes."
     )
     variable: str
-    "The anemoi-datasets variable to use."    
-    
+    "The anemoi-datasets variable to use."
+
+
+class GridIndexPositionSchema(BaseModel):
+    target_: Literal["anemoi.graphs.nodes.attributes.GridIndexPosition"] = Field(..., alias="_target_")
+    (
+        "Grid-index (i, j) position of each node on a template NWP grid, "
+        "from anemoi.graphs.nodes.attributes. Data nodes receive integer (i, j); "
+        "hidden / mesh nodes receive fractional (i, j) via inverse-distance "
+        "KNN on the template lat/lon."
+    )
+    field_shape: list[int] = Field(..., examples=[[250, 250]])
+    "[H, W] of the template NWP grid."
+    reference_dataset: str
+    "Path to the anemoi zarr store whose latitudes/longitudes define the (i,j) ↔ (lat,lon) mapping."
+    n_neighbours: int = 4
+    "Number of nearest template cells averaged when interpolating a node's (i, j)."
+
 
 SingleAttributeSchema = (
     PlanarAreaWeightSchema
@@ -91,6 +107,7 @@ SingleAttributeSchema = (
     | GridsMaskSchema
     | NonmissingAnemoiDatasetVariableSchema
     | DatasetVariableMaskSchema
+    | GridIndexPositionSchema
 )
 
 

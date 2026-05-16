@@ -416,3 +416,134 @@ class EdgeRelativePosition3D(BasePositionalBuilder):
         distance = torch.linalg.norm(rel_pos, dim=-1, keepdim=True)
 
         return torch.cat([distance, rel_pos], dim=-1)
+
+
+class EdgeTangentPlanePosition(BasePositionalBuilder):
+    """Location-invariant edge features in the receiver's local east/north tangent plane.
+
+    For each edge (sender → receiver), returns a 3-D feature vector
+
+        [distance_km, dx_east_km, dy_north_km]
+
+    computed in the tangent plane at the receiver's lat/lon using the
+    standard small-angle formulas
+
+        dy_north = R * (lat_s - lat_r)
+        dx_east  = R * cos(lat_r) * unwrap(lon_s - lon_r)
+        distance = sqrt(dx_east^2 + dy_north^2)
+
+    where ``R = 6371 km`` and ``unwrap`` maps Δlon to ``[-π, π]`` so
+    antimeridian crossings do not blow up.
+
+    Why this matters for template / patch graphs
+    --------------------------------------------
+    For patches sampled from a fixed regular km-spaced grid (e.g. HRRR 4 km
+    LCC), two neighbouring cells are separated by the same local east/north
+    offset regardless of where on Earth the patch sits. That means the
+    (distance, dx_east, dy_north) computed here is *identical* across all
+    patches for the same cell-index pair — so a graph built once from any
+    template patch can be reused at any other location without retraining.
+
+    This differs from :class:`EdgeRelativePosition3D`, which rotates into a
+    receiver-local 3-D frame; that frame is approximately invariant for
+    small patches but has O((L/R)^2) curvature error (~1% for L=1000 km).
+
+    With ``norm="unit-max"``, all three features are divided by
+    ``max(distance)`` across edges, giving distance in ``[0, 1]`` and
+    positions in ``[-1, 1]``.
+    """
+
+    EARTH_RADIUS_KM: float = 6371.0
+
+    def compute(self, x_i: torch.Tensor, x_j: torch.Tensor) -> torch.Tensor:
+        # x_i: receiver, x_j: sender; both [N, 2] in radians as (lat, lon).
+        lat_r = x_i[:, self._idx_lat]
+        lon_r = x_i[:, self._idx_lon]
+        lat_s = x_j[:, self._idx_lat]
+        lon_s = x_j[:, self._idx_lon]
+
+        dlat = lat_s - lat_r
+        two_pi = 2.0 * torch.pi
+        dlon = torch.remainder(lon_s - lon_r + torch.pi, two_pi) - torch.pi
+
+        dy_north = self.EARTH_RADIUS_KM * dlat
+        dx_east = self.EARTH_RADIUS_KM * torch.cos(lat_r) * dlon
+        distance = torch.sqrt(dx_east * dx_east + dy_north * dy_north)
+
+        return torch.stack([distance, dx_east, dy_north], dim=-1)
+
+
+class EdgeGridIndexPosition(BaseEdgeAttributeBuilder):
+    """Location-invariant edge features in NWP grid-index coordinates.
+
+    For each edge (sender → receiver), returns a 3-D feature vector
+
+        [distance_pix, di, dj]
+
+    where ``(i, j)`` is the integer/fractional row/column index of a node
+    on the underlying NWP grid (``H × W``), not a physical distance. The
+    sender/receiver ``(i, j)`` is provided by
+    :class:`anemoi.graphs.nodes.attributes.GridIndexPosition`:
+
+    * Data nodes inherit their own cell's ``(i, j)`` exactly.
+    * Hidden / icosahedron mesh nodes get a bilinear-style ``(i, j)``
+      via inverse distance weighting against the template lat/lon.
+
+    Because ``(i, j)`` is the cell identity — not an Earth-surface offset
+    — the resulting edge features are **bit-identical across patches**
+    for patches slicing the same source grid at different CONUS locations.
+    This is the cleanest representation for a template-graph approach
+    where one graph is reused at every patch location.
+
+    Parameters
+    ----------
+    norm : str | None, default "unit-max"
+        Normalisation applied via ``NormaliserMixin`` from the empirical
+        statistics of *this* graph's edge features. Convenient for a
+        single-graph workflow but the divisor moves between graphs of
+        different size — e.g. on an LCC-projected dataset the empirical
+        max edge length in (i, j) cells grows with the latitude range
+        the graph spans. A checkpoint trained on small patches and
+        deployed on a larger inference domain therefore sees a shifted
+        feature distribution. Pin ``divisor`` instead in that case.
+    divisor : float | None, default None
+        If set, divide all three channels (distance, di, dj) by this
+        fixed value and ignore ``norm``. The divisor lives in the same
+        cell-units as :meth:`compute` returns. For an encoder edge set
+        with an 18 km physical cutoff and a nominally ~4 km/cell dataset
+        the natural divisor is ``18.0 / 4.0 = 4.5``. Tying the divisor to
+        the recipe rather than the empirical max of the graph makes edge
+        features bit-identical across graphs of different sizes (same
+        recipe → same divisor → same input distribution at training and
+        at inference).
+    """
+
+    node_attr_name: str = "grid_ij"
+
+    def __init__(
+        self,
+        norm: str | None = "unit-max",
+        divisor: float | None = None,
+        dtype: str = "float32",
+    ) -> None:
+        super().__init__(norm=norm, dtype=dtype)
+        if divisor is not None and float(divisor) <= 0:
+            raise ValueError(f"divisor must be positive, got {divisor}")
+        self.divisor = float(divisor) if divisor is not None else None
+        if self.divisor is not None and self.norm not in (None, "unit-max"):
+            LOGGER.info(
+                "EdgeGridIndexPosition: explicit divisor=%g overrides norm=%r",
+                self.divisor, self.norm,
+            )
+
+    def compute(self, x_i: torch.Tensor, x_j: torch.Tensor) -> torch.Tensor:
+        # x_i: receiver (target), x_j: sender (source); both [N, 2] as (i, j)
+        di = x_j[:, 0] - x_i[:, 0]
+        dj = x_j[:, 1] - x_i[:, 1]
+        distance = torch.sqrt(di * di + dj * dj)
+        return torch.stack([distance, di, dj], dim=-1)
+
+    def aggregate(self, edge_features, index, ptr=None, dim_size=None):
+        if self.divisor is not None:
+            return edge_features / self.divisor
+        return self.normalise(edge_features, index, dim_size)

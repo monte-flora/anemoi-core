@@ -25,6 +25,7 @@ from .builders.from_refined_icosahedron import LimitedAreaHexNodes
 from .builders.from_refined_icosahedron import LimitedAreaTriNodes
 from .builders.from_refined_icosahedron import StretchedTriNodes
 from .builders.from_refined_icosahedron import TriNodes
+from .builders.from_square_mesh import LimitedAreaSquareNodes
 from .builders.from_vectors import LatLonNodes
 
 __all__ = [
@@ -38,6 +39,7 @@ __all__ = [
     "LimitedAreaNPZFileNodes",
     "LimitedAreaTriNodes",
     "LimitedAreaHexNodes",
+    "LimitedAreaSquareNodes",
     "ReducedGaussianGridNodes",
     "StretchedTriNodes",
     "ICONMultimeshNodes",
