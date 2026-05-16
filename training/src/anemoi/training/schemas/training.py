@@ -79,16 +79,34 @@ class Rollout(BaseModel):
 class LR(BaseModel):
     """Learning rate configuration.
 
-    Changes in per-gpu batch_size should come with a rescaling of the local_lr,
-    in order to keep a constant global_lr global_lr = local_lr * num_gpus_per_node * num_nodes / gpus_per_model.
+    ``semantics`` controls how ``rate`` and ``min`` are interpreted relative
+    to the actual optimizer LR the model sees during training:
+
+    - ``"per_rank_legacy"`` (default): legacy anemoi behaviour. ``rate`` is
+      multiplied by ``num_nodes × num_gpus_per_node / num_gpus_per_model``
+      to obtain the optimizer peak, but ``min`` is passed through literally
+      (no multiplier). Kept as the default so existing configs continue to
+      reproduce historical results; the asymmetry is a known footgun.
+    - ``"per_rank"``: same multiplier applied to ``rate`` AND ``min``. The
+      asymmetry is gone — cosine sweep span is now hardware-independent.
+      Recommended when migrating a per-rank config away from the legacy
+      behaviour without rewriting the literal numbers.
+    - ``"global"``: ``rate`` and ``min`` are the literal values the
+      optimizer will use, regardless of GPU count. Cleanest semantics.
+      Recommended for all new configs.
+
+    Changes in per-gpu batch_size still warrant rescaling: in ``"global"``
+    semantics, just multiply ``rate`` and ``min`` by the batch ratio.
     """
 
-    rate: NonNegativeFloat = Field(example=0.625e-4)  # TODO(Helen): Could be computed by pydantic
-    "Initial learning rate. Is adjusteed according to the hardware configuration"
+    semantics: Literal["per_rank_legacy", "per_rank", "global"] = "per_rank_legacy"
+    "How rate/min are interpreted relative to optimizer LR. See class docstring."
+    rate: NonNegativeFloat = Field(example=0.625e-4)
+    "Initial learning rate, interpreted per ``semantics``."
     iterations: NonNegativeInt = Field(example=300000)
     "Number of iterations."
     min: NonNegativeFloat = Field(example=3e-7)
-    "Minimum learning rate."
+    "Minimum learning rate, interpreted per ``semantics``."
     warmup: NonNegativeInt = Field(example=1000)
     "Number of warm up iteration. Default to 1000."
 
@@ -173,6 +191,7 @@ class VariableLevelScalerTargets(str, Enum):
     polynomial_sclaer = "anemoi.training.losses.scalers.PolynomialVariableLevelScaler"
     no_scaler = "anemoi.training.losses.scalers.NoVariableLevelScaler"
     model_level_scaler = "anemoi.training.losses.scalers.ModelLevelReluVariableLevelScaler"
+    level_average_scaler = "anemoi.training.losses.scalers.LevelAverageScaler"
 
 
 class VariableLevelScalerSchema(BaseModel):
@@ -182,10 +201,10 @@ class VariableLevelScalerSchema(BaseModel):
     )
     group: str = Field(example="pl")
     "Group of variables to scale."
-    slope: float = Field(example=1.0)
-    "Slope of scaling function."
-    y_intercept: float = Field(example=0.001)
-    "Y-axis shift of scaling function."
+    slope: float = Field(default=0.0, example=1.0)
+    "Slope of scaling function (unused by NoVariableLevelScaler / LevelAverageScaler)."
+    y_intercept: float = Field(default=1.0, example=0.001)
+    "Y-axis shift of scaling function (unused by NoVariableLevelScaler / LevelAverageScaler)."
 
 
 class GraphNodeAttributeScalerSchema(BaseModel):
@@ -578,11 +597,53 @@ class GraphCastFullLossSchema(BaseLossSchema):
     use_variable_normalization: bool = True
     normalize_gradients: bool = True
     epsilon: float = 1.0e-6
+    grad_var_weights: Optional[dict[str, NonNegativeFloat]] = None
+    "Per-variable weights for the ∂x/∂y terms only. Keys are output-variable names "
+    "(e.g. ``qv_33``) or level-stripped group stems (e.g. ``pressure``). 0 fully ablates "
+    "that variable's gradient contribution; ``default`` (if set) covers unmatched names."
     u_v_pairs: Optional[list[list[str]]] = None
     distributed_stats: bool = True
     mse_scalers: Optional[list[str]] = None
     msh_scalers: Optional[list[str]] = None
     precomputed_stats_path: Optional[str] = None
+    column_mass_flux_weight: NonNegativeFloat = 0.0
+    "Weight on the column-mass-flux conservation term. Penalises domain-mean "
+    "(Σ w_lev · Δp_lev) mismatch between prediction and target. 0 disables. "
+    "Targets the compensating-subsidence failure mode: ML emulators often fail to "
+    "produce mass-balanced compensating flow around convective columns, leading to "
+    "spurious net upward mass flux that drives upper-level theta drift over rollout."
+    w_var_names: Optional[list[str]] = None
+    "Output-variable names representing W at each retained vertical level, ordered "
+    "low-to-high in altitude. If None, autodetected by matching ``w_<level_int>``."
+    w_level_pressure_weights: Optional[list[float]] = None
+    "Δp weights (Pa) per W level for the column integral, same length and order as "
+    "``w_var_names``. If None, uniform weighting is used (less physical but works). "
+    "Typically computed from US Standard Atmosphere at each level's zeta height."
+    hydrostatic_weight: NonNegativeFloat = 0.0
+    "Weight on the hydrostatic-balance soft constraint. Penalises per-pixel deviation "
+    "from the hypsometric equation at each adjacent level pair via an error-tolerant "
+    "loss f(r/α) = (r/α)² / (1 + exp(1 - (r/α)²)). Below α the loss is ≈0 (tolerates "
+    "GRAF's natural non-hydrostatic imbalance from convection); above α it approaches "
+    "MSE. 0 disables. Targets the same lid-drift failure mode as column_mass_flux but "
+    "by enforcing the underlying invariant directly."
+    hydrostatic_alphas: Optional[list[float]] = None
+    "Per-level-pair tolerance α_k (K) for the error-tolerant loss. Length must be "
+    "len(hydrostatic_z_levels) - 1. Calibrated from the training-zarr natural "
+    "distribution of r_k via α_k = Q_k(p) · √(W₀(1) + 1) ≈ Q_k(50%) × 1.252 "
+    "(precompute_hydrostatic_alphas.py)."
+    hydrostatic_z_levels: Optional[list[float]] = None
+    "Fixed zeta-level heights (m), ordered low-to-high in altitude, one per resolved "
+    "pressure/theta/qv output variable. dz_k = z_k - z_{k-1} is computed internally."
+    hydrostatic_p_var_names: Optional[list[str]] = None
+    "Output-variable names for pressure at each retained vertical level, ordered to "
+    "match ``hydrostatic_z_levels``. If None, autodetected by matching "
+    "``pressure_<level_int>`` and sorting by level."
+    hydrostatic_theta_var_names: Optional[list[str]] = None
+    "Output-variable names for potential temperature at each level, same ordering as "
+    "``hydrostatic_p_var_names``. If None, autodetected by matching ``theta_<level_int>``."
+    hydrostatic_qv_var_names: Optional[list[str]] = None
+    "Output-variable names for water-vapor mixing ratio at each level, same ordering "
+    "as ``hydrostatic_p_var_names``. If None, autodetected by matching ``qv_<level_int>``."
     "Path to anemoi zarr containing statistics_msh_beta / statistics_gradient_{x,y}_stdev. Skips online Welford."
 
 
@@ -674,6 +735,11 @@ class BaseTrainingSchema(BaseModel):
     "Config for stochastic weight averaging."
     ewa: EWA = Field(default_factory=EWA)
     "Config for exponential weight averaging."
+    input_noise_sigma: NonNegativeFloat = Field(default=0.0)
+    """Standard deviation of Gaussian noise added to model inputs during training
+    (in normalized state space). Only honored when ``training.model_task`` resolves
+    to a forecaster that reads it (e.g. grafai.training.NoisyResidualForecaster).
+    0.0 disables noise. Typical values: 0.01-0.10."""
     training_loss: LossSchemas
     "Training loss configuration."
     loss_gradient_scaling: bool = False

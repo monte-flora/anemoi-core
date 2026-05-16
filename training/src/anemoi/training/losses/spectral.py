@@ -165,7 +165,9 @@ class LogSpectralDistance(SpectralLoss):
         without_scalers: list[str] | list[int] | None = None,
         grid_shard_slice: slice | None = None,
         group: ProcessGroup | None = None,
+        **kwargs,  # absorb framework extras like model_comm_group_size
     ) -> torch.Tensor:
+        del kwargs  # unused; framework passes extras like model_comm_group_size
         is_sharded = grid_shard_slice is not None
         group = group if is_sharded else None
         eps = torch.finfo(pred.dtype).eps

@@ -100,6 +100,20 @@ class GraphCastFullLoss(CombinedLoss):
     msh_scalers : list[str] | None
         Scaler names routed to the internal MSH leaf. Defaults to
         ``['general_variable']``.
+    grad_var_weights : dict[str, float] | None, default None
+        Per-variable weights applied **only to the gradient terms**
+        (∂x and ∂y). The raw MSE/MSH and wind paths are unaffected.
+        Keys may be either an exact output-variable name (e.g.
+        ``qv_33``) or a level-stripped group stem (e.g. ``pressure``,
+        which matches every ``pressure_<N>``). Exact-name matches take
+        precedence over group matches; unmatched variables fall back
+        to the value of ``default`` (1.0 if absent). All values must
+        be ≥ 0; setting a weight to 0 fully ablates that variable's
+        gradient contribution. Use this to neutralise variables whose
+        residual-space σ_∂ is anomalously small (e.g. ``pressure``
+        with σ_∂x ≈ 0.19 vs the median 0.36, or ``qv_33`` with
+        σ_∂x ≈ 0.002 — both over-amplify their gradient term under
+        z-score normalisation).
     """
 
     def __init__(
@@ -126,9 +140,35 @@ class GraphCastFullLoss(CombinedLoss):
         mse_scalers: list[str] | None = None,
         msh_scalers: list[str] | None = None,
         precomputed_stats_path: str | None = None,
+        grad_var_weights: dict | None = None,
+        column_mass_flux_weight: float = 0.0,
+        w_var_names: list | None = None,
+        w_level_pressure_weights: list | None = None,
+        hydrostatic_weight: float = 0.0,
+        hydrostatic_alphas: list | None = None,
+        hydrostatic_z_levels: list | None = None,
+        hydrostatic_p_var_names: list | None = None,
+        hydrostatic_theta_var_names: list | None = None,
+        hydrostatic_qv_var_names: list | None = None,
         **kwargs: Any,
     ) -> None:
         self.precomputed_stats_path = str(precomputed_stats_path) if precomputed_stats_path else None
+
+        # Per-variable gradient weights (validated; resolved against
+        # data_indices in set_data_indices). Stored as a plain dict so
+        # OmegaConf DictConfig and dict both work.
+        if grad_var_weights is None:
+            self._grad_var_weights_cfg: dict[str, float] = {}
+        else:
+            self._grad_var_weights_cfg = {
+                str(k): float(v) for k, v in dict(grad_var_weights).items()
+            }
+            for k, v in self._grad_var_weights_cfg.items():
+                if v < 0.0 or v != v:  # NaN check via self-comparison
+                    msg = (
+                        f"grad_var_weights[{k!r}] = {v}; must be ≥ 0 and finite."
+                    )
+                    raise ValueError(msg)
 
         mse_cfg = OmegaConf.create(
             {
@@ -185,6 +225,52 @@ class GraphCastFullLoss(CombinedLoss):
         self.u_v_pairs_override = (
             [tuple(p) for p in u_v_pairs] if u_v_pairs is not None else None
         )
+
+        # --- Column-mass-flux conservation term ----------------------------
+        # Penalises domain-mean(Σ w_lev · Δp_lev) mismatch between pred & target.
+        # See diag_mass_flux.py: v17 develops |domain mean ∫ρw·dz| swings of
+        # ~150 kg/(m²·s) at 18 h (vs <8 in truth) — a known
+        # ML-emulator failure mode (compensating-subsidence absence).
+        self.column_mass_flux_weight = float(column_mass_flux_weight)
+        self.w_var_names_override = (
+            [str(v) for v in w_var_names] if w_var_names is not None else None
+        )
+        self.w_level_pressure_weights = (
+            [float(p) for p in w_level_pressure_weights]
+            if w_level_pressure_weights is not None
+            else None
+        )
+        # Resolved in set_data_indices()
+        self._w_idx: torch.Tensor | None = None
+        self._w_level_dp: torch.Tensor | None = None
+
+        # --- Hydrostatic-balance soft constraint (DLESyM-style) -------------
+        # Soft constraint that penalises deviations from hydrostatic balance
+        # via an error-tolerant loss
+        #     f(r_k) = (r/α)² / (1 + exp(1 - (r/α)²))
+        # where the residual at adjacent level pair (k-1, k) is
+        #     r_k = T_v_mean - (g/R) · (z_k - z_{k-1}) / ln(p_{k-1}/p_k)
+        # Below α_k the loss is ~0 (tolerates GRAF's natural non-hydrostatic
+        # imbalance from convection); above α_k it approaches MSE. α_k is
+        # precomputed from the natural percentile distribution of r_k in
+        # the training zarr via the Lambert-W scaling
+        #     α_k = Q_k(p) · sqrt(W₀(1) + 1).
+        self.hydrostatic_weight = float(hydrostatic_weight)
+        self.hydrostatic_alphas_cfg = (
+            [float(a) for a in hydrostatic_alphas] if hydrostatic_alphas is not None else None
+        )
+        self.hydrostatic_z_levels_cfg = (
+            [float(z) for z in hydrostatic_z_levels] if hydrostatic_z_levels is not None else None
+        )
+        self.hyd_p_names_override     = list(hydrostatic_p_var_names)     if hydrostatic_p_var_names     is not None else None
+        self.hyd_theta_names_override = list(hydrostatic_theta_var_names) if hydrostatic_theta_var_names is not None else None
+        self.hyd_qv_names_override    = list(hydrostatic_qv_var_names)    if hydrostatic_qv_var_names    is not None else None
+        # Resolved in set_data_indices():
+        self._hyd_p_idx: torch.Tensor | None = None
+        self._hyd_theta_idx: torch.Tensor | None = None
+        self._hyd_qv_idx: torch.Tensor | None = None
+        self._hyd_dz: torch.Tensor | None = None       # (n_pairs,) — z_{k} − z_{k-1}
+        self._hyd_alpha: torch.Tensor | None = None    # (n_pairs,)
 
         # Finite-difference stencil buffer
         self.register_buffer("_diff_kernel", _CENTRAL_DIFF_4.clone(), persistent=False)
@@ -258,6 +344,18 @@ class GraphCastFullLoss(CombinedLoss):
     # ------------------------------------------------------------------
     # Scaler / data-indices routing (CombinedLoss children need it)
     # ------------------------------------------------------------------
+    @staticmethod
+    def _level_stripped_stem(name: str) -> str:
+        """``pressure_14`` → ``pressure``; ``t2m`` → ``t2m``.
+
+        Strips a single trailing ``_<digits>`` suffix. Used so a single
+        ``grad_var_weights`` key like ``pressure`` covers every
+        ``pressure_<level>``.
+        """
+        import re
+        m = re.match(r"^(.+?)(?:_\d+)?$", name)
+        return m.group(1) if m else name
+
     def set_data_indices(self, data_indices) -> None:
         if data_indices is None:
             return
@@ -265,6 +363,41 @@ class GraphCastFullLoss(CombinedLoss):
             self.mse.set_data_indices(data_indices)
         if self.msh is not None and hasattr(self.msh, "set_data_indices"):
             self.msh.set_data_indices(data_indices)
+
+        # Per-variable gradient weights (V_model,) — exact-name match
+        # takes precedence over level-stripped group stem; default 1.0.
+        if self._grad_var_weights_cfg:
+            output_n2i = data_indices.model.output.name_to_index
+            n_out = len(output_n2i)
+            default_w = float(self._grad_var_weights_cfg.get("default", 1.0))
+            w = torch.full((n_out,), default_w, dtype=torch.float32)
+            unmatched = set(self._grad_var_weights_cfg.keys()) - {"default"}
+            for name, model_idx in output_n2i.items():
+                if name in self._grad_var_weights_cfg:
+                    w[model_idx] = float(self._grad_var_weights_cfg[name])
+                    unmatched.discard(name)
+                else:
+                    stem = self._level_stripped_stem(name)
+                    if stem in self._grad_var_weights_cfg:
+                        w[model_idx] = float(self._grad_var_weights_cfg[stem])
+                        unmatched.discard(stem)
+            if unmatched:
+                LOGGER.warning(
+                    "GraphCastFullLoss.grad_var_weights: %d key(s) matched no "
+                    "model-output variable: %s",
+                    len(unmatched), sorted(unmatched)[:10],
+                )
+            n_zero = int((w == 0.0).sum())
+            n_nondefault = int((w != default_w).sum())
+            LOGGER.info(
+                "GraphCastFullLoss.grad_var_weights resolved: default=%.3f, "
+                "n_zero=%d, n_nondefault=%d (e.g. %s)",
+                default_w, n_zero, n_nondefault,
+                {n: float(w[i]) for n, i in output_n2i.items() if w[i] != default_w}
+            )
+            self.register_buffer("_grad_var_weights", w, persistent=False)
+        else:
+            self._grad_var_weights = None
 
         # Resolve (V_model,) → (V_raw_zarr,) mapping for precomputed-σ lookup
         # by name — bypasses the `drop`-filtered data_indices.data mapping
@@ -301,26 +434,148 @@ class GraphCastFullLoss(CombinedLoss):
                                   if self._precomputed_sigma_x_data[self._zarr_name_to_index[name]] == 0]
                     LOGGER.warning("  zero σ_∂x outputs (will clamp to 1e-12): %s", zero_names[:10])
 
-        # Resolve wind indices
-        if self.wind_speed_weight == 0.0 and self.wind_dir_weight == 0.0:
-            return
         name_to_idx = dict(data_indices.model.output.name_to_index)
-        if self.u_v_pairs_override is not None:
-            pairs = self.u_v_pairs_override
-        else:
-            pairs = _autodetect_wind_pairs(list(name_to_idx.keys()))
-        pairs = [p for p in pairs if p[0] in name_to_idx and p[1] in name_to_idx]
-        if not pairs:
-            LOGGER.warning("GraphCastFullLoss: no (u, v) pairs resolved; wind terms will be skipped.")
-            return
-        self._u_idx = torch.tensor([name_to_idx[u] for u, _ in pairs], dtype=torch.long)
-        self._v_idx = torch.tensor([name_to_idx[v] for _, v in pairs], dtype=torch.long)
-        self._pair_names = pairs
-        LOGGER.info(
-            "GraphCastFullLoss: resolved %d (u, v) pairs: %s",
-            len(pairs),
-            ", ".join(f"{u}↔{v}" for u, v in pairs),
-        )
+
+        # Resolve wind indices (only when wind terms are active)
+        if self.wind_speed_weight != 0.0 or self.wind_dir_weight != 0.0:
+            if self.u_v_pairs_override is not None:
+                pairs = self.u_v_pairs_override
+            else:
+                pairs = _autodetect_wind_pairs(list(name_to_idx.keys()))
+            pairs = [p for p in pairs if p[0] in name_to_idx and p[1] in name_to_idx]
+            if not pairs:
+                LOGGER.warning("GraphCastFullLoss: no (u, v) pairs resolved; wind terms will be skipped.")
+            else:
+                self._u_idx = torch.tensor([name_to_idx[u] for u, _ in pairs], dtype=torch.long)
+                self._v_idx = torch.tensor([name_to_idx[v] for _, v in pairs], dtype=torch.long)
+                self._pair_names = pairs
+                LOGGER.info(
+                    "GraphCastFullLoss: resolved %d (u, v) pairs: %s",
+                    len(pairs),
+                    ", ".join(f"{u}↔{v}" for u, v in pairs),
+                )
+
+        # --- Resolve W indices for column-mass-flux loss --------------------
+        if self.column_mass_flux_weight != 0.0:
+            if self.w_var_names_override is not None:
+                w_names = list(self.w_var_names_override)
+            else:
+                # Autodetect: model outputs named "w_NN" sorted by level int
+                w_pat = []
+                for name in name_to_idx:
+                    if name.startswith("w_"):
+                        suffix = name[2:]
+                        if suffix.isdigit():
+                            w_pat.append((int(suffix), name))
+                w_pat.sort()
+                w_names = [n for _, n in w_pat]
+            w_names = [n for n in w_names if n in name_to_idx]
+            if not w_names:
+                LOGGER.warning(
+                    "GraphCastFullLoss.column_mass_flux_weight != 0 but no W "
+                    "outputs found; mass-flux term disabled."
+                )
+                self.column_mass_flux_weight = 0.0
+            else:
+                self._w_idx = torch.tensor(
+                    [name_to_idx[n] for n in w_names], dtype=torch.long
+                )
+                if self.w_level_pressure_weights is not None:
+                    if len(self.w_level_pressure_weights) != len(w_names):
+                        msg = (
+                            f"w_level_pressure_weights length "
+                            f"({len(self.w_level_pressure_weights)}) does not match "
+                            f"number of resolved W outputs ({len(w_names)})."
+                        )
+                        raise ValueError(msg)
+                    dp = torch.tensor(self.w_level_pressure_weights, dtype=torch.float32)
+                else:
+                    dp = torch.ones(len(w_names), dtype=torch.float32)
+                # Regular attribute (not register_buffer) — mirrors how _u_idx
+                # is stored, and avoids a "buffer already exists" conflict with
+                # the pre-init `self._w_level_dp = None` in __init__.
+                self._w_level_dp = dp
+                LOGGER.info(
+                    "GraphCastFullLoss.column_mass_flux_weight=%.3e enabled on "
+                    "%d W outputs: %s (Δp weights sum=%.1f)",
+                    self.column_mass_flux_weight, len(w_names), w_names,
+                    float(dp.sum()),
+                )
+
+        # --- Resolve hydrostatic-balance constraint -------------------------
+        if self.hydrostatic_weight != 0.0:
+            # Helper: autodetect "<prefix>_<level_int>" sorted by level
+            def _autodetect_3d(prefix: str) -> list[str]:
+                out = []
+                for name in name_to_idx:
+                    if name.startswith(prefix + "_"):
+                        suffix = name[len(prefix) + 1:]
+                        if suffix.isdigit():
+                            out.append((int(suffix), name))
+                out.sort()
+                return [n for _, n in out]
+            p_names     = self.hyd_p_names_override     or _autodetect_3d("pressure")
+            theta_names = self.hyd_theta_names_override or _autodetect_3d("theta")
+            qv_names    = self.hyd_qv_names_override    or _autodetect_3d("qv")
+            p_names     = [n for n in p_names     if n in name_to_idx]
+            theta_names = [n for n in theta_names if n in name_to_idx]
+            qv_names    = [n for n in qv_names    if n in name_to_idx]
+
+            n_lev = len(p_names)
+            consistent = (
+                n_lev > 1
+                and len(theta_names) == n_lev
+                and len(qv_names) == n_lev
+            )
+            if not consistent:
+                LOGGER.warning(
+                    "GraphCastFullLoss.hydrostatic_weight != 0 but could not "
+                    "find consistent pressure/theta/qv 3-D outputs "
+                    "(p=%d, theta=%d, qv=%d). Hydrostatic term disabled.",
+                    len(p_names), len(theta_names), len(qv_names),
+                )
+                self.hydrostatic_weight = 0.0
+            elif self.hydrostatic_z_levels_cfg is None or self.hydrostatic_alphas_cfg is None:
+                LOGGER.warning(
+                    "GraphCastFullLoss.hydrostatic_weight != 0 but "
+                    "hydrostatic_z_levels (%s) or hydrostatic_alphas (%s) "
+                    "missing. Hydrostatic term disabled.",
+                    self.hydrostatic_z_levels_cfg, self.hydrostatic_alphas_cfg,
+                )
+                self.hydrostatic_weight = 0.0
+            else:
+                if len(self.hydrostatic_z_levels_cfg) != n_lev:
+                    msg = (
+                        f"hydrostatic_z_levels length ({len(self.hydrostatic_z_levels_cfg)}) "
+                        f"must match number of resolved p/theta/qv levels ({n_lev})."
+                    )
+                    raise ValueError(msg)
+                if len(self.hydrostatic_alphas_cfg) != n_lev - 1:
+                    msg = (
+                        f"hydrostatic_alphas length ({len(self.hydrostatic_alphas_cfg)}) "
+                        f"must match number of adjacent level pairs ({n_lev - 1})."
+                    )
+                    raise ValueError(msg)
+                self._hyd_p_idx     = torch.tensor([name_to_idx[n] for n in p_names],     dtype=torch.long)
+                self._hyd_theta_idx = torch.tensor([name_to_idx[n] for n in theta_names], dtype=torch.long)
+                self._hyd_qv_idx    = torch.tensor([name_to_idx[n] for n in qv_names],    dtype=torch.long)
+                z = torch.tensor(self.hydrostatic_z_levels_cfg, dtype=torch.float32)
+                self._hyd_dz    = (z[1:] - z[:-1]).clone()                                   # (n_lev-1,)
+                self._hyd_alpha = torch.tensor(self.hydrostatic_alphas_cfg, dtype=torch.float32)
+                LOGGER.info(
+                    "GraphCastFullLoss.hydrostatic_weight=%.3e enabled on %d "
+                    "level pairs.  p_names=%s  theta_names=%s  qv_names=%s",
+                    self.hydrostatic_weight, n_lev - 1,
+                    p_names, theta_names, qv_names,
+                )
+                LOGGER.info(
+                    "  z_levels (m): %s",
+                    [f"{z[i].item():.1f}" for i in range(n_lev)],
+                )
+                LOGGER.info(
+                    "  α per pair (K): %s",
+                    [f"{a:.3f}" for a in self.hydrostatic_alphas_cfg],
+                )
 
     def add_scaler(self, dimension, scaler, *, name: str | None = None) -> None:
         self.mse.add_scaler(dimension, scaler, name=name)
@@ -399,6 +654,12 @@ class GraphCastFullLoss(CombinedLoss):
             )
             kernel = self._diff_kernel
 
+            # Per-variable gradient weights (√w applied to both pred and
+            # tgt so the inner MSE picks up exactly w per variable).
+            sqrt_w = None
+            if self._grad_var_weights is not None:
+                sqrt_w = self._grad_var_weights.to(pred_2d.device).sqrt().view(1, -1, 1, 1)
+
             if self.grad_x_weight != 0.0:
                 dpred = _apply_stencil_x(pred_2d, kernel)
                 dtgt = _apply_stencil_x(tgt_2d, kernel)
@@ -408,6 +669,9 @@ class GraphCastFullLoss(CombinedLoss):
                     )
                     dpred = dpred / sigma
                     dtgt = dtgt / sigma
+                if sqrt_w is not None:
+                    dpred = dpred * sqrt_w
+                    dtgt = dtgt * sqrt_w
                 dpred_flat = einops.rearrange(
                     dpred, "(b e) v h w -> b e (h w) v", b=B
                 )
@@ -425,6 +689,9 @@ class GraphCastFullLoss(CombinedLoss):
                     )
                     dpred = dpred / sigma
                     dtgt = dtgt / sigma
+                if sqrt_w is not None:
+                    dpred = dpred * sqrt_w
+                    dtgt = dtgt * sqrt_w
                 dpred_flat = einops.rearrange(
                     dpred, "(b e) v h w -> b e (h w) v", b=B
                 )
@@ -471,6 +738,79 @@ class GraphCastFullLoss(CombinedLoss):
                 pred_spd.index_copy_(-1, u_idx, s_pred)
                 tgt_spd.index_copy_(-1, u_idx, s_tgt)
                 L = L + self.wind_speed_weight * self.mse(pred_spd, tgt_spd, **kwargs)
+
+        # --- 4. Column mass-flux conservation -------------------------------
+        # Domain-coherent column-integrated W (pressure-weighted) — the loss
+        # is the squared difference of the *domain mean* of (Σ w_lev · Δp_lev)
+        # between pred and target. By averaging over spatial cells first, the
+        # term is blind to local storm-scale W variance (real convection) and
+        # only catches column-coherent bias — i.e. compensating-subsidence
+        # failure that produces a net upward/downward mass flux across the
+        # whole domain.
+        if (
+            self.column_mass_flux_weight != 0.0
+            and self._w_idx is not None
+            and self._w_idx.numel() > 0
+        ):
+            w_idx = self._w_idx.to(pred.device)
+            dp = self._w_level_dp.to(pred.device)            # (n_lev,)
+            w_pred = pred.index_select(-1, w_idx)            # (B, E, G, n_lev)
+            w_tgt  = target.index_select(-1, w_idx)
+            cf_pred = (w_pred * dp).sum(dim=-1)              # (B, E, G)
+            cf_tgt  = (w_tgt  * dp).sum(dim=-1)
+            mu_pred = cf_pred.mean(dim=-1)                   # (B, E) domain mean
+            mu_tgt  = cf_tgt.mean(dim=-1)
+            mass_loss = ((mu_pred - mu_tgt) ** 2).mean()
+            L = L + self.column_mass_flux_weight * mass_loss
+
+        # --- 5. Hydrostatic-balance soft constraint -------------------------
+        # Penalises deviations from hydrostatic balance via an error-tolerant
+        # loss (DLESyM-style). Computed per-pixel per adjacent-level-pair:
+        #
+        #   T  = θ · (p/p0)^(R_d/c_p)
+        #   T_v = T · (1 + 0.61·qv)
+        #   r_k = mean(T_v_{k-1}, T_v_k) - (g/R_d) · (z_k - z_{k-1}) / ln(p_{k-1}/p_k)
+        #   x   = r / α_k
+        #   f   = x² / (1 + exp(1 - x²))                          # ≈0 for |x|<1
+        #
+        # α_k is the K-tolerance below which the loss is essentially flat;
+        # supplied as a precomputed per-pair scalar from the training-zarr
+        # natural distribution.
+        if (
+            self.hydrostatic_weight != 0.0
+            and self._hyd_p_idx is not None
+            and self._hyd_p_idx.numel() > 1
+        ):
+            R_d = 287.05
+            c_p = 1004.0
+            p0 = 1.0e5
+            g = 9.80665
+            p_idx  = self._hyd_p_idx.to(pred.device)
+            th_idx = self._hyd_theta_idx.to(pred.device)
+            qv_idx = self._hyd_qv_idx.to(pred.device)
+            dz     = self._hyd_dz.to(device=pred.device, dtype=pred.dtype)
+            alpha  = self._hyd_alpha.to(device=pred.device, dtype=pred.dtype)
+
+            p_lvl  = pred.index_select(-1, p_idx)            # (B, E, G, n_lev)
+            th_lvl = pred.index_select(-1, th_idx)
+            qv_lvl = pred.index_select(-1, qv_idx)
+            # Guard against pathological zero-/negative-pressure or negative-qv
+            # noise the model may produce during early steps.
+            p_lvl  = p_lvl.clamp(min=1.0)
+            qv_lvl = qv_lvl.clamp(min=0.0)
+
+            T   = th_lvl * (p_lvl / p0).pow(R_d / c_p)
+            T_v = T * (1.0 + 0.61 * qv_lvl)
+            T_v_mean = 0.5 * (T_v[..., 1:] + T_v[..., :-1])       # (B, E, G, n_pairs)
+            p_lo = p_lvl[..., :-1]                                # lower-altitude (higher p)
+            p_hi = p_lvl[..., 1:]                                 # upper-altitude (lower p)
+            log_ratio = torch.log(p_lo / p_hi).clamp(min=1.0e-6)
+            rhs = (g / R_d) * dz / log_ratio                       # broadcasts over (B,E,G)
+            r = T_v_mean - rhs                                     # (B, E, G, n_pairs)  [K]
+            x = r / alpha
+            x2 = x * x
+            f = x2 / (1.0 + torch.exp(1.0 - x2))
+            L = L + self.hydrostatic_weight * f.mean()
 
         return L
 

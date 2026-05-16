@@ -89,19 +89,17 @@ class GeneralVariableLossScaler(BaseVariableLossScaler):
 
         for variable_name, idx in self.data_indices.model.output.name_to_index.items():
             _, variable_ref, _ = self.variable_metadata_extractor.get_group_and_level(variable_name)
-            # Apply variable scaling by variable name
-            # or base variable name (variable_ref: variable name without variable level)
+            # Lookup priority: full variable name (e.g. "qv_24") -> base name
+            # (e.g. "qv") -> default. The full-name override exists so that
+            # per-level corrections (e.g. counteracting the ResidualNormalizer
+            # σ_clipped/σ_true gradient amplification for stratospheric qv
+            # vars) can be applied without changing the whole variable family.
             variable_loss_scaling[idx] = self.weights.get(
-                variable_ref,
-                self.weights.get("default", 1.0),
+                variable_name,
+                self.weights.get(
+                    variable_ref,
+                    self.weights.get("default", 1.0),
+                ),
             )
-            if variable_ref != variable_name:
-                assert (
-                    self.weights.get(
-                        variable_name,
-                        None,
-                    )
-                    is None
-                ), f"Variable {variable_name} is not allowed to have a separate scaling besides {variable_ref}."
 
         return variable_loss_scaling
