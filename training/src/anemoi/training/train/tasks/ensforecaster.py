@@ -76,13 +76,29 @@ class GraphEnsForecaster(BaseRolloutGraphModule):
             If you would like to run in deterministic mode, please use aifs-train"
         )
 
-        self.lr = (
-            config.system.hardware.num_nodes
-            * config.system.hardware.num_gpus_per_node
-            * config.training.lr.rate
-            / num_gpus_per_ensemble
+        # NOTE: the ensemble forecaster uses a different denominator
+        # (``num_gpus_per_ensemble``) than the deterministic path
+        # (``num_gpus_per_model``). The semantics resolver from
+        # ``anemoi.training.utils.lr_resolution`` only handles the
+        # deterministic case; here we apply the per_rank_legacy multiplier
+        # directly with the ensemble-specific denominator. New ensemble
+        # configs that want explicit "global" semantics should set
+        # ``training.lr.semantics: "global"`` — handled below.
+        semantics = getattr(config.training.lr, "semantics", None) or "per_rank_legacy"
+        if semantics == "global":
+            self.lr = float(config.training.lr.rate)
+        else:
+            mult = (
+                config.system.hardware.num_nodes
+                * config.system.hardware.num_gpus_per_node
+                / num_gpus_per_ensemble
+            )
+            self.lr = float(config.training.lr.rate) * mult
+        LOGGER.info(
+            "[lr_resolution:GraphEnsForecaster] semantics=%s  "
+            "config_rate=%.3e  optimizer_peak=%.3e",
+            semantics, config.training.lr.rate, self.lr,
         )
-        LOGGER.info("Base (config) learning rate: %e -- Effective learning rate: %e", config.training.lr.rate, self.lr)
 
         self.nens_per_device = config.training.ensemble_size_per_device
         self.nens_per_group = self.nens_per_device * num_gpus_per_ensemble // num_gpus_per_model

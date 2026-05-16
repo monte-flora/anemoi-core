@@ -97,6 +97,17 @@ class NativeGridDataset(IterableDataset):
         self.chunk_index_range: np.ndarray | None = None
         self.shuffle = shuffle
 
+        # Sidecar for spike-monitor reverse lookup. When `ANEMOI_SPIKE_SIDECAR_DIR`
+        # is set, each yielded sample writes one line — `<fingerprint>\t<time_idx>\t<trajectory_id>\t<date>` —
+        # to a per-(rank, worker) file in that directory. Spike monitor reads the
+        # files at spike time to attach `time_index` / `trajectory_id` / `date` to JSONL.
+        # NOTE: env var is checked at __iter__ time, not __init__: in the parent
+        # rank-0 process AnemoiTrainer accesses self.model (→ datamodule → dataset)
+        # before self.callbacks (→ SpikeMonitor.__init__ which sets the env var).
+        # Subprocesses (rank ≥1) inherit the already-set env var from the parent.
+        self._sidecar_dir = None
+        self._sidecar_file = None  # opened lazily on first yield (worker context)
+
     @cached_property
     def statistics(self) -> dict:
         """Return dataset statistics."""
@@ -459,7 +470,56 @@ class NativeGridDataset(IterableDataset):
                 except Exception as e:
                     LOGGER.warning("Failed to save diagnostic plot: %s", e)
 
+            # Sidecar write — spike monitor uses this to attach the underlying
+            # zarr time_index / trajectory_id / date to a logged spike.
+            # No-op when ANEMOI_SPIKE_SIDECAR_DIR is unset; <70 B/sample otherwise.
+            # Re-read the env var on first sample (set late by SpikeMonitor on rank 0).
+            if self._sidecar_dir is None and self._sidecar_file is None:
+                env_dir = os.environ.get("ANEMOI_SPIKE_SIDECAR_DIR")
+                if env_dir:
+                    self._sidecar_dir = env_dir
+            if self._sidecar_dir is not None and self.label == "train":
+                try:
+                    self._write_sidecar_entry(x_tensor, int(i))
+                except Exception as exc:  # never break training on sidecar failure
+                    LOGGER.warning("sidecar write failed: %s", exc)
+                    self._sidecar_dir = None  # disable for the rest of the run
+
             yield x_tensor
+
+    def _write_sidecar_entry(self, x_tensor: torch.Tensor, time_index: int) -> None:
+        """Append `<fp>\\t<time_index>\\t<trajectory_id>\\t<date>` to this
+        worker's sidecar file. Fingerprint = blake2b-8 of 4 spatial-forcing
+        floats at the patch center cell. Spike monitor recomputes the same
+        fingerprint on its received batch to identify the originating sample
+        without changing the yield contract."""
+        if self._sidecar_file is None:
+            from pathlib import Path
+            wid = self.worker_id if self.worker_id is not None else 0
+            sidecar_dir = Path(self._sidecar_dir)
+            sidecar_dir.mkdir(parents=True, exist_ok=True)
+            path = sidecar_dir / f"rank{self.global_rank}_worker{wid}.tsv"
+            self._sidecar_file = open(path, "a", buffering=1)  # line-buffered
+
+        # Locate the patch center cell on the gridpoints axis.
+        G = x_tensor.shape[2]
+        side = int(round(G ** 0.5))
+        center = side // 2 * side + side // 2 if side * side == G else G // 2
+
+        n2i = self.data.name_to_index
+        forcing_keys = ("cos_latitude", "sin_latitude",
+                        "cos_longitude", "sin_longitude")
+        idx = [n2i[k] for k in forcing_keys if k in n2i]
+        if not idx:
+            return  # forcings unavailable; nothing to fingerprint
+
+        import hashlib
+        fp_bytes = x_tensor[0, 0, center, idx].cpu().numpy().tobytes()
+        fp = hashlib.blake2b(fp_bytes, digest_size=8).hexdigest()
+        date = self.data.dates[time_index].astype("datetime64[s]").astype(str)
+        traj = getattr(self.data, "trajectory_ids", None)
+        traj_id = int(traj[time_index]) if traj is not None else -1
+        self._sidecar_file.write(f"{fp}\t{time_index}\t{traj_id}\t{date}\n")
 
     def __repr__(self) -> str:
         return f"""

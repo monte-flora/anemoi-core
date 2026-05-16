@@ -14,6 +14,7 @@ from omegaconf import DictConfig
 from pytorch_lightning.callbacks import LearningRateMonitor as pl_LearningRateMonitor
 from pytorch_lightning.callbacks import WeightAveraging as pl_WeightAveraging
 from pytorch_lightning.callbacks.stochastic_weight_avg import StochasticWeightAveraging as pl_StochasticWeightAveraging
+from torch.optim.swa_utils import get_ema_avg_fn
 
 LOGGER = logging.getLogger(__name__)
 
@@ -99,55 +100,64 @@ class ExponentialWeightAveraging(pl_WeightAveraging):
         epoch_start : int, optional
             Epoch to start averaging. Default 0.75 * config.training.max_epochs
         """
-        kwargs["avg_fn"] = avg_fn
-        kwargs["ema_decay"] = ema_decay or config.training.ewa.ema_decay
+        # Lightning's WeightAveraging forwards **kwargs straight to
+        # torch.optim.swa_utils.AveragedModel, which expects ``avg_fn`` as a
+        # callable (not a string) and does NOT accept ``ema_decay``. Translate
+        # the convenience pair ("ema", decay) into the proper callable here.
+        decay = ema_decay if ema_decay is not None else config.training.ewa.ema_decay
+        if avg_fn == "ema" or avg_fn is None:
+            kwargs["avg_fn"] = get_ema_avg_fn(decay=decay)
+        else:
+            kwargs["avg_fn"] = avg_fn
 
-        # Handle epoch_start - use max_epochs if available, otherwise estimate from max_steps
+        # Resolve when averaging should start. Lightning's WeightAveraging
+        # does NOT accept ``epoch_start`` as a constructor kwarg (kwargs get
+        # forwarded to AveragedModel which rejects it). Instead, the timing
+        # is encoded by overriding ``should_update`` -- we store the
+        # resolved epoch_start on the instance and gate updates below.
         if epoch_start is None:
             if config.training.max_epochs is not None:
-                # Use max_epochs directly
-                kwargs["epoch_start"] = min(
+                resolved_epoch_start = min(
                     int(0.75 * config.training.max_epochs),
-                    config.training.max_epochs - 1,
+                    max(0, config.training.max_epochs - 1),
                 )
             elif config.training.max_steps is not None:
-                # Estimate max_epochs from max_steps
-                # Need to estimate steps per epoch from dataset size and batch configuration
-                # Use check_val_every_n_epoch to help estimate
-                check_val_every_n_epoch = getattr(config.diagnostics, 'check_val_every_n_epoch', 1)
-
-                # Approximate steps per epoch by looking at validation frequency
-                # Typical setup: validation runs every N epochs at specific step intervals
-                # Conservative estimate: ~1400-1500 steps per epoch for large datasets
-                # More accurate: try to infer from checkpoint frequency
-
-                # Look for checkpoint frequency as a proxy for epoch length
-                if hasattr(config.diagnostics, 'checkpoint') and hasattr(config.diagnostics.checkpoint, 'every_n_train_steps'):
-                    checkpoint_freq = config.diagnostics.checkpoint.every_n_train_steps.save_frequency
-                    # If checkpoints are every 20000 steps and every ~14 epochs, that's ~1428 steps/epoch
-                    # Use a reasonable estimate based on this
-                    estimated_steps_per_epoch = 1400  # Conservative default
-                else:
-                    estimated_steps_per_epoch = 1400  # Default estimate
-
-                # Calculate estimated max_epochs
-                estimated_max_epochs = config.training.max_steps / estimated_steps_per_epoch
-
-                # Start EWA at 75% of training
-                kwargs["epoch_start"] = max(1, int(0.75 * estimated_max_epochs))
-
+                # Without max_epochs we cannot infer epoch length reliably
+                # (true steps/epoch depends on dataset size + batch + workers).
+                # Default to averaging from epoch 0 -- safest for fine-tunes
+                # where we want to average across the whole short FT anyway.
+                resolved_epoch_start = 0
                 LOGGER.info(
-                    "EWA: Estimated %d epochs from max_steps=%d (%.1f steps/epoch). Starting EWA at epoch %d",
-                    int(estimated_max_epochs),
+                    "EWA: max_epochs not set; defaulting epoch_start=0 "
+                    "(averaging from training start over max_steps=%d).",
                     config.training.max_steps,
-                    estimated_steps_per_epoch,
-                    kwargs["epoch_start"]
                 )
             else:
-                # Neither max_steps nor max_epochs set - use a safe default
-                kwargs["epoch_start"] = 1000  # Start very late
+                resolved_epoch_start = 0
         else:
-            kwargs["epoch_start"] = epoch_start
+            resolved_epoch_start = epoch_start
+
+        self._ewa_epoch_start = int(resolved_epoch_start)
+        # If we're starting at epoch 0, enable averaging from the very first
+        # optimizer step. Otherwise we wait for the first end-of-epoch hook
+        # to set the flag.
+        self._ewa_started = (self._ewa_epoch_start == 0)
 
         super().__init__(**kwargs)
         self.config = config
+
+    def should_update(self, step_idx=None, epoch_idx=None) -> bool:
+        """Gate on the resolved epoch_start while preserving Lightning's
+        per-step update semantics. Returns True once we've reached the
+        configured epoch_start, then on every optimizer step (the default
+        Lightning behavior).
+        """
+        # Per-step calls (epoch_idx is None) are gated by the trainer's
+        # current_epoch which we don't have access to here without a
+        # trainer reference. Defer to a stored flag set on epoch transitions.
+        if step_idx is not None:
+            return getattr(self, "_ewa_started", False)
+        if epoch_idx is not None and epoch_idx >= self._ewa_epoch_start:
+            self._ewa_started = True
+            return True
+        return False
