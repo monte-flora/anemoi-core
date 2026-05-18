@@ -30,6 +30,26 @@ from anemoi.utils.config import DotDict
 LOGGER = logging.getLogger(__name__)
 
 
+class _PassthroughConditionEmbedder(nn.Module):
+    """Conditioning embedder that returns the ``condition`` kwarg unchanged.
+
+    Used when we want to inject a pre-encoded conditioning vector into
+    every adaLN block — e.g. an FGN noise-vector encoding — without
+    going through a timestep-based sinusoidal+MLP transformation.
+
+    Matches the ``conditioning_embedder(t, condition=...)`` signature
+    that ``FlexibleDiT.forward`` calls at line ~674.
+    """
+
+    def forward(self, t: Tensor, condition: Optional[Tensor] = None) -> Tensor:
+        if condition is None:
+            # Defensive: return zeros sized to the timestep tensor so the
+            # downstream blocks don't blow up. In practice we always call
+            # this via ``forward_with_noise`` which provides a condition.
+            return torch.zeros(t.shape[0], 1, device=t.device, dtype=t.dtype)
+        return condition
+
+
 def _swap_activation(module: nn.Module, old_cls: type, new_cls: type) -> int:
     """Walk a module tree and replace every instance of ``old_cls`` with
     ``new_cls``. Returns the number of swaps performed.
@@ -186,6 +206,7 @@ class AnemoiDiTModel(nn.Module):
             conditioning_embedder_kwargs=conditioning_embedder_kwargs,
             force_tokenization_fp32=bool(getattr(dit_cfg, "force_tokenization_fp32", True)),
             detokenizer_type=str(getattr(dit_cfg, "detokenizer_type", "linear_reshape")),
+            tokenizer_kernel_size=getattr(dit_cfg, "tokenizer_kernel_size", None),
         )
 
         # Architecture summary at instantiation time. Printed once per rank
@@ -344,6 +365,54 @@ class AnemoiDiTModel(nn.Module):
             self.rho = float(getattr(dit_cfg, "rho", 7.0))
             self.inference_defaults = dict(getattr(dit_cfg, "inference_defaults", {}))
 
+        # FGN-style noise-vector conditioning (CRPS ensemble training). When
+        # ``noise_vector_dim`` is set, we add a small Linear that maps the
+        # per-member noise vector to the DiT hidden_size and swap the
+        # conditioning_embedder for a passthrough so the encoded noise is what
+        # actually reaches the adaLN layers in every block + the detokenizer.
+        noise_vector_dim = getattr(dit_cfg, "noise_vector_dim", None)
+        self.noise_vector_dim = (
+            int(noise_vector_dim) if noise_vector_dim is not None else None
+        )
+        self.noise_encoder_type = str(getattr(dit_cfg, "noise_encoder_type", "none")).lower()
+        if self.noise_vector_dim is not None and self.noise_encoder_type != "none":
+            hidden_size = int(dit_cfg.hidden_size)
+            if self.noise_encoder_type == "matmul":
+                # FGN-faithful: single Linear (no activation). Initialise with
+                # small std so the warm-started deterministic features dominate
+                # at step 0 and noise contribution grows during FT.
+                self.noise_encoder = nn.Linear(self.noise_vector_dim, hidden_size)
+                nn.init.normal_(self.noise_encoder.weight, std=0.02)
+                nn.init.zeros_(self.noise_encoder.bias)
+            elif self.noise_encoder_type == "fourier_mlp":
+                # GenCast-style for ablation: Fourier embedding + 2-layer MLP.
+                from anemoi.models.layers.diffusion import SinusoidalEmbeddings
+                self.noise_encoder = nn.Sequential(
+                    SinusoidalEmbeddings(noise_channels=self.noise_vector_dim),
+                    nn.Linear(self.noise_vector_dim, hidden_size),
+                    nn.SiLU(),
+                    nn.Linear(hidden_size, hidden_size),
+                )
+            else:
+                raise ValueError(
+                    f"noise_encoder_type must be 'matmul', 'fourier_mlp', or "
+                    f"'none'; got {self.noise_encoder_type!r}."
+                )
+
+            # Swap the FlexibleDiT conditioning_embedder for a passthrough so
+            # the encoded noise we hand to ``self.dit(x, t, condition=...)``
+            # reaches every adaLN unchanged. The original embedder was either
+            # "zero" (returns zeros — would discard our noise) or "dit" /
+            # "edm" (would re-embed the timestep — also wrong for FGN).
+            self.dit.conditioning_embedder = _PassthroughConditionEmbedder()
+            LOGGER.info(
+                "AnemoiDiTModel: noise-vector conditioning enabled  "
+                "(dim=%d, encoder=%s, swapped conditioning_embedder to passthrough)",
+                self.noise_vector_dim, self.noise_encoder_type,
+            )
+        else:
+            self.noise_encoder = None
+
     # ------------------------------------------------------------------
     # Padding
     # ------------------------------------------------------------------
@@ -420,6 +489,109 @@ class AnemoiDiTModel(nn.Module):
             for bounding in self.boundings:
                 y = bounding(y)
         # NB: residual mode does NOT apply boundings (see __init__ warning).
+
+        return y
+
+    # ------------------------------------------------------------------
+    # Forward: noise-vector conditioning (FGN-style ensemble training)
+    # ------------------------------------------------------------------
+
+    def forward_with_noise(
+        self,
+        x: Tensor,
+        noise_vec: Tensor,
+        *,
+        model_comm_group: Optional[ProcessGroup] = None,
+        grid_shard_shapes: Optional[list] = None,
+        **kwargs,
+    ) -> Tensor:
+        """Forward with per-(batch, member) noise-vector conditioning.
+
+        Mirrors ``_forward_deterministic`` but threads a noise vector
+        ``z ~ N(0, I)^{noise_vector_dim}`` (one per ensemble member)
+        through every block's adaLN modulation via the FlexibleDiT
+        ``condition`` kwarg.
+
+        Parameters
+        ----------
+        x : Tensor
+            Input window, shape ``(B, T, E, G, V)``. ``E`` is the
+            ensemble dim — typically replicated from a single
+            realisation, with diversity coming entirely from
+            ``noise_vec``.
+        noise_vec : Tensor
+            Per-(batch, member) noise, shape ``(B, E, noise_vector_dim)``.
+
+        Returns
+        -------
+        Tensor
+            Model output, shape ``(B, E, G, V_out)``.
+
+        Notes
+        -----
+        Uses the same ``(b e) → flat batch`` einops rearrange as the
+        deterministic path so the DiT processes each ensemble member as
+        an independent batch row. ``noise_vec`` is folded the same way
+        so member ``j`` of batch ``i`` ends up at the same flat index in
+        both tensors.
+        """
+        if self.noise_encoder is None:
+            raise RuntimeError(
+                "forward_with_noise() called but noise_vector_dim was not "
+                "configured at init. Set DiTConfigSchema.noise_vector_dim "
+                "(e.g. 32) and noise_encoder_type='matmul'."
+            )
+
+        B, T, E, G, V = x.shape
+        if noise_vec.shape != (B, E, self.noise_vector_dim):
+            raise ValueError(
+                f"noise_vec has shape {tuple(noise_vec.shape)}; expected "
+                f"({B}, {E}, {self.noise_vector_dim})."
+            )
+
+        H, W = self.field_shape
+        input_dtype = x.dtype
+
+        # Reshape: (B, T, E, H*W, V) -> (B*E, T*V, H, W). Same as
+        # _forward_deterministic.
+        x_2d = einops.rearrange(x, "b t e (h w) v -> (b e) (t v) h w", h=H, w=W)
+        x_2d, (pad_h, pad_w) = self._pad_to_patch_size(x_2d)
+
+        # Fold noise the same way: (B, E, D) -> (B*E, D). Member j of batch i
+        # lands at flat index i*E + j, matching x_2d's fold ordering.
+        noise_fold = einops.rearrange(noise_vec, "b e d -> (b e) d")
+        # Match the DiT input dtype for the encoded condition.
+        noise_enc = self.noise_encoder(noise_fold.to(self.noise_encoder.weight.dtype))
+        noise_enc = noise_enc.to(x_2d.dtype)
+
+        # Forward through DiT. The passthrough conditioning_embedder returns
+        # `condition=noise_enc` unchanged, so this goes to every block's adaLN.
+        t = torch.zeros(x_2d.shape[0], device=x_2d.device, dtype=x_2d.dtype)
+        y_2d = self.dit(x_2d, t, condition=noise_enc)
+
+        # Same post-processing as _forward_deterministic.
+        if getattr(self, "detokenizer_lowpass", None) is not None:
+            y_2d = self.detokenizer_lowpass(y_2d)
+        if getattr(self, "conv_refinement", None) is not None:
+            y_2d = y_2d + self.conv_refinement(y_2d)
+        if pad_h > 0 or pad_w > 0:
+            y_2d = y_2d[:, :, :H, :W]
+
+        # Reshape back (B*E, V_out, H, W) -> (B, E, G, V_out).
+        y = einops.rearrange(
+            y_2d, "(b e) v h w -> b e (h w) v", b=B, e=E,
+        ).to(dtype=input_dtype).clone()
+
+        # state-mode persistence skip — same as _forward_deterministic for
+        # parity with non-CRPS predict_step (kept for back-compat).
+        if getattr(self, "output_mode", "residual") == "state":
+            x_last = x[:, -1, ...]
+            y[..., self._internal_output_idx] = (
+                y[..., self._internal_output_idx]
+                + x_last[..., self._internal_input_idx]
+            )
+            for bounding in self.boundings:
+                y = bounding(y)
 
         return y
 
@@ -557,9 +729,39 @@ class AnemoiDiTModel(nn.Module):
             #               output through the input normaliser; the residual
             #               normaliser path would double-add the input state
             #               and produce explosive rollouts.
-            model_output = self.forward(
-                x, model_comm_group=model_comm_group, grid_shard_shapes=grid_shard_shapes, **kwargs
-            )  # (B, E=1, G, V_out)
+            # Route through forward_with_noise when the model is an FGN-style
+            # ensemble model (noise_encoder is configured). The noise vector is
+            # read from ``self._inference_noise_vec`` (a (B, E=1, noise_dim) tensor
+            # set by the caller) so the same vector is reused across every
+            # autoregressive step in one forecast, but different members can be
+            # produced by setting different vectors before each inference run.
+            # If no vector is attached, a single fresh one is sampled and stored
+            # (default member-0 trajectory; the model becomes a deterministic-
+            # under-fixed-noise predictor).
+            if getattr(self, "noise_encoder", None) is not None:
+                B = x.shape[0]
+                E = x.shape[2]
+                noise_vec = getattr(self, "_inference_noise_vec", None)
+                if noise_vec is None:
+                    noise_vec = torch.randn(
+                        B, E, self.noise_vector_dim,
+                        device=x.device, dtype=x.dtype,
+                    )
+                    self._inference_noise_vec = noise_vec
+                # Allow caller to pre-set a (1, 1, D) vector; broadcast to (B, E, D).
+                if noise_vec.shape[0] != B or noise_vec.shape[1] != E:
+                    noise_vec = noise_vec.expand(B, E, -1).contiguous()
+                model_output = self.forward_with_noise(
+                    x,
+                    noise_vec.to(device=x.device, dtype=x.dtype),
+                    model_comm_group=model_comm_group,
+                    grid_shard_shapes=grid_shard_shapes,
+                    **kwargs,
+                )
+            else:
+                model_output = self.forward(
+                    x, model_comm_group=model_comm_group, grid_shard_shapes=grid_shard_shapes, **kwargs
+                )  # (B, E=1, G, V_out)
             output_mode = getattr(self, "output_mode", "residual")
 
             # Variable indices

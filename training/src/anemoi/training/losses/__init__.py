@@ -12,6 +12,7 @@ from .graphcast_gaussian_nll import GraphCastGaussianNLLLoss
 from .graphcast_huber import GraphCastHuberLoss
 from .graphcast_logcosh import GraphCastLogCoshLoss
 from .graphcast_mahalanobis import GraphCastMahalanobisLoss
+from .graphcast_crps import GraphCastCRPSLoss
 from .graphcast_mse import GraphCastMSELoss
 from .graphcast_robust import GraphCastClippedMSELoss
 from .graphcast_robust import GraphCastPseudoHuberLoss
@@ -34,6 +35,7 @@ __all__ = [
     "AlmostFairKernelCRPS",
     "CombinedLoss",
     "FourierCorrelationLoss",
+    "GraphCastCRPSLoss",
     "GraphCastClippedMSELoss",
     "GraphCastGaussianNLLLoss",
     "GraphCastHuberLoss",

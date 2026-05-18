@@ -57,6 +57,83 @@ class FlexiblePatchEmbed2DTokenizer(PatchEmbed2DTokenizer):
         return tokens
 
 
+class OverlappingPatchEmbed2DTokenizer(FlexiblePatchEmbed2DTokenizer):
+    """Tokenizer with **overlapping** input patches via kernel_size > stride.
+
+    Standard `PatchEmbed2DTokenizer` uses `Conv2d(kernel=patch_size, stride=patch_size)`,
+    so each output token encodes a disjoint patch_size × patch_size block of
+    input cells. This commits the input field to a hard 16 km (patch_size=4 at
+    4 km grid) partition, and any downstream pixelation in the output is a
+    structural consequence of that partition — no decoder can fully erase it.
+
+    This subclass replaces the inner `Conv2d` with a wider-kernel version
+    (`kernel_size > patch_size`) while keeping `stride = patch_size` so the
+    token grid size is unchanged. Adjacent tokens then **share input cells**:
+    with patch_size=4, kernel_size=8 each token sees an 8×8 cell region with
+    its 4-cell-wide grid spacing, so neighbors share 4 of every 8 cells (50%
+    overlap per axis). This structurally breaks per-token spatial
+    independence at the source.
+
+    Parameters
+    ----------
+    kernel_size : int
+        Receptive field of each token, in input cells. Must be ≥ patch_size,
+        and (kernel_size − patch_size) must be even so symmetric padding can
+        keep the output grid size identical to the non-overlapping case.
+
+    Notes
+    -----
+    Padding is set to `(kernel_size − patch_size) // 2` on each side so the
+    output spatial size matches `input // patch_size`. For input 252×252,
+    patch_size=4, kernel_size=8 → padding=2 → output 63×63 tokens (same as
+    stock). At the boundary 2-cell reflection padding from `nn.ZeroPad2d` is
+    *not* applied here (PatchEmbed2D already handles boundary residuals via
+    the upstream `_pad_to_patch_size` reflect-pad in dit_wrapper); the inner
+    conv padding is zero on the field, which is acceptable because the
+    LAM-interior loss masks the boundary cells anyway.
+    """
+
+    def __init__(
+        self,
+        *,
+        kernel_size: int,
+        input_size,
+        patch_size,
+        in_channels: int,
+        hidden_size: int,
+        pos_embed: str = "learnable",
+    ):
+        super().__init__(
+            input_size=input_size,
+            patch_size=patch_size,
+            in_channels=in_channels,
+            hidden_size=hidden_size,
+            pos_embed=pos_embed,
+        )
+        ph, pw = self.patch_size if isinstance(self.patch_size, tuple) else (
+            self.patch_size, self.patch_size
+        )
+        if ph != pw:
+            raise NotImplementedError("Overlapping tokenizer requires square patches.")
+        if kernel_size < ph or (kernel_size - ph) % 2 != 0:
+            raise ValueError(
+                f"kernel_size={kernel_size} must be >= patch_size={ph} and "
+                f"(kernel_size - patch_size) must be even for symmetric padding."
+            )
+
+        padding = (kernel_size - ph) // 2
+        # Replace the inner Conv2d. Initialize from Kaiming-normal because the
+        # kernel shape changed and we can't load the old (k=patch_size) weights.
+        new_proj = nn.Conv2d(
+            self.in_channels, self.hidden_size,
+            kernel_size=kernel_size, stride=ph, padding=padding,
+        )
+        nn.init.kaiming_normal_(new_proj.weight, mode="fan_out", nonlinearity="linear")
+        nn.init.zeros_(new_proj.bias)
+        self.x_embedder.proj = new_proj
+        self.tokenizer_kernel_size = kernel_size
+
+
 class _AdaLNModulation2D(nn.Module):
     """LayerNorm + adaLN (scale, shift) on a 4-D feature map.
 
@@ -450,7 +527,13 @@ class FlexibleDiT(DiT):
         """Picklable replacement for lambda modulation in DiTBlock and ProjLayer."""
         return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
 
-    def __init__(self, *args, detokenizer_type: str = "linear_reshape", **kwargs):
+    def __init__(
+        self,
+        *args,
+        detokenizer_type: str = "linear_reshape",
+        tokenizer_kernel_size: Optional[int] = None,
+        **kwargs,
+    ):
         """Build a FlexibleDiT.
 
         Parameters
@@ -478,14 +561,31 @@ class FlexibleDiT(DiT):
             and not isinstance(self.tokenizer, FlexiblePatchEmbed2DTokenizer)
         ):
             orig_tok = self.tokenizer
-            flex_tok = FlexiblePatchEmbed2DTokenizer(
+            tok_kwargs = dict(
                 input_size=orig_tok.input_size,
                 patch_size=orig_tok.patch_size,
                 in_channels=orig_tok.in_channels,
                 hidden_size=orig_tok.hidden_size,
                 pos_embed="learnable",
             )
-            flex_tok.load_state_dict(orig_tok.state_dict())
+            ph = (
+                orig_tok.patch_size[0] if isinstance(orig_tok.patch_size, tuple)
+                else orig_tok.patch_size
+            )
+            if tokenizer_kernel_size is not None and tokenizer_kernel_size > ph:
+                # Overlapping tokenizer: kernel > stride. Cannot load old weights
+                # (kernel shape changed), so this path requires from-scratch
+                # training. Pos_embed and other buffers transfer cleanly via
+                # state_dict load below, since the token grid size is unchanged.
+                flex_tok = OverlappingPatchEmbed2DTokenizer(
+                    kernel_size=tokenizer_kernel_size, **tok_kwargs,
+                )
+                # Load only the pos_embed (kernel weights have different shape).
+                with torch.no_grad():
+                    flex_tok.pos_embed.copy_(orig_tok.pos_embed)
+            else:
+                flex_tok = FlexiblePatchEmbed2DTokenizer(**tok_kwargs)
+                flex_tok.load_state_dict(orig_tok.state_dict())
             self.tokenizer = flex_tok
 
         # Replace the detokenizer with the flexible version.

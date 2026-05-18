@@ -267,6 +267,7 @@ class ImplementedLossesUsingBaseLossSchema(str, Enum):
     graphcast_clipped_mse = "anemoi.training.losses.GraphCastClippedMSELoss"
     graphcast_pseudo_huber = "anemoi.training.losses.GraphCastPseudoHuberLoss"
     graphcast_gaussian_nll = "anemoi.training.losses.GraphCastGaussianNLLLoss"
+    graphcast_crps = "anemoi.training.losses.GraphCastCRPSLoss"
     fcl = "anemoi.training.losses.spectral.FourierCorrelationLoss"
     lsd = "anemoi.training.losses.spectral.LogSpectralDistance"
 
@@ -441,6 +442,20 @@ class GraphCastPseudoHuberLossSchema(BaseLossSchema):
 
     delta: float = 10.0
     "Transition point from quadratic to linear behavior."
+
+
+class GraphCastCRPSLossSchema(BaseLossSchema):
+    """Schema for GraphCast-style fair-CRPS loss (FGN-style ensemble training).
+
+    Per-cell metric is fair/almost-fair kernel CRPS; the GraphCastBaseLoss
+    reduction (mean-over-levels-per-group → sum-over-grid → mean-over-ensemble
+    → sum-over-groups → weighted-batch-mean) is applied unchanged on top.
+    """
+
+    alpha: float = 1.0
+    """Blend between fair (1.0; FGN) and unfair (0.0; MAE/N) CRPS. epsilon = (1 - alpha) / N."""
+    no_autocast: bool = True
+    "Deactivate autocast for the kernel CRPS calculation (matches AlmostFairKernelCRPS)."
 
 
 class GraphCastGaussianNLLLossSchema(BaseLossSchema):
@@ -665,6 +680,7 @@ LossSchemas = (
     | GraphCastClippedMSELossSchema
     | GraphCastPseudoHuberLossSchema
     | GraphCastGaussianNLLLossSchema
+    | GraphCastCRPSLossSchema
     | LogFFT2DistanceSchema
     | FourierCorrelationLossSchema
     | SpectralAmplitudeLossSchema
@@ -781,6 +797,19 @@ class ForecasterEnsSchema(ForecasterSchema):
     "Training objective."
 
 
+class EnsResidualForecasterSchema(ForecasterSchema):
+    # FGN-style ensemble residual forecaster: combines GraphResidualForecaster's
+    # residual reconstruction with GraphEnsForecaster's ensemble path + per-member
+    # noise injection through AnemoiDiTModel.forward_with_noise.
+    model_task: Literal["anemoi.training.train.tasks.GraphEnsResidualForecaster"] = Field(
+        ...,
+        alias="model_task",
+    )
+    "Training objective (ensemble + residual + per-member noise; pair with GraphCastCRPSLoss)."
+    noise_vector_dim: PositiveInt = Field(default=32)
+    "Per-(batch, member) noise-vector dimensionality. Must match model.dit.noise_vector_dim. Default 32 (FGN)."
+
+
 class DiffusionForecasterSchema(ForecasterSchema):
     model_task: Literal["anemoi.training.train.tasks.GraphDiffusionForecaster"] = Field(..., alias="model_task")
     "Training objective."
@@ -806,6 +835,7 @@ class InterpolationSchema(BaseTrainingSchema):
 TrainingSchema = Annotated[
     ForecasterSchema
     | ForecasterEnsSchema
+    | EnsResidualForecasterSchema
     | InterpolationSchema
     | DiffusionForecasterSchema
     | DiffusionTendForecasterSchema,

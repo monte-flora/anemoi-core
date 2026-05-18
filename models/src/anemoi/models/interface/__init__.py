@@ -131,6 +131,14 @@ class AnemoiModelInterface(torch.nn.Module):
         # Use the forward method of the model directly
         self.forward = self.model.forward
 
+        # FGN-style ensemble path: if the wrapped model exposes
+        # ``forward_with_noise`` (e.g. AnemoiDiTModel with noise_vector_dim
+        # configured), surface it on the interface so trainers
+        # (GraphEnsResidualForecaster) can call ``self.model.forward_with_noise``
+        # without reaching into ``self.model.model``.
+        if hasattr(self.model, "forward_with_noise"):
+            self.forward_with_noise = self.model.forward_with_noise
+
     def predict_step(
         self, batch: torch.Tensor, model_comm_group: Optional[ProcessGroup] = None, gather_out: bool = True, **kwargs
     ) -> torch.Tensor:
