@@ -72,6 +72,14 @@ class DefinedModels(str, Enum):
     ANEMOI_UNET_MODEL = "anemoi.models.models.unet_wrapper.AnemoiUNetModel"
     ANEMOI_UNET_MODEL_SHORT = "anemoi.models.models.AnemoiUNetModel"
 
+    # v30 Atlas-style latent rollout architecture (Variant B normalization).
+    ANEMOI_ATLAS_DECODER_MODEL = "anemoi.models.models.decoder_dit_wrapper.AnemoiDecoderDiTModel"
+    ANEMOI_ATLAS_DECODER_MODEL_SHORT = "anemoi.models.models.AnemoiDecoderDiTModel"
+    ANEMOI_ATLAS_LATENT_MODEL = "anemoi.models.models.latent_dit_wrapper.AnemoiLatentDiTModel"
+    ANEMOI_ATLAS_LATENT_MODEL_SHORT = "anemoi.models.models.AnemoiLatentDiTModel"
+    ANEMOI_ATLAS_COMPOSED_MODEL = "anemoi.models.models.atlas_composed_model.AnemoiAtlasModel"
+    ANEMOI_ATLAS_COMPOSED_MODEL_SHORT = "anemoi.models.models.AnemoiAtlasModel"
+
 class Model(BaseModel):
     target_: DefinedModels = Field(..., alias="_target_")
     "Model object defined in anemoi.models.model."
@@ -287,6 +295,12 @@ class DiTConfigSchema(BaseModel):
     "DiT output is a normalised residual; the task reconstructs state externally. " \
     "'state': DiT output + input-state skip = predicted state in normalised space; " \
     "use with default GraphForecaster task. Boundings are applied only in 'state' mode."
+    attn_drop_rate: float = Field(default=0.0)
+    "Attention-weights dropout rate (physicsnemo DiTBlock). 0.0 = off (default). Used for U-Cast MC-dropout CRPS recipe (Cachay et al, arXiv 2604.09041)."
+    proj_drop_rate: float = Field(default=0.0)
+    "Post-attention projection dropout rate. 0.0 = off (default)."
+    drop_path_rate: float = Field(default=0.0)
+    "Stochastic-depth (DropPath) rate applied at each block's residual gate. 0.0 = off (default)."
     noise_vector_dim: Optional[int] = Field(default=None)
     "Dimension of the per-(batch, member) noise vector for FGN-style ensemble training (None = disabled, deterministic). 32 matches FGN."
     noise_encoder_type: Literal["matmul", "fourier_mlp", "none"] = Field(default="none")
@@ -540,6 +554,170 @@ class HierarchicalModelSchema(BaseModelSchema):
     "Number of message passing steps at each level"
 
 
+# ----------------------------------------------------------------------
+# v30 Atlas-style architecture schemas (Variant B normalization).
+# ----------------------------------------------------------------------
+
+
+class AtlasDecoderConfigSchema(BaseModel):
+    """Schema for the standalone Atlas decoder model.
+
+    Maps to :class:`anemoi.models.models.decoder_dit_wrapper.AnemoiDecoderDiTModel`.
+    """
+
+    full_res_shape: list[PositiveInt] = Field(default=[250, 250])
+    "Spatial extent of the full-resolution grid [H, W]."
+    latent_shape: list[PositiveInt] = Field(default=[63, 63])
+    "Spatial extent of the latent grid [h_lat, w_lat]. Must match the predictive model."
+    in_channels_xt: PositiveInt
+    "Channels in the full-resolution input x_t (prognostic + forcings)."
+    in_channels_r: PositiveInt
+    "Channels in the latent residual r_t (typically prognostic-only)."
+    out_channels: PositiveInt
+    "Channels in the predicted full-res residual delta_t (prognostic-only)."
+    hidden_size: PositiveInt = Field(default=512)
+    "DiT block hidden dimension."
+    depth: PositiveInt = Field(default=8)
+    "Number of DiT blocks."
+    num_heads: PositiveInt = Field(default=8)
+    "Attention heads. Must divide hidden_size."
+    attn_kernel: PositiveInt = Field(default=9)
+    "NATTEN local-attention kernel size (Atlas uses 3; we use 7–11 at 4 km)."
+    embed_split: float = Field(default=0.5)
+    "Fraction of hidden_size allocated to the x_t branch; rest goes to r_t."
+
+
+class AtlasLatentConfigSchema(BaseModel):
+    """Schema for the Atlas latent predictive model.
+
+    Maps to :class:`anemoi.models.models.latent_dit_wrapper.AnemoiLatentDiTModel`.
+    Variant B: emits latent residuals in mean-std space (NOT tendency-normalized).
+    Tendency normalization happens in the loss via LatentVarTendencyScaler.
+    """
+
+    latent_shape: list[PositiveInt] = Field(default=[63, 63])
+    "Spatial extent of the latent grid [h_lat, w_lat]."
+    in_channels: PositiveInt
+    "Prognostic channels per latent state."
+    out_channels: PositiveInt
+    "Channels in predicted latent residual (typically = in_channels, prognostic-only)."
+    forcings_channels: NonNegativeInt = Field(default=0)
+    "Forcing channels concatenated at the tokenizer input (0 disables; "
+    "GRAF-AI uses 11 to inject HGT, land/sea, lat/lon, time-of-day, etc.)."
+    hidden_size: PositiveInt = Field(default=512)
+    "DiT block hidden dimension."
+    depth: PositiveInt = Field(default=16)
+    "Number of DiT blocks."
+    num_heads: PositiveInt = Field(default=8)
+    "Attention heads."
+    history_len: Literal[1, 2] = Field(default=2)
+    "Number of input history states (Atlas uses 2 = z_t, z_{t-1})."
+    noise_vector_dim: NonNegativeInt = Field(default=32)
+    "FGN noise-vector dim (32=FGN, 256+=Atlas, 0=deterministic)."
+
+
+class AtlasComposedConfigSchema(BaseModel):
+    """Schema for the composed Atlas model (encoder+predictive+decoder).
+
+    Maps to :class:`anemoi.models.models.atlas_composed_model.AnemoiAtlasModel`.
+    Inference-time wrapper that hosts the trained predictive + decoder.
+    """
+
+    full_res_shape: list[PositiveInt] = Field(default=[250, 250])
+    "Full-res spatial extent."
+    latent_shape: list[PositiveInt] = Field(default=[63, 63])
+    "Latent spatial extent."
+    prognostic_channels: PositiveInt
+    "Number of prognostic channels (decoded by the decoder)."
+    forcings_channels: NonNegativeInt = Field(default=0)
+    "Number of forcing channels in x_t after the prognostic slice."
+
+
+class AtlasDecoderModel(BaseModel):
+    target_: Literal[
+        DefinedModels.ANEMOI_ATLAS_DECODER_MODEL,
+        DefinedModels.ANEMOI_ATLAS_DECODER_MODEL_SHORT,
+    ] = Field(..., alias="_target_")
+    convert_: str = Field("all", alias="_convert_")
+    decoder: AtlasDecoderConfigSchema = Field(...)
+
+
+class AtlasLatentModel(BaseModel):
+    target_: Literal[
+        DefinedModels.ANEMOI_ATLAS_LATENT_MODEL,
+        DefinedModels.ANEMOI_ATLAS_LATENT_MODEL_SHORT,
+    ] = Field(..., alias="_target_")
+    convert_: str = Field("all", alias="_convert_")
+    latent: AtlasLatentConfigSchema = Field(...)
+
+
+class AtlasComposedModel(BaseModel):
+    target_: Literal[
+        DefinedModels.ANEMOI_ATLAS_COMPOSED_MODEL,
+        DefinedModels.ANEMOI_ATLAS_COMPOSED_MODEL_SHORT,
+    ] = Field(..., alias="_target_")
+    convert_: str = Field("all", alias="_convert_")
+    atlas: AtlasComposedConfigSchema = Field(...)
+
+
+class AtlasDecoderModelSchema(PydanticBaseModel):
+    """Top-level schema for the standalone Atlas decoder task.
+
+    Mirrors DiTModelSchema (no enc-proc-dec pipeline) but with sensible
+    defaults for the boundary / residual / output_mask fields that
+    BaseGraphModule expects, since Variant B doesn't use them.
+    """
+
+    num_channels: NonNegativeInt = Field(default=512)
+    "DiT hidden dimension."
+    keep_batch_sharded: bool = Field(default=True)
+    "Keep input batch + model output sharded across GPUs."
+    model: AtlasDecoderModel = Field(...)
+    "Decoder model schema."
+    trainable_parameters: TrainableParameters = Field(default_factory=lambda: TrainableParameters(data=0, hidden=0))
+    "Unused for Atlas (no learned node attributes); default to zeros."
+    bounding: list[Bounding] = Field(default_factory=list)
+    "Empty by default; Variant B does no bounding (no ResidualNormalizer to clip against)."
+    output_mask: OutputMaskSchemas
+    "Output mask configuration."
+    attributes: Optional[dict] = Field(default_factory=dict)
+    "Unused for Atlas."
+    compile: Optional[list[dict[str, Any]]] = Field(None)
+    "Modules to compile."
+
+
+class AtlasLatentModelSchema(PydanticBaseModel):
+    """Top-level schema for the standalone Atlas latent predictive task."""
+
+    num_channels: NonNegativeInt = Field(default=512)
+    keep_batch_sharded: bool = Field(default=True)
+    model: AtlasLatentModel = Field(...)
+    trainable_parameters: TrainableParameters = Field(default_factory=lambda: TrainableParameters(data=0, hidden=0))
+    bounding: list[Bounding] = Field(default_factory=list)
+    output_mask: OutputMaskSchemas
+    attributes: Optional[dict] = Field(default_factory=dict)
+    compile: Optional[list[dict[str, Any]]] = Field(None)
+
+
+class AtlasComposedModelSchema(PydanticBaseModel):
+    """Top-level schema for the composed Atlas inference model.
+
+    Used at inference time (and never at training, since the two submodels
+    are trained separately). Holds metadata to assemble the composed model
+    after loading the two checkpoints.
+    """
+
+    num_channels: NonNegativeInt = Field(default=512)
+    keep_batch_sharded: bool = Field(default=True)
+    model: AtlasComposedModel = Field(...)
+    trainable_parameters: TrainableParameters = Field(default_factory=lambda: TrainableParameters(data=0, hidden=0))
+    bounding: list[Bounding] = Field(default_factory=list)
+    output_mask: OutputMaskSchemas
+    attributes: Optional[dict] = Field(default_factory=dict)
+    compile: Optional[list[dict[str, Any]]] = Field(None)
+
+
 ModelSchema = Union[
-    DiTModelSchema, UNetModelSchema, BaseModelSchema, EnsModelSchema, HierarchicalModelSchema, DiffusionModelSchema, DiffusionTendModelSchema
+    DiTModelSchema, UNetModelSchema, BaseModelSchema, EnsModelSchema, HierarchicalModelSchema, DiffusionModelSchema, DiffusionTendModelSchema,
+    AtlasDecoderModelSchema, AtlasLatentModelSchema, AtlasComposedModelSchema,
 ]

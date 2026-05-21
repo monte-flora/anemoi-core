@@ -13,6 +13,7 @@ from .graphcast_huber import GraphCastHuberLoss
 from .graphcast_logcosh import GraphCastLogCoshLoss
 from .graphcast_mahalanobis import GraphCastMahalanobisLoss
 from .graphcast_crps import GraphCastCRPSLoss
+from .graphcast_mae import GraphCastMAELoss
 from .graphcast_mse import GraphCastMSELoss
 from .graphcast_robust import GraphCastClippedMSELoss
 from .graphcast_robust import GraphCastPseudoHuberLoss
@@ -41,6 +42,7 @@ __all__ = [
     "GraphCastHuberLoss",
     "GraphCastLogCoshLoss",
     "GraphCastMahalanobisLoss",
+    "GraphCastMAELoss",
     "GraphCastMSELoss",
     "GraphCastPseudoHuberLoss",
     "HuberLoss",

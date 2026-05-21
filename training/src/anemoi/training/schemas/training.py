@@ -261,6 +261,7 @@ class ImplementedLossesUsingBaseLossSchema(str, Enum):
     graphcast_full = "anemoi.training.losses.graphcast_full.GraphCastFullLoss"
     horizontal_gradient = "anemoi.training.losses.horizontal_gradient.HorizontalGradientLoss"
     graphcast_wind = "anemoi.training.losses.graphcast_wind.GraphCastWindAwareLoss"
+    graphcast_mae = "anemoi.training.losses.GraphCastMAELoss"
     graphcast_mse = "anemoi.training.losses.GraphCastMSELoss"
     graphcast_huber = "anemoi.training.losses.GraphCastHuberLoss"
     graphcast_logcosh = "anemoi.training.losses.GraphCastLogCoshLoss"
@@ -400,6 +401,19 @@ class GraphCastMSELossSchema(BaseLossSchema):
     "Minimum weight for extreme samples."
 
 
+class GraphCastMAELossSchema(BaseLossSchema):
+    """Schema for GraphCast-style MAE loss (mirror of MSELossSchema, |y-x| metric).
+
+    Same sample-weighting + scalers + ignore_nans plumbing as MSE; only
+    the per-cell error term differs. Pair with stdev_tendency, NOT
+    var_tendency (see feedback-loss-tendency-pairing memory).
+    """
+
+    sample_weighting: bool = False
+    sample_weight_threshold: float = 10.0
+    sample_weight_min: float = 0.01
+
+
 class GraphCastHuberLossSchema(BaseLossSchema):
     """Schema for GraphCast-style Huber loss with sample weighting."""
 
@@ -450,12 +464,23 @@ class GraphCastCRPSLossSchema(BaseLossSchema):
     Per-cell metric is fair/almost-fair kernel CRPS; the GraphCastBaseLoss
     reduction (mean-over-levels-per-group → sum-over-grid → mean-over-ensemble
     → sum-over-groups → weighted-batch-mean) is applied unchanged on top.
+
+    Optional: ATLAS (Kossaifi et al, NVIDIA 2026) spectral-CRPS regularisation
+    via ``spectral_crps_weight`` + ``spectral_grid_shape``. Fixes the spectral
+    bias (HF under-representation / pixelation) that vanilla CRPS exhibits.
     """
 
     alpha: float = 1.0
     """Blend between fair (1.0; FGN) and unfair (0.0; MAE/N) CRPS. epsilon = (1 - alpha) / N."""
     no_autocast: bool = True
     "Deactivate autocast for the kernel CRPS calculation (matches AlmostFairKernelCRPS)."
+    spectral_crps_weight: float = 0.0
+    """λ_spec for ATLAS spectral-CRPS regularisation. 0.0 = off (default).
+    Penalises kernel CRPS on magnitudes of 2-D FFT coefficients of (pred, target);
+    directly addresses the HF-pixelation failure mode of v24/v24_ft."""
+    spectral_grid_shape: list = []
+    """2-element [H, W] grid shape needed to reshape the flat-G dim into 2-D for
+    rFFT2. Required when spectral_crps_weight > 0; for patches this is [250, 250]."""
 
 
 class GraphCastGaussianNLLLossSchema(BaseLossSchema):
@@ -489,6 +514,7 @@ class CombinedLossSchema(BaseLossSchema):
         BaseLossSchema
         | HuberLossSchema
         | GraphCastMSELossSchema
+        | GraphCastMAELossSchema
         | GraphCastHuberLossSchema
         | GraphCastLogCoshLossSchema
         | GraphCastClippedMSELossSchema
@@ -675,6 +701,7 @@ LossSchemas = (
     | SpectralLossSchema
     | MultiScaleLossSchema
     | GraphCastMSELossSchema
+    | GraphCastMAELossSchema
     | GraphCastHuberLossSchema
     | GraphCastLogCoshLossSchema
     | GraphCastClippedMSELossSchema
@@ -797,6 +824,33 @@ class ForecasterEnsSchema(ForecasterSchema):
     "Training objective."
 
 
+class ResidualForecasterRandomConditionSchema(ForecasterSchema):
+    # Deterministic residual forecaster + random per-batch noise conditioning.
+    # Used as a 5K-step warmup before CRPS FT: gives the zero-initialised
+    # adaLN modulation weights some non-zero gradient signal while still
+    # under the v17 deterministic loss.
+    model_task: Literal["anemoi.training.train.tasks.GraphResidualForecasterRandomCondition"] = Field(
+        ...,
+        alias="model_task",
+    )
+    "Training objective (deterministic + random conditioning warmup)."
+    noise_vector_dim: PositiveInt = Field(default=32)
+    "Per-batch noise-vector dimensionality. Must match model.dit.noise_vector_dim. Default 32 (FGN)."
+
+
+class EnsResidualForecasterDropoutSchema(ForecasterSchema):
+    # MC-dropout ensemble residual forecaster (U-Cast recipe, Cachay et al
+    # 2604.09041). Same shape as the noise-vector variant but uses dropout
+    # layers in the DiT for stochasticity; no noise_encoder param needed.
+    model_task: Literal["anemoi.training.train.tasks.GraphEnsResidualForecasterDropout"] = Field(
+        ...,
+        alias="model_task",
+    )
+    "Training objective (ensemble + residual + MC dropout; pair with GraphCastCRPSLoss)."
+    noise_vector_dim: PositiveInt = Field(default=32)
+    "Inherited from parent schema for backward compat; ignored by the dropout task."
+
+
 class EnsResidualForecasterSchema(ForecasterSchema):
     # FGN-style ensemble residual forecaster: combines GraphResidualForecaster's
     # residual reconstruction with GraphEnsForecaster's ensemble path + per-member
@@ -832,12 +886,43 @@ class InterpolationSchema(BaseTrainingSchema):
     "Forcing parameters for target output times."
 
 
+class AtlasDecoderForecasterSchema(BaseTrainingSchema):
+    # v30 Atlas decoder pre-training. Single-step task; no rollout.
+    # Variant B normalization (mean-std residuals; tendency normalization
+    # in the loss only). See project_v30_variant_b_design memory.
+    model_task: Literal["anemoi.training.train.tasks.GraphAtlasDecoderForecaster"] = Field(
+        ...,
+        alias="model_task",
+    )
+    "Training objective (Atlas decoder, deterministic L1)."
+    rollout: Rollout = Field(default_factory=Rollout)
+    "Rollout configuration (locked to 1 for the decoder)."
+
+
+class AtlasLatentForecasterSchema(BaseTrainingSchema):
+    # v30 Atlas latent predictive training. CRPS in latent space with
+    # FGN-style noise injection. Variant B normalization.
+    model_task: Literal["anemoi.training.train.tasks.GraphAtlasLatentForecaster"] = Field(
+        ...,
+        alias="model_task",
+    )
+    "Training objective (Atlas latent, probabilistic CRPS)."
+    rollout: Rollout = Field(default_factory=Rollout)
+    "Rollout configuration."
+    noise_vector_dim: PositiveInt = Field(default=32)
+    "Per-(batch, member) noise-vector dim. Must match model.latent.noise_vector_dim."
+
+
 TrainingSchema = Annotated[
     ForecasterSchema
     | ForecasterEnsSchema
+    | ResidualForecasterRandomConditionSchema
     | EnsResidualForecasterSchema
+    | EnsResidualForecasterDropoutSchema
     | InterpolationSchema
     | DiffusionForecasterSchema
-    | DiffusionTendForecasterSchema,
+    | DiffusionTendForecasterSchema
+    | AtlasDecoderForecasterSchema
+    | AtlasLatentForecasterSchema,
     Discriminator("model_task"),
 ]

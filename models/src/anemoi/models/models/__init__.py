@@ -7,11 +7,14 @@
 # granted to it by virtue of its status as an intergovernmental organisation
 # nor does it submit to any jurisdiction.
 
+from .atlas_composed_model import AnemoiAtlasModel
 from .base import BaseGraphModel
+from .decoder_dit_wrapper import AnemoiDecoderDiTModel
 from .diffusion_encoder_processor_decoder import AnemoiDiffusionModelEncProcDec
 from .diffusion_encoder_processor_decoder import AnemoiDiffusionTendModelEncProcDec
 from .dit_wrapper import AnemoiDiTModel
 from .encoder_processor_decoder import AnemoiModelEncProcDec
+from .latent_dit_wrapper import AnemoiLatentDiTModel
 from .unet_wrapper import AnemoiUNetModel
 from .ens_encoder_processor_decoder import AnemoiEnsModelEncProcDec
 from .hierarchical import AnemoiModelEncProcDecHierarchical
@@ -20,7 +23,10 @@ from .residual_encoder_processor_decoder import AnemoiResidualModelEncProcDec
 
 __all__ = [
     "BaseGraphModel",
+    "AnemoiAtlasModel",
+    "AnemoiDecoderDiTModel",
     "AnemoiDiTModel",
+    "AnemoiLatentDiTModel",
     "AnemoiUNetModel",
     "AnemoiModelEncProcDec",
     "AnemoiEnsModelEncProcDec",

@@ -12,6 +12,7 @@ import logging
 import warnings
 from abc import abstractmethod
 
+import numpy as np
 import torch
 
 from anemoi.models.data_indices.collection import IndexCollection
@@ -97,3 +98,107 @@ class VarTendencyScaler(BaseTendencyScaler):
 
     def get_level_scaling(self, variable_stdev: float, variable_tendency_stdev: float) -> float:
         return variable_stdev**2 / variable_tendency_stdev**2
+
+
+class _LatentTendencyMixin:
+    """Shared init logic for latent-space tendency scalers.
+
+    Loads ``statistics_tendencies_<freqstr>_latent_stdev`` directly from a
+    zarr and substitutes it for the physical ``statistics_tendencies['stdev']``
+    that ``create_scalers`` auto-injects. Subclasses pair this with a
+    ``get_level_scaling`` (squared for MSE-family losses, linear for
+    MAE/CRPS-family losses).
+    """
+
+    def __init__(
+        self,
+        data_indices: IndexCollection,
+        statistics: dict,
+        statistics_tendencies: dict,
+        norm: str | None = None,
+        *,
+        latent_stats_path: str,
+        latent_stats_key: str | None = None,
+        **kwargs,
+    ) -> None:
+        import zarr
+
+        z = zarr.open(latent_stats_path, mode="r")
+        freqstr = z.attrs.get("frequency")
+        if not freqstr:
+            error = (
+                f"{self.__class__.__name__}: zarr at {latent_stats_path!r} has no "
+                "'frequency' attribute; cannot resolve latent stats key."
+            )
+            raise RuntimeError(error)
+        key = latent_stats_key or f"statistics_tendencies_{freqstr}_latent_stdev"
+        if key not in z:
+            error = (
+                f"{self.__class__.__name__}: {key!r} missing from "
+                f"{latent_stats_path!r}. Run grafai/datasets/"
+                "compute_latent_tendency_stats.py first."
+            )
+            raise RuntimeError(error)
+        latent_stdev = np.asarray(z[key][:])
+        LOGGER.info(
+            "%s: loaded latent tendency stdev %s from %s (range [%.3e, %.3e])",
+            self.__class__.__name__, key, latent_stats_path,
+            float(latent_stdev.min()), float(latent_stdev.max()),
+        )
+
+        tendencies_latent = dict(statistics_tendencies or {})
+        tendencies_latent["stdev"] = latent_stdev
+
+        super().__init__(
+            data_indices=data_indices,
+            statistics=statistics,
+            statistics_tendencies=tendencies_latent,
+            norm=norm,
+            **kwargs,
+        )
+
+
+class LatentVarTendencyScaler(_LatentTendencyMixin, BaseTendencyScaler):
+    """Variance-of-tendency scaler in LATENT space.
+
+    Pairs with **MSE-style** losses (squared error). Multiplies each
+    per-variable loss contribution by ``(σ_var / σ_lat_tend)²`` so a
+    mean-std-space residual lands on O(1) magnitude per channel.
+
+    Use this when the underlying loss is squared (MSE, GaussianNLL).
+
+    For MAE/CRPS-style absolute-error losses, use
+    :class:`LatentStdevTendencyScaler` instead — the linear σ pairing.
+
+    Parameters
+    ----------
+    latent_stats_path : str
+        Path to the training zarr containing
+        ``statistics_tendencies_<freqstr>_latent_stdev`` (computed by
+        ``grafai/datasets/compute_latent_tendency_stats.py``).
+    latent_stats_key : str, optional
+        Override for the array key.
+    """
+
+    def get_level_scaling(self, variable_stdev: float, variable_tendency_stdev: float) -> float:
+        return variable_stdev**2 / variable_tendency_stdev**2
+
+
+class LatentStdevTendencyScaler(_LatentTendencyMixin, BaseTendencyScaler):
+    """Stdev-of-tendency scaler in LATENT space.
+
+    Pairs with **MAE / CRPS / absolute-error** losses. Multiplies each
+    per-variable loss contribution by ``(σ_var / σ_lat_tend)¹`` so a
+    mean-std-space residual lands on O(1) magnitude per channel.
+
+    Use this for the v30 latent predictive task (CRPS in latent) and any
+    other L1-family losses computed against mean-std residuals.
+
+    For MSE-style squared-error losses, use
+    :class:`LatentVarTendencyScaler` instead.
+
+    Parameters as for :class:`LatentVarTendencyScaler`.
+    """
+
+    def get_level_scaling(self, variable_stdev: float, variable_tendency_stdev: float) -> float:
+        return variable_stdev / variable_tendency_stdev
