@@ -208,6 +208,39 @@ class AnemoiLatentDiTModel(nn.Module):
             )
             raise ValueError(error)
 
+        # Standard Anemoi init kwargs: data_indices / statistics / graph_data
+        # are passed by AnemoiModelInterface to every model class regardless
+        # of whether the class uses them. Handle each explicitly:
+        #
+        # * data_indices: USED for sanity checks below — catches the case
+        #   where in_channels / forcings_channels in the config drift away
+        #   from what the data actually has, before the shape mismatch
+        #   surfaces 16 DiT blocks deep in a forward pass.
+        # * statistics: Variant B normalization keeps stats in
+        #   AnemoiModelInterface.pre_processors; the model itself doesn't
+        #   need them. Accept and ignore.
+        # * graph_data: GNN-only (encoder/processor/decoder graphs).
+        #   FlexibleDiT is grid-native — no graph. Accept and ignore.
+        if data_indices is not None:
+            n_prog_data = len(data_indices.data.input.prognostic)
+            n_forcings_data = len(data_indices.data.input.forcing)
+            if n_prog_data != in_channels:
+                error = (
+                    f"AnemoiLatentDiTModel: config in_channels={in_channels} "
+                    f"but data_indices.data.input.prognostic has {n_prog_data} "
+                    f"entries. Edit data/vars or model.latent.in_channels."
+                )
+                raise ValueError(error)
+            if forcings_channels > 0 and n_forcings_data != forcings_channels:
+                error = (
+                    f"AnemoiLatentDiTModel: config forcings_channels="
+                    f"{forcings_channels} but data_indices.data.input.forcing "
+                    f"has {n_forcings_data} entries. Edit data/vars or "
+                    f"model.latent.forcings_channels."
+                )
+                raise ValueError(error)
+        del statistics, graph_data  # accepted for Anemoi compat; not used
+
         self.latent_shape = tuple(latent_shape)
         self.history_len = history_len
         self.noise_vector_dim = noise_vector_dim

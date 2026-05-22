@@ -220,6 +220,140 @@ class AnemoiAtlasModel(nn.Module):
             }
         return x_next
 
+    def predict_step(
+        self,
+        batch: torch.Tensor,
+        pre_processors: nn.Module,
+        post_processors: nn.Module,
+        data_indices,
+        multi_step: int,
+        model_comm_group=None,
+        gather_out: bool = True,
+        residual_normalizer=None,
+        **kwargs,
+    ) -> torch.Tensor:
+        """Anemoi-inference-compatible predict_step for the composed Atlas model.
+
+        Mirrors the contract of ``AnemoiDiTModel.predict_step`` (v17) so the
+        existing ``AnemoiModelInterface.predict_step`` can call us
+        transparently — no runner changes required other than substituting
+        this ``AnemoiAtlasModel`` for the standalone latent-predictive at
+        ``predictor.py:_compose_atlas_model``.
+
+        Variant B normalization (locked v30 design):
+          1. ``pre_processors`` normalize the full batch (mean-std) so x_curr,
+             x_prev arrive in σ-normalized space.
+          2. The composed forward returns ``x_next_prog`` in σ-normalized
+             space (delta is added to σ-normalized x_curr_prog).
+          3. We denormalize via ``norm_mul / norm_add`` from the input
+             normalizer (same path v17's predict_step uses) so output is in
+             physical units, matching what the runner expects.
+
+        Parameters
+        ----------
+        batch : torch.Tensor
+            ``(B, T, G, V)`` with ``T == multi_step`` history frames.
+        pre_processors, post_processors : nn.Module
+            Anemoi normalizers (from AnemoiModelInterface).
+        data_indices : IndexCollection
+            Provides prognostic/forcing/full index lists in the input space.
+        multi_step : int
+            Number of history frames in ``batch``. Must be ``>= 2`` —
+            the composed model needs both x_curr and x_prev.
+
+        Returns
+        -------
+        torch.Tensor
+            ``(B, 1, G, V_out_full)`` with prognostic channels filled by
+            the composed forecast and diagnostic channels zeroed
+            (the composed model doesn't predict diagnostics — matches v17
+            residual-mode behavior).
+        """
+        # Unused parameters accepted for runner compat:
+        del model_comm_group, gather_out, residual_normalizer
+
+        with torch.no_grad():
+            assert batch.dim() == 4, (
+                f"AnemoiAtlasModel.predict_step expects 4D batch (B, T, G, V); got {batch.shape}"
+            )
+            assert multi_step >= 2, (
+                "AnemoiAtlasModel.predict_step requires multi_step >= 2 "
+                f"(needs x_curr + x_prev); got multi_step={multi_step}"
+            )
+
+            B, T, G, V = batch.shape
+
+            # Add ensemble dim and normalize the history window (B, T, 1, G, V).
+            x = batch[:, 0:multi_step, None, ...].clone()
+            x = pre_processors(x, in_place=True)
+
+            # Pull the input-space index lists (full = prog + forcings).
+            input_full_idx = data_indices.data.input.full
+            input_prog_idx = data_indices.data.input.prognostic
+            input_forc_idx = data_indices.data.input.forcing
+
+            # Slice last + second-to-last frames as full-state tensors
+            # (B, V_full, H, W). Squeeze ensemble dim — the composed forward
+            # accepts (B, C, H, W); ensemble re-fans-out via the noise vector.
+            H, W = self.full_res_shape
+            def _to_image(t, idx_list):
+                """(B, 1, G, V) → (B, len(idx_list), H, W)."""
+                sl = t[..., idx_list]                    # (B, 1, G, n)
+                # collapse ensemble singleton then channels-last → channels-first
+                sl = sl.squeeze(1)                       # (B, G, n)
+                sl = sl.permute(0, 2, 1).contiguous()    # (B, n, G)
+                return sl.reshape(B, -1, H, W)
+
+            x_curr_full = _to_image(x[:, -1], input_full_idx)         # (B, V_full, H, W)
+            x_prev_full = _to_image(x[:, -2], input_full_idx) if multi_step >= 2 else x_curr_full
+
+            # Composed forecast returns the normalized next-step prog state.
+            # The composed wrapper auto-samples noise if predictive.noise_vector_dim > 0.
+            x_next_prog_norm = self.forward(
+                x_curr_full, x_prev=x_prev_full, noise=None,
+                return_intermediates=False,
+            )                                            # (B, prog_channels, H, W)
+
+            # Reshape back to anemoi (B, 1, G, V_prog).
+            n_prog = self.prognostic_channels
+            x_next_prog_norm = (
+                x_next_prog_norm.reshape(B, n_prog, G).permute(0, 2, 1).contiguous()
+            )                                            # (B, G, n_prog)
+            x_next_prog_norm = x_next_prog_norm.unsqueeze(1)   # (B, 1, G, n_prog)
+
+            # Denormalize prognostic-only via input normalizer
+            # (state lives in σ-normalized space; mean-std denorm gives physical).
+            norm_mul, norm_add = self._get_normalizer_buffers(pre_processors)
+            prog_mul = norm_mul[input_prog_idx].float()
+            prog_add = norm_add[input_prog_idx].float()
+            x_next_prog_phys = (
+                (x_next_prog_norm.float() - prog_add) / prog_mul
+            ).to(x_next_prog_norm.dtype)
+
+            # Build full output tensor (B, 1, G, V_out_full). Decoder outputs
+            # are prognostic-only; diagnostic channels (if any) stay zero —
+            # the v30 stack does not model diagnostics.
+            model_prog_idx = data_indices.model.output.prognostic
+            n_output = len(data_indices.model.output.full)
+            y_hat = torch.zeros(
+                B, 1, G, n_output,
+                dtype=x_next_prog_phys.dtype, device=x_next_prog_phys.device,
+            )
+            y_hat[..., model_prog_idx] = x_next_prog_phys
+        return y_hat
+
+    @staticmethod
+    def _get_normalizer_buffers(pre_processors: nn.Module):
+        """Pull (norm_mul, norm_add) from the InputNormalizer in pre_processors."""
+        for processor in pre_processors.processors.values():
+            if hasattr(processor, "_norm_mul") and hasattr(processor, "_norm_add"):
+                return processor._norm_mul, processor._norm_add
+        raise RuntimeError(
+            "AnemoiAtlasModel.predict_step: InputNormalizer buffers not "
+            "found in pre_processors. The composed model needs mean-std stats "
+            "to denormalize the predicted prognostic state."
+        )
+
 
 _RECIPE_DEFAULTS = {
     "fgn": {

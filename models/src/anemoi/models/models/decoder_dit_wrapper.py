@@ -414,6 +414,46 @@ class AnemoiDecoderDiTModelV2(nn.Module):
             )
             raise ValueError(error)
 
+        # Standard Anemoi init kwargs: data_indices / statistics / graph_data
+        # are passed by AnemoiModelInterface to every model class regardless
+        # of whether the class uses them. Handle each explicitly:
+        #
+        # * data_indices: USED for sanity checks — catches in_channels_xt /
+        #   in_channels_r / out_channels drift between config and data
+        #   before it surfaces as a shape mismatch in forward.
+        # * statistics: Variant B normalization keeps stats in
+        #   AnemoiModelInterface.pre_processors; the model itself doesn't
+        #   need them. Accept and ignore.
+        # * graph_data: GNN-only. FlexibleDiT + Conv2d skip paths are
+        #   grid-native — no graph. Accept and ignore.
+        if data_indices is not None:
+            n_full_data = len(data_indices.data.input.full)
+            n_prog_data = len(data_indices.data.input.prognostic)
+            if n_full_data != in_channels_xt:
+                error = (
+                    f"AnemoiDecoderDiTModelV2: config in_channels_xt={in_channels_xt} "
+                    f"but data_indices.data.input.full has {n_full_data} entries. "
+                    f"Edit data/vars or model.decoder.in_channels_xt."
+                )
+                raise ValueError(error)
+            if n_prog_data != in_channels_r:
+                error = (
+                    f"AnemoiDecoderDiTModelV2: config in_channels_r={in_channels_r} "
+                    f"but data_indices.data.input.prognostic has {n_prog_data} "
+                    f"entries (latent residual matches prognostic count). "
+                    f"Edit data/vars or model.decoder.in_channels_r."
+                )
+                raise ValueError(error)
+            if n_prog_data != out_channels:
+                error = (
+                    f"AnemoiDecoderDiTModelV2: config out_channels={out_channels} "
+                    f"but data_indices.data.input.prognostic has {n_prog_data} "
+                    f"entries (full-res residual is prognostic-only). "
+                    f"Edit data/vars or model.decoder.out_channels."
+                )
+                raise ValueError(error)
+        del statistics, graph_data  # accepted for Anemoi compat; not used
+
         self.full_res_shape = tuple(full_res_shape)
         self.latent_shape = tuple(latent_shape)
         self.hidden_size = hidden_size
