@@ -223,21 +223,27 @@ class GraphAtlasDecoderForecaster(BaseGraphModule):
 
         # Smoke-time invariant check (cheap, runs every step but trivially fast).
         # Mismatched counts → the data_indices and config disagree.
-        # v1 uses xt_tokenizer (strided Conv2d); v2 uses xt_proj (1x1 Conv after
-        # bilinear downsample). Both expose .in_channels.
-        xt_module = getattr(
-            self.decoder, "xt_tokenizer", None
-        ) or getattr(self.decoder, "xt_proj", None)
-        if xt_module is None:
-            error = (
-                "GraphAtlasDecoderForecaster: decoder exposes neither xt_tokenizer "
-                "nor xt_proj — cannot validate x_full channel count."
+        # v1 uses xt_tokenizer (strided Conv2d), v2 (with placeholder blocks)
+        # used xt_proj (1x1 Conv), and v2 (post-FlexibleDiT refactor) exposes
+        # `in_channels_xt` directly as an attribute. Check in that order.
+        if hasattr(self.decoder, "in_channels_xt"):
+            expected_in = self.decoder.in_channels_xt
+        else:
+            xt_module = getattr(self.decoder, "xt_tokenizer", None) or getattr(
+                self.decoder, "xt_proj", None,
             )
-            raise RuntimeError(error)
-        if x_full.shape[1] != xt_module.in_channels:
+            if xt_module is None:
+                error = (
+                    "GraphAtlasDecoderForecaster: decoder exposes neither "
+                    "in_channels_xt, xt_tokenizer, nor xt_proj — cannot validate "
+                    "x_full channel count."
+                )
+                raise RuntimeError(error)
+            expected_in = xt_module.in_channels
+        if x_full.shape[1] != expected_in:
             error = (
                 f"x_full has {x_full.shape[1]} channels, but decoder x_t input "
-                f"expects {xt_module.in_channels}. data_indices/config mismatch."
+                f"expects {expected_in}. data_indices/config mismatch."
             )
             raise RuntimeError(error)
 

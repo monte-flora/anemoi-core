@@ -39,6 +39,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from anemoi.models.layers.bilinear_encoder import bilinear_upsample, resize_pos_embed
+from anemoi.models.models.flexible_dit import FlexibleDiT
 
 LOGGER = logging.getLogger(__name__)
 
@@ -418,44 +419,25 @@ class AnemoiDecoderDiTModelV2(nn.Module):
         self.hidden_size = hidden_size
         self.depth = depth
         self.out_channels = out_channels
+        # Expose the expected input-channel count so the task class can
+        # validate batch shapes without poking into the internal FlexibleDiT.
+        self.in_channels_xt = int(in_channels_xt)
+        self.in_channels_r = int(in_channels_r)
 
-        e_x = int(hidden_size * embed_split)
-        e_r = hidden_size - e_x
-        self.e_x = e_x
-        self.e_r = e_r
-
-        # v2 CHANGE: replace strided Conv2d tokenizer with 1x1 Conv channel
-        # projection. The actual spatial downsample is done by F.interpolate
-        # with mode="bilinear" in forward(), matching the operator used to
-        # produce r_lat. No more learned-vs-bilinear coordinate mismatch.
-        self.xt_proj = nn.Conv2d(in_channels_xt, e_x, kernel_size=1)
-
-        # 1x1 conv on r_t (unchanged from v1).
-        self.r_tokenizer = nn.Conv2d(in_channels_r, e_r, kernel_size=1)
-
-        # Cached sin-cos positional embedding for the latent token grid
-        # (unchanged from v1).
-        pos = _sincos_2d_pos_embed(
-            self.latent_shape[0], self.latent_shape[1],
-            hidden_size, device="cpu",
-        )
-        self.register_buffer("pos_embed", pos.unsqueeze(0))
-
-        # Scaffold DiT-like blocks (unchanged from v1; will be replaced by
-        # NATTEN-DiT in Phase 2).
-        self.blocks = nn.ModuleList()
-        pad = attn_kernel // 2
-        for _ in range(depth):
-            self.blocks.append(
-                nn.Sequential(
-                    nn.GroupNorm(num_groups=8, num_channels=hidden_size),
-                    nn.Conv2d(hidden_size, hidden_size, kernel_size=attn_kernel, padding=pad),
-                    nn.GELU(),
-                    nn.Conv2d(hidden_size, hidden_size, kernel_size=1),
-                )
-            )
-
-        # Latent path output projection + PixelShuffle (unchanged from v1).
+        # v2 UPGRADED FROM PLACEHOLDER (2026-05-22):
+        # Replaced the v1 SCAFFOLD conv blocks (GroupNorm + Conv2d + GELU +
+        # Conv2d, NOT a DiT) with a real physicsnemo FlexibleDiT.
+        #
+        # FlexibleDiT does its own tokenize → DiT-blocks → detokenize chain
+        # at full-resolution input. We feed it:
+        #     concat([r_bilinear, x_t], dim=1)   # (B, out_channels + in_channels_xt, H, W)
+        # It tokenizes via 4×4 strided Conv2d (patch_size=4) → 63×63 tokens,
+        # runs `depth` DiT blocks with NATTEN local attention (Atlas's
+        # decoder recipe: "the task of the decoder is spatially local"),
+        # and uses pixel_shuffle detokenizer to upsample back to full-res.
+        #
+        # The decoder is deterministic (Atlas-faithful) — noise stays in
+        # v30b. So conditioning_embedder='zero' (no adaLN modulation).
         stride_h = math.ceil(self.full_res_shape[0] / self.latent_shape[0])
         stride_w = math.ceil(self.full_res_shape[1] / self.latent_shape[1])
         if stride_h != stride_w:
@@ -465,10 +447,44 @@ class AnemoiDecoderDiTModelV2(nn.Module):
             )
             raise ValueError(error)
         self.stride = (stride_h, stride_w)
-        self.final = nn.Conv2d(
-            hidden_size, out_channels * stride_h * stride_w, kernel_size=1,
+
+        # Pad full_res_shape up to a multiple of stride so the tokenizer's
+        # learnable pos_embed has the right token count (mirrors v17 dit_wrapper).
+        pad_h = (stride_h - self.full_res_shape[0] % stride_h) % stride_h
+        pad_w = (stride_w - self.full_res_shape[1] % stride_w) % stride_w
+        padded_full_res = (self.full_res_shape[0] + pad_h, self.full_res_shape[1] + pad_w)
+
+        # FlexibleDiT input channels: bilinear-upsampled r_t (out_channels) +
+        # x_t with forcings (in_channels_xt).
+        dit_in_channels = out_channels + in_channels_xt
+
+        self.dit = FlexibleDiT(
+            input_size=padded_full_res,
+            in_channels=dit_in_channels,
+            out_channels=out_channels,
+            patch_size=stride_h,
+            hidden_size=hidden_size,
+            depth=depth,
+            num_heads=num_heads,
+            mlp_ratio=4.0,
+            attention_backend="natten2d",
+            attn_kwargs={"attn_kernel": attn_kernel},
+            # NOTE: 'zero' conditioning is INCOMPATIBLE with the pixel_shuffle
+            # detokenizer's ProjLayer adaLN (it expects a real (B, D)
+            # conditioning vector). Use 'dit' with t=0 at forward time —
+            # produces a fixed but valid conditioning vector. Matches the
+            # convention v17's dit_natten.yaml documents:
+            # "conditioning_embedder: dit  # unconditional (t=0 at forward
+            #  time); 'zero' incompatible with ProjLayer".
+            conditioning_embedder="dit",
+            condition_dim=0,
+            force_tokenization_fp32=False,
+            detokenizer_type="pixel_shuffle",  # cross-patch refinement convs avoid the
+                                                # per-patch independence pixelation
         )
-        self.pixel_shuffle = nn.PixelShuffle(stride_h)
+        # embed_split is unused with FlexibleDiT but kept in the schema for
+        # backwards compat; just consume the variable to silence linters.
+        _ = embed_split
 
         # v2 NEW: full-res x_t skip path. Two-layer ConvNet, no downsampling.
         sk_pad = x_t_skip_kernel // 2
@@ -510,17 +526,12 @@ class AnemoiDecoderDiTModelV2(nn.Module):
         )
 
         # Zero-init the LAST conv of the combiner so the correction starts at 0.
-        # Combined with `final` zero-init below, the model output starts as
-        # exactly the bilinear baseline.
+        # FlexibleDiT's detokenizer already has adaLN-Zero internally (its
+        # `adaptive_modulation` zeros out the final scale/shift), so out_full
+        # ≈ 0 at init regardless. The combiner zero-init guarantees
+        # correction = 0 → output starts EXACTLY at the bilinear baseline.
         nn.init.zeros_(self.combiner[-1].weight)
         nn.init.zeros_(self.combiner[-1].bias)
-
-        # Keep `final` zero-init too — at init out_full = 0, so out_full
-        # contributes nothing to the combiner. The combiner is then producing
-        # correction = combiner(0, x_t_feat) which with zero-init last layer
-        # = 0. Clean two-stage zero-anchoring.
-        nn.init.zeros_(self.final.weight)
-        nn.init.zeros_(self.final.bias)
 
     def forward(
         self,
@@ -549,40 +560,31 @@ class AnemoiDecoderDiTModelV2(nn.Module):
             ``(B, out_channels, H, W)`` matching the input ``x_t``'s spatial shape.
         """
         H, W = int(x_t.shape[-2]), int(x_t.shape[-1])
-        lh, lw = self.latent_shape
 
         # Path 1: bilinear baseline (the floor we never want to drop below).
         r_bilinear = F.interpolate(
             r_t, size=(H, W), mode="bilinear", align_corners=False,
         )
 
-        # Path 2: latent DiT. Bilinear-downsample x_t to the latent grid so
-        # it lives in the same coordinate system as r_t (= B(x_{t+1}) - B(x_t)).
-        x_t_lat = F.interpolate(
-            x_t, size=(lh, lw), mode="bilinear", align_corners=False,
-        )
-        tok_x = self.xt_proj(x_t_lat)        # (B, e_x, lh, lw)
-        tok_r = self.r_tokenizer(r_t)        # (B, e_r, lh, lw)
-        tok = torch.cat([tok_x, tok_r], dim=1)  # (B, hidden, lh, lw)
+        # Path 2: real DiT (FlexibleDiT with NATTEN local attention).
+        # Concatenate r_bilinear (already at full-res) with x_t and feed to
+        # FlexibleDiT. It will tokenize via 4×4 strided Conv2d → 63×63 tokens,
+        # run NATTEN-DiT blocks (Atlas decoder recipe), then pixel_shuffle
+        # detokenize back to full-res. Pad input to a multiple of stride if
+        # needed; FlexibleDiT crops back via its detokenizer convention.
+        s_h, s_w = self.stride
+        pad_h = (s_h - H % s_h) % s_h
+        pad_w = (s_w - W % s_w) % s_w
+        dit_in = torch.cat([r_bilinear, x_t], dim=1)  # (B, out + xt_in, H, W)
+        if pad_h or pad_w:
+            dit_in = F.pad(dit_in, (0, pad_w, 0, pad_h), mode="replicate")
 
-        # Positional embedding (resize-if-shape-mismatch identical to v1).
-        B, C, h, w = tok.shape
-        cfg_h, cfg_w = self.latent_shape
-        if (h, w) != (cfg_h, cfg_w):
-            pos_3d = resize_pos_embed(
-                self.pos_embed, old_shape=(cfg_h, cfg_w), new_shape=(h, w),
-            )
-        else:
-            pos_3d = self.pos_embed
-        pos = pos_3d.to(dtype=tok.dtype).reshape(1, h, w, C).permute(0, 3, 1, 2)
-        tok = tok + pos
-
-        for blk in self.blocks:
-            tok = tok + blk(tok)
-
-        out = self.final(tok)                # (B, out * s^2, lh, lw)
-        out_full = self.pixel_shuffle(out)   # (B, out, lh*s, lw*s)
-        out_full = out_full[..., :H, :W]     # crop to (H, W) — handles 252 -> 250
+        # FlexibleDiT requires (x, t[, condition]). decoder is deterministic
+        # (conditioning_embedder='zero') — pass t=zeros, condition=None.
+        B_in = dit_in.shape[0]
+        t0 = torch.zeros(B_in, device=dit_in.device, dtype=dit_in.dtype)
+        out_full = self.dit(dit_in, t0, condition=None)   # (B, out_channels, padded H, padded W)
+        out_full = out_full[..., :H, :W]                  # crop back
 
         # Path 3: full-res x_t skip.
         x_t_feat = self.x_t_skip(x_t)        # (B, skip_ch, H, W)
