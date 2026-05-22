@@ -297,6 +297,328 @@ class AnemoiDecoderDiTModel(nn.Module):
         return out
 
 
+class AnemoiDecoderDiTModelV2(nn.Module):
+    """v2: three-path decoder addressing the latent-bottleneck pixelation.
+
+    v1 (AnemoiDecoderDiTModel) has a single information path: a strided
+    Conv2d tokenizes x_t (250x250 -> 63x63) before the DiT blocks, so any
+    spatial scale finer than the latent grid is destroyed before it can
+    reach the output. Result: error fields show ~4-pixel blocky residuals
+    along sharp gradients (storm cells, fronts), and the trained decoder
+    is only marginally better than naive bilinear upsample of r_lat.
+
+    v2 adds two paths so the output can carry high-frequency content:
+
+      Path 1 (bilinear baseline):
+        r_bilinear = F.interpolate(r_lat, full_res, mode="bilinear")
+        Guarantees output >= naive bilinear at init. The combiner only
+        learns the correction on top.
+
+      Path 2 (existing latent DiT, with bilinear-downsampled x_t):
+        x_t_lat = F.interpolate(x_t, latent_shape, mode="bilinear")
+        tok_x = xt_proj(x_t_lat)      # 1x1 Conv channel projection
+        tok_r = r_tokenizer(r_t)
+        out_latent = DiT(concat(tok_x, tok_r))
+        out_full = pixel_shuffle(final(out_latent))
+        Note: bilinear downsample matches r_lat's coordinate system exactly
+        (vs v1's learned strided Conv2d which doesn't), removing a learning
+        burden — the model doesn't have to reconcile two different
+        latent representations of x_t.
+
+      Path 3 (NEW full-res x_t skip):
+        x_t_feat = small_convnet(x_t)
+        Preserves high-frequency context from x_t that survives to the
+        output without going through the latent bottleneck. This is what
+        addresses the pixelation in error fields.
+
+      Combiner: combiner(concat(out_full, x_t_feat)) -> correction
+        Zero-init final layer so the correction starts at 0 and the
+        model output starts at r_bilinear (naive baseline).
+
+      Output: delta_pred = r_bilinear + correction
+
+    Why each piece is load-bearing:
+      * Without bilinear baseline, the decoder has to relearn smooth
+        low-freq upsampling from scratch.
+      * Without x_t skip, the decoder has no path to high-freq content
+        and can't beat naive bilinear's pixelation floor (the latent grid
+        resolution).
+      * Without zero-init combiner, the model output at init is random
+        and the loss landscape starts far from the bilinear basin —
+        observed in v30a v1 as failure to converge to a useful state.
+
+    See [project_v30_variant_b_design] and
+    [reference_predictability_cutoffs] memories for the architectural
+    context.
+    """
+
+    def __init__(
+        self,
+        *,
+        # Either provide model_config OR explicit kwargs (matches v1 pattern).
+        model_config=None,
+        data_indices=None,
+        statistics=None,
+        graph_data=None,
+        full_res_shape: tuple[int, int] | None = None,
+        latent_shape: tuple[int, int] | None = None,
+        in_channels_xt: int | None = None,
+        in_channels_r: int | None = None,
+        out_channels: int | None = None,
+        hidden_size: int = 512,
+        depth: int = 8,
+        num_heads: int = 8,
+        attn_kernel: int = 9,
+        embed_split: float = 0.5,
+        # New v2 knobs:
+        x_t_skip_channels: int = 64,
+        x_t_skip_kernel: int = 5,
+        combiner_hidden: int = 64,
+        # Noise injection (FGN-style) — captures aleatoric uncertainty at
+        # storm scales (e.g., convective initiation where the LATENT r_lat
+        # constrains the synoptic pattern but the precise storm location/
+        # intensity is stochastic). Set to 0 for the Atlas-faithful
+        # deterministic decoder. Set to 32+ to match the v30b predictive's
+        # noise_vector_dim and let both models contribute to ensemble spread.
+        noise_vector_dim: int = 0,
+        noise_hidden: int = 64,
+        **_extra_kwargs,
+    ) -> None:
+        super().__init__()
+
+        if model_config is not None:
+            from anemoi.utils.config import DotDict
+            cfg = DotDict(model_config).model.model.decoder
+            full_res_shape = tuple(cfg.full_res_shape)
+            latent_shape = tuple(cfg.latent_shape)
+            in_channels_xt = int(cfg.in_channels_xt)
+            in_channels_r = int(cfg.in_channels_r)
+            out_channels = int(cfg.out_channels)
+            hidden_size = int(getattr(cfg, "hidden_size", hidden_size))
+            depth = int(getattr(cfg, "depth", depth))
+            num_heads = int(getattr(cfg, "num_heads", num_heads))
+            attn_kernel = int(getattr(cfg, "attn_kernel", attn_kernel))
+            embed_split = float(getattr(cfg, "embed_split", embed_split))
+            x_t_skip_channels = int(getattr(cfg, "x_t_skip_channels", x_t_skip_channels))
+            x_t_skip_kernel = int(getattr(cfg, "x_t_skip_kernel", x_t_skip_kernel))
+            combiner_hidden = int(getattr(cfg, "combiner_hidden", combiner_hidden))
+            noise_vector_dim = int(getattr(cfg, "noise_vector_dim", noise_vector_dim))
+            noise_hidden = int(getattr(cfg, "noise_hidden", noise_hidden))
+
+        if any(v is None for v in (full_res_shape, latent_shape, in_channels_xt,
+                                   in_channels_r, out_channels)):
+            error = (
+                "AnemoiDecoderDiTModelV2: must provide either model_config or all "
+                "of full_res_shape / latent_shape / in_channels_xt / in_channels_r / out_channels."
+            )
+            raise ValueError(error)
+
+        self.full_res_shape = tuple(full_res_shape)
+        self.latent_shape = tuple(latent_shape)
+        self.hidden_size = hidden_size
+        self.depth = depth
+        self.out_channels = out_channels
+
+        e_x = int(hidden_size * embed_split)
+        e_r = hidden_size - e_x
+        self.e_x = e_x
+        self.e_r = e_r
+
+        # v2 CHANGE: replace strided Conv2d tokenizer with 1x1 Conv channel
+        # projection. The actual spatial downsample is done by F.interpolate
+        # with mode="bilinear" in forward(), matching the operator used to
+        # produce r_lat. No more learned-vs-bilinear coordinate mismatch.
+        self.xt_proj = nn.Conv2d(in_channels_xt, e_x, kernel_size=1)
+
+        # 1x1 conv on r_t (unchanged from v1).
+        self.r_tokenizer = nn.Conv2d(in_channels_r, e_r, kernel_size=1)
+
+        # Cached sin-cos positional embedding for the latent token grid
+        # (unchanged from v1).
+        pos = _sincos_2d_pos_embed(
+            self.latent_shape[0], self.latent_shape[1],
+            hidden_size, device="cpu",
+        )
+        self.register_buffer("pos_embed", pos.unsqueeze(0))
+
+        # Scaffold DiT-like blocks (unchanged from v1; will be replaced by
+        # NATTEN-DiT in Phase 2).
+        self.blocks = nn.ModuleList()
+        pad = attn_kernel // 2
+        for _ in range(depth):
+            self.blocks.append(
+                nn.Sequential(
+                    nn.GroupNorm(num_groups=8, num_channels=hidden_size),
+                    nn.Conv2d(hidden_size, hidden_size, kernel_size=attn_kernel, padding=pad),
+                    nn.GELU(),
+                    nn.Conv2d(hidden_size, hidden_size, kernel_size=1),
+                )
+            )
+
+        # Latent path output projection + PixelShuffle (unchanged from v1).
+        stride_h = math.ceil(self.full_res_shape[0] / self.latent_shape[0])
+        stride_w = math.ceil(self.full_res_shape[1] / self.latent_shape[1])
+        if stride_h != stride_w:
+            error = (
+                f"AnemoiDecoderDiTModelV2: requires square pixel-shuffle stride, "
+                f"got {stride_h}x{stride_w} from full_res={full_res_shape}/latent={latent_shape}."
+            )
+            raise ValueError(error)
+        self.stride = (stride_h, stride_w)
+        self.final = nn.Conv2d(
+            hidden_size, out_channels * stride_h * stride_w, kernel_size=1,
+        )
+        self.pixel_shuffle = nn.PixelShuffle(stride_h)
+
+        # v2 NEW: full-res x_t skip path. Two-layer ConvNet, no downsampling.
+        sk_pad = x_t_skip_kernel // 2
+        self.x_t_skip = nn.Sequential(
+            nn.Conv2d(in_channels_xt, x_t_skip_channels,
+                      kernel_size=x_t_skip_kernel, padding=sk_pad),
+            nn.GELU(),
+            nn.Conv2d(x_t_skip_channels, x_t_skip_channels,
+                      kernel_size=3, padding=1),
+            nn.GELU(),
+        )
+
+        # v2 NEW: noise injection (FGN-style). If noise_vector_dim > 0, the
+        # forward signature accepts a noise vector of shape (B, noise_vector_dim).
+        # A small MLP maps it to (noise_hidden,) per-sample channel modulation
+        # that gets broadcast to (B, noise_hidden, H, W) and concatenated into
+        # the combiner input. This lets the decoder express aleatoric
+        # uncertainty at scales finer than r_lat resolves (storm initiation
+        # within a synoptic-scale convective pattern).
+        self.noise_vector_dim = int(noise_vector_dim)
+        self.noise_hidden = int(noise_hidden) if self.noise_vector_dim > 0 else 0
+        if self.noise_vector_dim > 0:
+            self.noise_encoder = nn.Sequential(
+                nn.Linear(self.noise_vector_dim, self.noise_hidden),
+                nn.GELU(),
+                nn.Linear(self.noise_hidden, self.noise_hidden),
+            )
+
+        # v2 NEW: combiner. Sees the full-res DiT output (out_channels)
+        # concatenated with the x_t skip features (x_t_skip_channels)
+        # and (if enabled) the broadcasted noise features (noise_hidden).
+        # Outputs a correction tensor (out_channels, H, W).
+        combiner_in_ch = out_channels + x_t_skip_channels + self.noise_hidden
+        self.combiner = nn.Sequential(
+            nn.Conv2d(combiner_in_ch, combiner_hidden,
+                      kernel_size=3, padding=1),
+            nn.GELU(),
+            nn.Conv2d(combiner_hidden, out_channels, kernel_size=1),
+        )
+
+        # Zero-init the LAST conv of the combiner so the correction starts at 0.
+        # Combined with `final` zero-init below, the model output starts as
+        # exactly the bilinear baseline.
+        nn.init.zeros_(self.combiner[-1].weight)
+        nn.init.zeros_(self.combiner[-1].bias)
+
+        # Keep `final` zero-init too — at init out_full = 0, so out_full
+        # contributes nothing to the combiner. The combiner is then producing
+        # correction = combiner(0, x_t_feat) which with zero-init last layer
+        # = 0. Clean two-stage zero-anchoring.
+        nn.init.zeros_(self.final.weight)
+        nn.init.zeros_(self.final.bias)
+
+    def forward(
+        self,
+        r_t: torch.Tensor,
+        x_t: torch.Tensor,
+        noise: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Decode latent residual + full-res state -> full-res residual.
+
+        Three-path forward (see class docstring).
+
+        Parameters
+        ----------
+        r_t : torch.Tensor
+            ``(B, in_channels_r, h_lat, w_lat)`` latent residual.
+        x_t : torch.Tensor
+            ``(B, in_channels_xt, H, W)`` full-resolution state + forcings.
+        noise : Optional[torch.Tensor]
+            ``(B, noise_vector_dim)`` FGN-style noise vector. Only used if
+            ``noise_vector_dim > 0`` (default 0 = deterministic Atlas-faithful
+            decoder). If None and noise_vector_dim > 0, samples N(0, I).
+
+        Returns
+        -------
+        torch.Tensor
+            ``(B, out_channels, H, W)`` matching the input ``x_t``'s spatial shape.
+        """
+        H, W = int(x_t.shape[-2]), int(x_t.shape[-1])
+        lh, lw = self.latent_shape
+
+        # Path 1: bilinear baseline (the floor we never want to drop below).
+        r_bilinear = F.interpolate(
+            r_t, size=(H, W), mode="bilinear", align_corners=False,
+        )
+
+        # Path 2: latent DiT. Bilinear-downsample x_t to the latent grid so
+        # it lives in the same coordinate system as r_t (= B(x_{t+1}) - B(x_t)).
+        x_t_lat = F.interpolate(
+            x_t, size=(lh, lw), mode="bilinear", align_corners=False,
+        )
+        tok_x = self.xt_proj(x_t_lat)        # (B, e_x, lh, lw)
+        tok_r = self.r_tokenizer(r_t)        # (B, e_r, lh, lw)
+        tok = torch.cat([tok_x, tok_r], dim=1)  # (B, hidden, lh, lw)
+
+        # Positional embedding (resize-if-shape-mismatch identical to v1).
+        B, C, h, w = tok.shape
+        cfg_h, cfg_w = self.latent_shape
+        if (h, w) != (cfg_h, cfg_w):
+            pos_3d = resize_pos_embed(
+                self.pos_embed, old_shape=(cfg_h, cfg_w), new_shape=(h, w),
+            )
+        else:
+            pos_3d = self.pos_embed
+        pos = pos_3d.to(dtype=tok.dtype).reshape(1, h, w, C).permute(0, 3, 1, 2)
+        tok = tok + pos
+
+        for blk in self.blocks:
+            tok = tok + blk(tok)
+
+        out = self.final(tok)                # (B, out * s^2, lh, lw)
+        out_full = self.pixel_shuffle(out)   # (B, out, lh*s, lw*s)
+        out_full = out_full[..., :H, :W]     # crop to (H, W) — handles 252 -> 250
+
+        # Path 3: full-res x_t skip.
+        x_t_feat = self.x_t_skip(x_t)        # (B, skip_ch, H, W)
+
+        # Build combiner input. If noise injection enabled, broadcast a
+        # per-sample noise feature map and concat. Default config (no noise)
+        # leaves the decoder deterministic — stochasticity lives in v30b.
+        combiner_inputs = [out_full, x_t_feat]
+        if self.noise_vector_dim > 0:
+            B = r_t.shape[0]
+            if noise is None:
+                noise = torch.randn(
+                    (B, self.noise_vector_dim),
+                    device=r_t.device, dtype=r_t.dtype,
+                )
+            elif noise.shape != (B, self.noise_vector_dim):
+                error = (
+                    f"AnemoiDecoderDiTModelV2: noise shape mismatch — got "
+                    f"{tuple(noise.shape)}, expected ({B}, {self.noise_vector_dim})."
+                )
+                raise ValueError(error)
+            noise_feat = self.noise_encoder(noise)                # (B, noise_hidden)
+            noise_feat = noise_feat.view(B, -1, 1, 1).expand(-1, -1, H, W)
+            combiner_inputs.append(noise_feat)
+        elif noise is not None:
+            # User passed noise but model wasn't configured to use it; warn
+            # rather than silently ignore.
+            LOGGER.warning(
+                "AnemoiDecoderDiTModelV2: received noise but noise_vector_dim=0; "
+                "ignoring. Set noise_vector_dim > 0 in the config to enable noise.",
+            )
+
+        correction = self.combiner(torch.cat(combiner_inputs, dim=1))
+        return r_bilinear + correction
+
+
 class IdentityBilinearDecoder(nn.Module):
     """Decoder placeholder that just upsamples the latent residual.
 

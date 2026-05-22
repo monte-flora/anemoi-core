@@ -45,6 +45,7 @@ import torch
 from anemoi.models.data_indices.collection import IndexCollection
 from anemoi.models.layers.bilinear_encoder import bilinear_downsample
 from anemoi.models.models.decoder_dit_wrapper import AnemoiDecoderDiTModel
+from anemoi.models.models.decoder_dit_wrapper import AnemoiDecoderDiTModelV2
 from anemoi.training.train.tasks.base import BaseGraphModule
 
 if TYPE_CHECKING:
@@ -98,14 +99,14 @@ class GraphAtlasDecoderForecaster(BaseGraphModule):
         # standard Hydra ``model._target_`` field. We expect that target to
         # resolve to AnemoiDecoderDiTModel.
         inner = self.model.model if hasattr(self.model, "model") else self.model
-        if not isinstance(inner, AnemoiDecoderDiTModel):
+        if not isinstance(inner, (AnemoiDecoderDiTModel, AnemoiDecoderDiTModelV2)):
             error = (
                 f"GraphAtlasDecoderForecaster requires the underlying model to be "
-                f"AnemoiDecoderDiTModel; got {type(inner).__name__}. Check "
-                f"config.model._target_."
+                f"AnemoiDecoderDiTModel or AnemoiDecoderDiTModelV2; got "
+                f"{type(inner).__name__}. Check config.model._target_."
             )
             raise TypeError(error)
-        self.decoder: AnemoiDecoderDiTModel = inner
+        self.decoder = inner
 
         # Locked: single AR step.
         self.multi_step = 1
@@ -222,10 +223,21 @@ class GraphAtlasDecoderForecaster(BaseGraphModule):
 
         # Smoke-time invariant check (cheap, runs every step but trivially fast).
         # Mismatched counts → the data_indices and config disagree.
-        if x_full.shape[1] != self.decoder.xt_tokenizer.in_channels:
+        # v1 uses xt_tokenizer (strided Conv2d); v2 uses xt_proj (1x1 Conv after
+        # bilinear downsample). Both expose .in_channels.
+        xt_module = getattr(
+            self.decoder, "xt_tokenizer", None
+        ) or getattr(self.decoder, "xt_proj", None)
+        if xt_module is None:
             error = (
-                f"x_full has {x_full.shape[1]} channels, but decoder.xt_tokenizer "
-                f"expects {self.decoder.xt_tokenizer.in_channels}. data_indices/config mismatch."
+                "GraphAtlasDecoderForecaster: decoder exposes neither xt_tokenizer "
+                "nor xt_proj — cannot validate x_full channel count."
+            )
+            raise RuntimeError(error)
+        if x_full.shape[1] != xt_module.in_channels:
+            error = (
+                f"x_full has {x_full.shape[1]} channels, but decoder x_t input "
+                f"expects {xt_module.in_channels}. data_indices/config mismatch."
             )
             raise RuntimeError(error)
 

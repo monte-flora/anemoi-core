@@ -75,6 +75,8 @@ class DefinedModels(str, Enum):
     # v30 Atlas-style latent rollout architecture (Variant B normalization).
     ANEMOI_ATLAS_DECODER_MODEL = "anemoi.models.models.decoder_dit_wrapper.AnemoiDecoderDiTModel"
     ANEMOI_ATLAS_DECODER_MODEL_SHORT = "anemoi.models.models.AnemoiDecoderDiTModel"
+    ANEMOI_ATLAS_DECODER_MODEL_V2 = "anemoi.models.models.decoder_dit_wrapper.AnemoiDecoderDiTModelV2"
+    ANEMOI_ATLAS_DECODER_MODEL_V2_SHORT = "anemoi.models.models.AnemoiDecoderDiTModelV2"
     ANEMOI_ATLAS_LATENT_MODEL = "anemoi.models.models.latent_dit_wrapper.AnemoiLatentDiTModel"
     ANEMOI_ATLAS_LATENT_MODEL_SHORT = "anemoi.models.models.AnemoiLatentDiTModel"
     ANEMOI_ATLAS_COMPOSED_MODEL = "anemoi.models.models.atlas_composed_model.AnemoiAtlasModel"
@@ -562,7 +564,14 @@ class HierarchicalModelSchema(BaseModelSchema):
 class AtlasDecoderConfigSchema(BaseModel):
     """Schema for the standalone Atlas decoder model.
 
-    Maps to :class:`anemoi.models.models.decoder_dit_wrapper.AnemoiDecoderDiTModel`.
+    Maps to either:
+      * :class:`anemoi.models.models.decoder_dit_wrapper.AnemoiDecoderDiTModel`
+        (v1; single-path latent-only)
+      * :class:`anemoi.models.models.decoder_dit_wrapper.AnemoiDecoderDiTModelV2`
+        (v2; adds bilinear baseline + full-res x_t skip + combiner).
+
+    The v2 knobs (``x_t_skip_*``, ``combiner_hidden``, ``noise_*``) are ignored
+    by the v1 class.
     """
 
     full_res_shape: list[PositiveInt] = Field(default=[250, 250])
@@ -585,6 +594,18 @@ class AtlasDecoderConfigSchema(BaseModel):
     "NATTEN local-attention kernel size (Atlas uses 3; we use 7–11 at 4 km)."
     embed_split: float = Field(default=0.5)
     "Fraction of hidden_size allocated to the x_t branch; rest goes to r_t."
+    # ---- v2-only knobs (ignored by v1) ----
+    x_t_skip_channels: PositiveInt = Field(default=64)
+    "v2: channels in the full-res x_t skip ConvNet feature map."
+    x_t_skip_kernel: PositiveInt = Field(default=5)
+    "v2: first-layer kernel size in the x_t skip ConvNet."
+    combiner_hidden: PositiveInt = Field(default=64)
+    "v2: hidden width of the (out_full, x_t_feat, [noise]) combiner."
+    noise_vector_dim: NonNegativeInt = Field(default=0)
+    "v2: FGN noise-vector dim. 0 = deterministic (Atlas default). Set >0 if "
+    "the decoder should also contribute to ensemble spread."
+    noise_hidden: PositiveInt = Field(default=64)
+    "v2: hidden width of the noise encoder MLP. Only used if noise_vector_dim > 0."
 
 
 class AtlasLatentConfigSchema(BaseModel):
@@ -637,6 +658,8 @@ class AtlasDecoderModel(BaseModel):
     target_: Literal[
         DefinedModels.ANEMOI_ATLAS_DECODER_MODEL,
         DefinedModels.ANEMOI_ATLAS_DECODER_MODEL_SHORT,
+        DefinedModels.ANEMOI_ATLAS_DECODER_MODEL_V2,
+        DefinedModels.ANEMOI_ATLAS_DECODER_MODEL_V2_SHORT,
     ] = Field(..., alias="_target_")
     convert_: str = Field("all", alias="_convert_")
     decoder: AtlasDecoderConfigSchema = Field(...)

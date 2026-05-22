@@ -10,6 +10,7 @@
 from .atlas_composed_model import AnemoiAtlasModel
 from .base import BaseGraphModel
 from .decoder_dit_wrapper import AnemoiDecoderDiTModel
+from .decoder_dit_wrapper import AnemoiDecoderDiTModelV2
 from .diffusion_encoder_processor_decoder import AnemoiDiffusionModelEncProcDec
 from .diffusion_encoder_processor_decoder import AnemoiDiffusionTendModelEncProcDec
 from .dit_wrapper import AnemoiDiTModel
@@ -25,6 +26,7 @@ __all__ = [
     "BaseGraphModel",
     "AnemoiAtlasModel",
     "AnemoiDecoderDiTModel",
+    "AnemoiDecoderDiTModelV2",
     "AnemoiDiTModel",
     "AnemoiLatentDiTModel",
     "AnemoiUNetModel",
