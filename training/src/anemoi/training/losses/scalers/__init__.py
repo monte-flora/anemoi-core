@@ -20,6 +20,7 @@ from .variable_level import PolynomialVariableLevelScaler
 from .variable_level import ReluVariableLevelScaler
 from .variable_level import ModelLevelReluVariableLevelScaler
 from .variable_masking import VariableMaskingLossScaler
+from .latent_uniform_grid import LatentUniformGridScaler
 from .variable_tendency import LatentStdevTendencyScaler
 from .variable_tendency import LatentVarTendencyScaler
 from .variable_tendency import NoTendencyScaler
@@ -30,6 +31,7 @@ __all__ = [
     "GeneralVariableLossScaler",
     "GraphNodeAttributeScaler",
     "LatentStdevTendencyScaler",
+    "LatentUniformGridScaler",
     "LatentVarTendencyScaler",
     "LevelAverageScaler",
     "LinearVariableLevelScaler",

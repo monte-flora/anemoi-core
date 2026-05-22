@@ -121,44 +121,51 @@ class GraphAtlasDecoderForecaster(BaseGraphModule):
     # ------------------------------------------------------------------
     def _atlas_decoder_step(
         self,
-        x_t: torch.Tensor,
+        x_t_full: torch.Tensor,
+        x_t_prog: torch.Tensor,
         x_tp1_prog: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """One decoder forward pass on a (x_t, x_{t+1,prog}) pair.
+        """One decoder forward pass.
 
         Parameters
         ----------
-        x_t : torch.Tensor
-            ``(B, C_in, H, W)`` full-res current state INCLUDING forcings.
+        x_t_full : torch.Tensor
+            ``(B, C_in, H, W)`` full-res state with **prognostic AND forcings
+            in their native interleaved order** (sliced by
+            ``data_indices.data.input.full``). Passed to the decoder as
+            full-res conditioning context.
+        x_t_prog : torch.Tensor
+            ``(B, C_prog, H, W)`` PROGNOSTIC-ONLY current state (sliced by
+            ``data_indices.data.input.prognostic``). Used for bilinear
+            encoding into latent space — forcings are excluded because the
+            latent residual is computed in prognostic space only.
         x_tp1_prog : torch.Tensor
-            ``(B, C_prog, H, W)`` next-step prognostic-only state, used to
-            build the TRUTH latent residual.
+            ``(B, C_prog, H, W)`` PROGNOSTIC-ONLY next-step state.
 
         Returns
         -------
-        delta_pred : torch.Tensor
-            ``(B, C_prog, H, W)`` decoder's predicted full-res residual.
-        delta_truth : torch.Tensor
-            ``(B, C_prog, H, W)`` ground-truth full-res residual
-            ``x_{t+1,prog} - x_{t,prog}``.
-        """
-        # Slice prognostic from x_t for both the truth residual and the
-        # latent encoding of the current state. Forcings are NOT part of
-        # the latent r_lat; they appear only in x_t as decoder conditioning.
-        x_t_prog = x_t[:, : x_tp1_prog.shape[1]]
+        delta_pred, delta_truth : (B, C_prog, H, W) each.
 
-        # Truth latent residual = bilinear-downsampled difference. The
-        # decoder's learning target is to recover the full-resolution
-        # detail that this downsample threw away.
+        Notes
+        -----
+        Earlier versions of this method positional-sliced ``x_t[:,:n_prog]``
+        which silently picked the WRONG channels (the ufs2arco recipe
+        interleaves forcings within the prognostic level ordering). The
+        caller now pre-slices using ``data_indices`` lists. See
+        ``[[feedback-smoke-correctness-gap]]`` for the diagnostic story.
+        """
+        # Truth latent residual: bilinear-downsample the prognostic-only
+        # difference. (Forcings excluded — see docstring.)
         with torch.no_grad():
             z_t = bilinear_downsample(x_t_prog, target_shape=self.latent_shape)
             z_tp1 = bilinear_downsample(x_tp1_prog, target_shape=self.latent_shape)
             r_lat_truth = z_tp1 - z_t
 
-        # Decoder forward: (r_lat, x_t) -> delta_full.
-        delta_pred = self.decoder(r_lat_truth, x_t)
+        # Decoder forward: gets the FULL state (prog + forcings) as
+        # conditioning context, plus the latent residual.
+        delta_pred = self.decoder(r_lat_truth, x_t_full)
 
-        # Truth full-res residual (also in mean-std space — Variant B).
+        # Truth full-res residual: prog-only diff (matches delta_pred).
         delta_truth = x_tp1_prog - x_t_prog
         return delta_pred, delta_truth
 
@@ -196,17 +203,34 @@ class GraphAtlasDecoderForecaster(BaseGraphModule):
         # the dataloader's flat cell -> 2-D mapping).
         H, W = self.decoder.full_res_shape
 
-        # Current state with forcings (input variable ordering).
-        x_t = batch[:, 0, 0, :, self.data_indices.data.input.full]   # (B, cell, V_in)
-        # Next-step prognostic truth (output variable ordering, prog only).
+        # NOTE: `batch` is ALREADY normalized here — BaseGraphModule's
+        # on_after_batch_transfer → _normalize_batch calls
+        # self.model.pre_processors(batch) before _step runs.
+        # See anemoi-core/training/src/anemoi/training/train/tasks/base.py:515.
+
+        # Slice using data_indices lists (NOT positional) — forcings and
+        # prognostics are interleaved in the input channel order. Mirrors
+        # the pattern in GraphResidualForecaster:residualforecaster.py:75.
+        x_full = batch[:, 0, 0, :, self.data_indices.data.input.full]          # (B, cell, V_in=116)
+        x_t_prog = batch[:, 0, 0, :, self.data_indices.data.input.prognostic]  # (B, cell, V_prog=105)
         x_tp1_prog = batch[:, 1, 0, :, self.data_indices.data.input.prognostic]
 
-        B = x_t.shape[0]
-        x_t = x_t.permute(0, 2, 1).reshape(B, -1, H, W).contiguous()
+        B = x_full.shape[0]
+        x_full = x_full.permute(0, 2, 1).reshape(B, -1, H, W).contiguous()
+        x_t_prog = x_t_prog.permute(0, 2, 1).reshape(B, -1, H, W).contiguous()
         x_tp1_prog = x_tp1_prog.permute(0, 2, 1).reshape(B, -1, H, W).contiguous()
 
+        # Smoke-time invariant check (cheap, runs every step but trivially fast).
+        # Mismatched counts → the data_indices and config disagree.
+        if x_full.shape[1] != self.decoder.xt_tokenizer.in_channels:
+            error = (
+                f"x_full has {x_full.shape[1]} channels, but decoder.xt_tokenizer "
+                f"expects {self.decoder.xt_tokenizer.in_channels}. data_indices/config mismatch."
+            )
+            raise RuntimeError(error)
+
         # Run decoder + truth diff.
-        delta_pred, delta_truth = self._atlas_decoder_step(x_t, x_tp1_prog)
+        delta_pred, delta_truth = self._atlas_decoder_step(x_full, x_t_prog, x_tp1_prog)
 
         # ---- Loss path -------------------------------------------------
         # Flatten back to anemoi's (B, ensemble=1, cell, V) layout so the
@@ -216,12 +240,23 @@ class GraphAtlasDecoderForecaster(BaseGraphModule):
         delta_truth_flat = delta_truth.reshape(B, delta_truth.shape[1], -1).permute(0, 2, 1).unsqueeze(1)
 
         # GraphCast-style reduction is provided by self.loss (which is
-        # GraphCastL1Loss in the v30 config); per-channel σ_tend scaling
-        # comes from the configured scalers list (VarTendencyScaler).
+        # GraphCastMAELoss in the v30 config); per-channel σ_tend scaling
+        # comes from the configured scalers list (StdevTendencyScaler).
         loss = self.loss(
             delta_pred_flat, delta_truth_flat,
             squash=True,
         )
+
+        # NaN guard — fail fast rather than silently train through NaN
+        # (the v30b smoke produced nan.0 losses for 5 steps + checkpoint
+        # save before being noticed; we don't want that to happen again).
+        if not torch.isfinite(loss):
+            error = (
+                f"Non-finite loss (validation_mode={validation_mode}): "
+                f"{loss.item() if loss.numel()==1 else loss}. "
+                "Check tendency-scaler division, channel slicing, or input NaNs."
+            )
+            raise RuntimeError(error)
 
         # Per the parent class contract, also surface y_pred for metrics
         # and any downstream hooks.

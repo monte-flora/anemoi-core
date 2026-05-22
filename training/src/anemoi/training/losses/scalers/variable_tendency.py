@@ -63,6 +63,15 @@ class BaseTendencyScaler(BaseScaler):
     def get_scaling_values(self, **_kwargs) -> torch.Tensor:
         variable_level_scaling = torch.ones((len(self.data_indices.data.output.full),), dtype=torch.float32)
 
+        # Defensive instrumentation: forcing-like variables (cos_julian_day,
+        # land_sea_mask, ...) have σ_tend = 0 because they're time-invariant
+        # or rigorously periodic. If one slips into the prognostic index set
+        # via a misconfigured `forcing:` list, the σ_phys/σ_tend or σ_phys²/σ_tend²
+        # scaler factor becomes inf and silently corrupts training. Collect
+        # offenders and emit one summary line at the end.
+        zero_tend_offenders: list[str] = []
+        extreme_offenders: list[tuple[str, float]] = []
+
         for key, idx in self.data_indices.model.output.name_to_index.items():
             if idx in self.data_indices.model.output.prognostic and self.data_indices.data.output.name_to_index.get(
                 key,
@@ -72,8 +81,41 @@ class BaseTendencyScaler(BaseScaler):
                 variable_tendency_stdev = (
                     self.statistics_tendencies["stdev"][prog_idx] if self.statistics_tendencies else 1
                 )
+
+                # Zero σ_tend → forcing slipped into prognostic.
+                if float(variable_tendency_stdev) <= 0.0:
+                    zero_tend_offenders.append(key)
+                    # Skip the divide-by-zero; leave scaler = 1 for this channel.
+                    continue
+
                 scaling = self.get_level_scaling(variable_stdev, variable_tendency_stdev)
+
+                # Extreme scaler value — usually means σ_tend is much smaller than
+                # σ_phys for reasons other than ordinary climatology (e.g. clipped
+                # stats, near-constant variable). Flag for the user to verify.
+                if not np.isfinite(scaling) or float(scaling) > 1e4 or float(scaling) < 1e-4:
+                    extreme_offenders.append((key, float(scaling)))
+
                 variable_level_scaling[idx] *= scaling
+
+        if zero_tend_offenders:
+            warnings.warn(
+                f"{self.__class__.__name__}: {len(zero_tend_offenders)} prognostic "
+                f"variable(s) have σ_tend = 0 — strongly suggests a forcing-like "
+                f"variable is misclassified as prognostic. Setting scaler = 1 for "
+                f"these channels (otherwise the scaler would be inf). Offenders: "
+                f"{zero_tend_offenders}. Add them to your `forcing:` list in "
+                f"data/vars.",
+                stacklevel=2,
+            )
+        if extreme_offenders:
+            offenders_str = ", ".join(f"{n}={v:.3e}" for n, v in extreme_offenders[:10])
+            LOGGER.warning(
+                "%s: %d prognostic variable(s) have extreme scaler values (|v|>1e4 or <1e-4). "
+                "Verify their σ_tend / σ_phys ratios are not artifacts. First %d: %s",
+                self.__class__.__name__, len(extreme_offenders),
+                min(10, len(extreme_offenders)), offenders_str,
+            )
 
         return variable_level_scaling
 
@@ -139,12 +181,80 @@ class _LatentTendencyMixin:
                 "compute_latent_tendency_stats.py first."
             )
             raise RuntimeError(error)
-        latent_stdev = np.asarray(z[key][:])
+        latent_stdev_raw = np.asarray(z[key][:])
+
+        # IMPORTANT: latent_stdev_raw is indexed by the RAW zarr's variable
+        # ordering (138 channels). But BaseTendencyScaler indexes the
+        # tendency-stdev array with `prog_idx = data.output.name_to_index[name]`
+        # — i.e. the POST-DROP output space (e.g. 99 channels). If we just
+        # pass latent_stdev_raw, channel index misalignment makes some
+        # prognostic vars pick up a FORCING's σ_lat_tend (which is 0 for
+        # time-invariant forcings) → division by zero → inf scaler → inf
+        # loss. (Bug found 2026-05-22 from v30b smoke; see
+        # [[feedback-smoke-correctness-gap]].)
+        #
+        # Re-index by NAME. `data.output.name_to_index[name]` returns
+        # positions in the POST-DROP INPUT space (0..N_input_after_drop-1),
+        # NOT positions within output.full (which has fewer entries). So
+        # we size the re-indexed array by data.input.full (or equivalent
+        # input-space size). Indexing matches what statistics["stdev"] uses.
+        zarr_names = list(z.attrs.get("variables", []))
+        if not zarr_names or len(zarr_names) != len(latent_stdev_raw):
+            error = (
+                f"{self.__class__.__name__}: zarr's `variables` attr "
+                f"({len(zarr_names)}) does not match the latent-stdev "
+                f"array length ({len(latent_stdev_raw)}). Cannot re-index."
+            )
+            raise RuntimeError(error)
+        zarr_name_to_idx = {n: i for i, n in enumerate(zarr_names)}
+        out_n2i = data_indices.data.output.name_to_index
+        # Size by the max index value (+1) so writes never go out-of-bounds,
+        # matching whatever index space `out_n2i` lives in.
+        n_array = max(out_n2i.values()) + 1
+        latent_stdev = np.ones((n_array,), dtype=np.float32)
+        n_filled = 0
+        # Defensive instrumentation — track which prognostic names came back
+        # with σ_lat_tend = 0 (indicates a forcing-like variable slipped in,
+        # which would otherwise produce inf scaler at the next stage).
+        zero_tend_prognostic: list[str] = []
+        # The set of prognostic output indices, for the σ=0 check below.
+        prog_idx_set = set(int(i) for i in data_indices.model.output.prognostic.tolist())
+        # Reverse map from output index → model output name (for the warning).
+        model_idx_to_name = {idx: name for name, idx in data_indices.model.output.name_to_index.items()}
+        for name, out_idx in out_n2i.items():
+            if name not in zarr_name_to_idx:
+                LOGGER.warning(
+                    "%s: output variable %r not in latent stats array; "
+                    "leaving scaler = 1 for this channel.",
+                    self.__class__.__name__, name,
+                )
+                continue
+            val = float(latent_stdev_raw[zarr_name_to_idx[name]])
+            latent_stdev[out_idx] = val
+            n_filled += 1
+            # If this output index is prognostic AND σ_lat_tend = 0, flag it.
+            model_idx = data_indices.model.output.name_to_index.get(name)
+            if model_idx is not None and int(model_idx) in prog_idx_set and val <= 0.0:
+                zero_tend_prognostic.append(name)
+
         LOGGER.info(
-            "%s: loaded latent tendency stdev %s from %s (range [%.3e, %.3e])",
-            self.__class__.__name__, key, latent_stats_path,
+            "%s: re-indexed latent tendency stdev for %d/%d output names "
+            "into a %d-d array (raw zarr had %d). Filled range [%.3e, %.3e].",
+            self.__class__.__name__, n_filled, len(out_n2i),
+            n_array, len(latent_stdev_raw),
             float(latent_stdev.min()), float(latent_stdev.max()),
         )
+        if zero_tend_prognostic:
+            warnings.warn(
+                f"{self.__class__.__name__}: {len(zero_tend_prognostic)} prognostic "
+                f"variable(s) have σ_lat_tend = 0 in the latent stats array — "
+                f"this WILL produce inf scaler values and inf training loss. "
+                f"Likely cause: a forcing-like variable (cos_julian_day, "
+                f"land_sea_mask, ...) is misclassified as prognostic. Add it to "
+                f"your `forcing:` list in data/vars. Offenders: "
+                f"{zero_tend_prognostic}.",
+                stacklevel=2,
+            )
 
         tendencies_latent = dict(statistics_tendencies or {})
         tendencies_latent["stdev"] = latent_stdev

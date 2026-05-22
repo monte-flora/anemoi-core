@@ -88,6 +88,8 @@ class GraphCastCRPSLoss(GraphCastBaseLoss):
         sample_weighting: bool = False,
         sample_weight_threshold: float = 10.0,
         sample_weight_min: float = 0.01,
+        spectral_crps_weight: float = 0.0,
+        spectral_grid_shape: list | None = None,
     ) -> None:
         super().__init__(
             ignore_nans=ignore_nans,
@@ -97,6 +99,24 @@ class GraphCastCRPSLoss(GraphCastBaseLoss):
         )
         self.alpha = float(alpha)
         self.no_autocast = bool(no_autocast)
+        # ATLAS (Kossaifi et al, NVIDIA, 2026) spectral-CRPS regularization.
+        # CRPS-trained models exhibit spectral bias — high-frequency power is
+        # under-represented. The fix: also penalise CRPS on the magnitudes of
+        # the 2-D FFT coefficients of (pred, target). λ_spec=0 = disabled.
+        self.spectral_crps_weight = float(spectral_crps_weight)
+        if self.spectral_crps_weight > 0:
+            if spectral_grid_shape is None or len(spectral_grid_shape) != 2:
+                msg = (
+                    "spectral_crps_weight > 0 requires spectral_grid_shape: [H, W] "
+                    f"(got {spectral_grid_shape!r})"
+                )
+                raise ValueError(msg)
+            self.spectral_grid_shape = (
+                int(spectral_grid_shape[0]),
+                int(spectral_grid_shape[1]),
+            )
+        else:
+            self.spectral_grid_shape = None
 
     def _kernel_crps(
         self,
@@ -250,9 +270,81 @@ class GraphCastCRPSLoss(GraphCastBaseLoss):
             grid_shard_slice=grid_shard_slice,
         )
 
-        return self.reduce(
+        base_loss = self.reduce(
             out,
             squash,
             group=group if is_sharded else None,
             sample_weights=sample_weights,
         )
+
+        # ATLAS spectral-CRPS regularization. Computed alongside (not via
+        # GraphCastBaseLoss.reduce) so the spectral coefficient magnitudes
+        # are penalised directly without per-variable scaler weighting —
+        # consistent with Kossaifi et al's λ_spec * (CRPS on |FFT|) formula.
+        if self.spectral_crps_weight > 0 and self.spectral_grid_shape is not None:
+            spec = self._spectral_crps(pred, target)
+            if not squash:
+                # When the caller asks for un-reduced (per-variable) output,
+                # broadcast the scalar spectral term equally across vars.
+                # Spectral CRPS is intrinsically a scalar — there's no clean
+                # per-variable decomposition without dropping the cross-var
+                # spectral signal. Add as a uniform additive term.
+                base_loss = base_loss + self.spectral_crps_weight * spec
+            else:
+                base_loss = base_loss + self.spectral_crps_weight * spec
+        return base_loss
+
+    def _spectral_crps(
+        self,
+        pred: torch.Tensor,
+        target: torch.Tensor,
+    ) -> torch.Tensor:
+        """ATLAS spectral CRPS regularization: kernel CRPS on |FFT2| magnitudes.
+
+        For LAM 2-D Cartesian grids — uses ``torch.fft.rfft2`` on the
+        (H, W) reshape of each variable. The CRPS estimator (with the
+        same ``alpha`` blend) is applied to the magnitudes per-spectral-
+        coefficient, then averaged.
+
+        Parameters
+        ----------
+        pred : torch.Tensor
+            Ensemble predictions, shape ``(B, E, G, V)``.
+        target : torch.Tensor
+            Single-realisation truth, ``(B, 1, G, V)`` or ``(B, G, V)``.
+
+        Returns
+        -------
+        torch.Tensor
+            Scalar spectral CRPS loss.
+        """
+        H, W = self.spectral_grid_shape
+        # Drop singleton ensemble dim from target if present.
+        if target.ndim == 4:
+            if target.shape[1] != 1:
+                target = target.mean(dim=1)
+            else:
+                target = target.squeeze(1)
+        B, E, G, V = pred.shape
+        if G != H * W:
+            # Sharded / partial-grid runs — skip rather than corrupt the loss.
+            return pred.new_zeros(())
+
+        with torch.amp.autocast(device_type="cuda", enabled=False):
+            # (B, E, V, H, W)
+            pred2d = pred.float().permute(0, 1, 3, 2).reshape(B, E, V, H, W)
+            tgt2d = target.float().permute(0, 2, 1).reshape(B, V, H, W)
+
+            # rFFT2 over the last two dims → (B, E, V, H, W//2+1) complex
+            pred_mag = torch.abs(torch.fft.rfft2(pred2d, norm="ortho"))
+            tgt_mag = torch.abs(torch.fft.rfft2(tgt2d, norm="ortho"))
+
+            # Reuse the same kernel-CRPS code as the pixelwise term. The
+            # (B, V, G, E) layout it expects becomes (B, V, H*Wr, E).
+            Hr, Wr = pred_mag.shape[-2], pred_mag.shape[-1]
+            preds_p = pred_mag.permute(0, 2, 3, 4, 1).reshape(B, V, Hr * Wr, E)
+            target_p = tgt_mag.reshape(B, V, Hr * Wr)
+
+            crps_per_coef = self._kernel_crps(preds_p, target_p, self.alpha)
+        # Reduce to a single scalar (mean over all coefs / vars / batch).
+        return crps_per_coef.mean()

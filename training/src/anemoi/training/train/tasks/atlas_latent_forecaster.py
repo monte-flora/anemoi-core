@@ -97,6 +97,7 @@ class GraphAtlasLatentForecaster(BaseGraphModule):
         rollout: int = 1,
         spectral_crps_weight: float = 0.0,
         crps_alpha: float = 1.0,
+        full_res_shape: tuple[int, int] = (250, 250),
     ) -> None:
         super().__init__(
             config=config,
@@ -124,6 +125,9 @@ class GraphAtlasLatentForecaster(BaseGraphModule):
         self.latent_shape = tuple(self.predictive.latent_shape)
         self.noise_vector_dim = self.predictive.noise_vector_dim
         self.forcings_channels = self.predictive.forcings_channels
+        # Full-res spatial shape of the dataloader's batch (cell -> H × W reshape).
+        # TODO: derive this from metadata['field_shape'] once we confirm the path.
+        self.full_res_shape = tuple(full_res_shape)
         LOGGER.info(
             "GraphAtlasLatentForecaster: latent=%s history=%d rollout=%d "
             "nens=%d noise_dim=%d forcings=%d crps_alpha=%.2f spec_w=%.3f",
@@ -137,26 +141,26 @@ class GraphAtlasLatentForecaster(BaseGraphModule):
     # ------------------------------------------------------------------
     def _encode_prog_and_forcings(
         self,
-        x_full: torch.Tensor,
-        n_prog: int,
+        x_prog: torch.Tensor,
+        x_forcings: Optional[torch.Tensor],
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
-        """Split x into prognostic + forcings and bilinear-encode each.
+        """Bilinear-encode prog + forcings tensors (already pre-sliced).
+
+        Earlier this method positional-sliced ``x_full[:, :n_prog]`` and
+        ``x_full[:, n_prog:n_prog+forcings_channels]`` — silently picking
+        the wrong channels for the ufs2arco-built dataset where forcings
+        are interleaved (e.g. cos_latitude at index 2, land_sea_mask at
+        index 7). Callers now do the slicing with ``data_indices`` lists
+        and pass pre-separated tensors. See
+        ``[[feedback-smoke-correctness-gap]]``.
 
         Returns ``(z, forcings_latent)`` where ``forcings_latent`` is
-        None when the model is configured forcings-less.
+        None when the model is configured forcings-less or x_forcings is None.
         """
-        prog = x_full[:, :n_prog]
-        z = bilinear_downsample(prog, target_shape=self.latent_shape)
+        z = bilinear_downsample(x_prog, target_shape=self.latent_shape)
         f_lat = None
-        if self.forcings_channels > 0:
-            if x_full.shape[1] < n_prog + self.forcings_channels:
-                error = (
-                    f"x has {x_full.shape[1]} channels; expected at least "
-                    f"{n_prog + self.forcings_channels}."
-                )
-                raise ValueError(error)
-            f_phys = x_full[:, n_prog : n_prog + self.forcings_channels]
-            f_lat = bilinear_downsample(f_phys, target_shape=self.latent_shape)
+        if self.forcings_channels > 0 and x_forcings is not None:
+            f_lat = bilinear_downsample(x_forcings, target_shape=self.latent_shape)
         return z, f_lat
 
     # ------------------------------------------------------------------
@@ -164,19 +168,24 @@ class GraphAtlasLatentForecaster(BaseGraphModule):
     # ------------------------------------------------------------------
     def _atlas_latent_step(
         self,
-        x_hist: torch.Tensor,
-        x_targets: torch.Tensor,
+        x_hist_prog: torch.Tensor,
+        x_hist_forcings: Optional[torch.Tensor],
+        x_targets_prog: torch.Tensor,
     ) -> tuple[torch.Tensor, list[torch.Tensor]]:
         """Run the latent CRPS rollout.
 
         Parameters
         ----------
-        x_hist : torch.Tensor
-            ``(B, history_len, C_in, H, W)`` full-res history (prog + forcings).
-            history_len == self.multi_step (Atlas: 2).
-        x_targets : torch.Tensor
-            ``(B, rollout, C_prog, H, W)`` ground-truth prognostic states at
-            rollout steps t+1, t+2, ..., t+rollout.
+        x_hist_prog : torch.Tensor
+            ``(B, history_len, C_prog, H, W)`` PROGNOSTIC-only history
+            (pre-sliced by ``data_indices.data.input.prognostic``).
+        x_hist_forcings : torch.Tensor or None
+            ``(B, history_len, C_forcings, H, W)`` FORCINGS-only history
+            (pre-sliced by ``data_indices.data.input.forcing``). None if
+            the predictive is configured forcings-less.
+        x_targets_prog : torch.Tensor
+            ``(B, rollout, C_prog, H, W)`` ground-truth prognostic states
+            at rollout steps t+1, t+2, ..., t+rollout.
 
         Returns
         -------
@@ -186,15 +195,16 @@ class GraphAtlasLatentForecaster(BaseGraphModule):
             Per-rollout-step predicted latent residuals (ensemble),
             shape ``(B, E, C_prog, h_lat, w_lat)`` each. Useful for metrics.
         """
-        B = x_hist.shape[0]
+        B = x_hist_prog.shape[0]
         E = self.nens_per_device
-        n_prog = x_targets.shape[2]
 
-        # Encode the history: z_hist[i] = B(x_hist[:, i, :prog])
+        # Encode the history (pre-sliced prog + optional forcings).
         z_hist = []
         f_hist = []
         for i in range(self.multi_step):
-            z_i, f_i = self._encode_prog_and_forcings(x_hist[:, i], n_prog)
+            x_p = x_hist_prog[:, i]
+            x_f = x_hist_forcings[:, i] if x_hist_forcings is not None else None
+            z_i, f_i = self._encode_prog_and_forcings(x_p, x_f)
             z_hist.append(z_i)
             f_hist.append(f_i)
         z_curr_init = z_hist[-1]                     # z_t  (B, C_prog, h, w)
@@ -235,7 +245,7 @@ class GraphAtlasLatentForecaster(BaseGraphModule):
 
             # Truth latent residual for this step.
             z_target = bilinear_downsample(
-                x_targets[:, step], target_shape=self.latent_shape,
+                x_targets_prog[:, step], target_shape=self.latent_shape,
             )                                        # (B, C_prog, h, w)
 
             # CRPS in latent space: re-fold predicted to (B, E, C, h, w),
@@ -251,6 +261,28 @@ class GraphAtlasLatentForecaster(BaseGraphModule):
             r_pred_flat_cell = einops.rearrange(r_pred, "b e c h w -> b e (h w) c")
             r_true_unnorm = z_target - z_curr_init   # (B, C, h, w) — truth diff
             r_true_flat_cell = einops.rearrange(r_true_unnorm, "b c h w -> b 1 (h w) c")
+
+            # Diagnostic: dump per-channel min/max of the tensors going into
+            # the loss when ANY of them has non-finite values. Identifies
+            # which channel(s) are overflowing so we can localize the cause.
+            if not (torch.isfinite(r_pred_flat_cell).all() and torch.isfinite(r_true_flat_cell).all()):
+                LOGGER.error("=== NON-FINITE INPUT TO LOSS — per-channel diagnostic ===")
+                with torch.no_grad():
+                    pmin = r_pred_flat_cell.amin(dim=(0, 1, 2)).float()
+                    pmax = r_pred_flat_cell.amax(dim=(0, 1, 2)).float()
+                    tmin = r_true_flat_cell.amin(dim=(0, 1, 2)).float()
+                    tmax = r_true_flat_cell.amax(dim=(0, 1, 2)).float()
+                    pfin = torch.isfinite(r_pred_flat_cell).all(dim=(0, 1, 2))
+                    tfin = torch.isfinite(r_true_flat_cell).all(dim=(0, 1, 2))
+                names = list(self.data_indices.model.output.name_to_index.keys())
+                for i in range(min(len(names), r_pred_flat_cell.shape[-1])):
+                    nm = names[i] if i < len(names) else f"ch{i}"
+                    LOGGER.error(
+                        "  ch%3d %-25s  PRED[fin=%s] min=%+.3e max=%+.3e   TRUE[fin=%s] min=%+.3e max=%+.3e",
+                        i, nm, pfin[i].item(), pmin[i].item(), pmax[i].item(),
+                        tfin[i].item(), tmin[i].item(), tmax[i].item(),
+                    )
+                LOGGER.error("=== end diagnostic ===")
 
             step_loss = self.loss(
                 r_pred_flat_cell, r_true_flat_cell, squash=True,
@@ -294,27 +326,107 @@ class GraphAtlasLatentForecaster(BaseGraphModule):
         TODO(verify): field_shape attribute name. Same caveat as
         GraphAtlasDecoderForecaster.
         """
-        # TODO: replace with the correct field_shape access path once we
-        # smoke against the real IndexCollection.
-        field_shape = self.data_indices.data.input.field_shape
-        H, W = field_shape
+        # Full-res shape of the dataloader's batch (set at task init).
+        H, W = self.full_res_shape
 
-        # Slice history + targets.
-        x_hist = batch[:, :self.multi_step, 0, :, self.data_indices.data.input.full]
-        x_targets = batch[
-            :, self.multi_step : self.multi_step + self.rollout, 0,
-            :, self.data_indices.data.input.prognostic,
-        ]
+        # NOTE: `batch` is ALREADY normalized here — BaseGraphModule's
+        # on_after_batch_transfer → _normalize_batch calls
+        # self.model.pre_processors(batch) before _step runs.
+        # See anemoi-core/training/src/anemoi/training/train/tasks/base.py:515.
 
-        B = x_hist.shape[0]
+        # Slice history + targets using data_indices lists (NOT positional)
+        # — forcings and prognostics are interleaved in the input channel
+        # order (ufs2arco sort_channels_by_levels=True). Mirrors the
+        # pattern in GraphResidualForecaster:residualforecaster.py:75.
+        prog_idx = self.data_indices.data.input.prognostic
+        forcing_idx = self.data_indices.data.input.forcing
+
+        x_hist_prog = batch[:, :self.multi_step, 0, :, prog_idx]              # (B, T, cell, C_prog)
+        x_targets_prog = batch[
+            :, self.multi_step : self.multi_step + self.rollout, 0, :, prog_idx,
+        ]                                                                       # (B, R, cell, C_prog)
+
+        if self.forcings_channels > 0:
+            x_hist_forcings = batch[:, :self.multi_step, 0, :, forcing_idx]   # (B, T, cell, C_forcings)
+        else:
+            x_hist_forcings = None
+
+        B = x_hist_prog.shape[0]
         # Reshape (B, T, cell, V) -> (B, T, V, H, W) for spatial ops.
-        x_hist = x_hist.permute(0, 1, 3, 2).reshape(B, self.multi_step, -1, H, W).contiguous()
-        x_targets = x_targets.permute(0, 1, 3, 2).reshape(B, self.rollout, -1, H, W).contiguous()
+        x_hist_prog = x_hist_prog.permute(0, 1, 3, 2).reshape(
+            B, self.multi_step, -1, H, W,
+        ).contiguous()
+        x_targets_prog = x_targets_prog.permute(0, 1, 3, 2).reshape(
+            B, self.rollout, -1, H, W,
+        ).contiguous()
+        if x_hist_forcings is not None:
+            x_hist_forcings = x_hist_forcings.permute(0, 1, 3, 2).reshape(
+                B, self.multi_step, -1, H, W,
+            ).contiguous()
 
-        loss, r_pred_list = self._atlas_latent_step(x_hist, x_targets)
+        # Smoke-time invariant check (cheap, runs every step).
+        if x_hist_prog.shape[2] != self.predictive.in_channels:
+            error = (
+                f"x_hist_prog has {x_hist_prog.shape[2]} channels but "
+                f"predictive.in_channels={self.predictive.in_channels}. "
+                f"data_indices/config mismatch."
+            )
+            raise RuntimeError(error)
+        if x_hist_forcings is not None and x_hist_forcings.shape[2] != self.forcings_channels:
+            error = (
+                f"x_hist_forcings has {x_hist_forcings.shape[2]} channels but "
+                f"self.forcings_channels={self.forcings_channels}. "
+                f"data_indices/config mismatch."
+            )
+            raise RuntimeError(error)
+
+        loss, r_pred_list = self._atlas_latent_step(x_hist_prog, x_hist_forcings, x_targets_prog)
+
+        # NaN guard — fail fast rather than silently train through NaN.
+        if not torch.isfinite(loss):
+            error = (
+                f"Non-finite loss at step (validation_mode={validation_mode}): "
+                f"{loss.item() if loss.numel()==1 else loss}. "
+                "Check tendency-scaler division, forcings slicing, or input NaNs."
+            )
+            raise RuntimeError(error)
 
         metrics: dict = {}
         return loss, metrics, r_pred_list
+
+    # ------------------------------------------------------------------
+    # DDPEnsGroupStrategy hooks (called from the trainer setup path).
+    # These just stash the comm-group info so downstream code can use it;
+    # we don't currently dispatch ensemble-wise reductions internally, so
+    # the storage is sufficient for the trainer to proceed.
+    # ------------------------------------------------------------------
+    def set_ens_comm_group(
+        self,
+        ens_comm_group,
+        ens_comm_group_id: int,
+        ens_comm_group_rank: int,
+        ens_comm_num_groups: int,
+        ens_comm_group_size: int,
+    ) -> None:
+        self.ens_comm_group = ens_comm_group
+        self.ens_comm_group_id = ens_comm_group_id
+        self.ens_comm_group_rank = ens_comm_group_rank
+        self.ens_comm_num_groups = ens_comm_num_groups
+        self.ens_comm_group_size = ens_comm_group_size
+
+    def set_ens_comm_subgroup(
+        self,
+        ens_comm_subgroup,
+        ens_comm_subgroup_id: int,
+        ens_comm_subgroup_rank: int,
+        ens_comm_subgroup_num_groups: int,
+        ens_comm_subgroup_size: int,
+    ) -> None:
+        self.ens_comm_subgroup = ens_comm_subgroup
+        self.ens_comm_subgroup_id = ens_comm_subgroup_id
+        self.ens_comm_subgroup_rank = ens_comm_subgroup_rank
+        self.ens_comm_subgroup_num_groups = ens_comm_subgroup_num_groups
+        self.ens_comm_subgroup_size = ens_comm_subgroup_size
 
     # ------------------------------------------------------------------
     # Lightning hooks.

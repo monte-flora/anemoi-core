@@ -185,6 +185,36 @@ class TendencyScalerSchema(BaseModel):
     )
 
 
+# Latent-space tendency scalers (v30 Atlas-style Variant B). Read
+# statistics_tendencies_<freq>_latent_stdev from the training zarr; need
+# the extra latent_stats_path config field.
+class LatentTendencyScalerTargets(str, Enum):
+    latent_stdev = "anemoi.training.losses.scalers.LatentStdevTendencyScaler"
+    latent_var = "anemoi.training.losses.scalers.LatentVarTendencyScaler"
+
+
+class LatentTendencyScalerSchema(BaseModel):
+    target_: LatentTendencyScalerTargets = Field(
+        example="anemoi.training.losses.scalers.LatentStdevTendencyScaler",
+        alias="_target_",
+    )
+    latent_stats_path: str = Field(
+        example="/lustre/mflora/grafai/datasets/graf-conus-patches-train.zarr",
+    )
+    "Path to the zarr containing statistics_tendencies_<freq>_latent_stdev."
+    latent_stats_key: str | None = Field(default=None)
+    "Override for the array key (default derives from zarr's 'frequency' attr)."
+
+
+class LatentUniformGridScalerSchema(BaseModel):
+    target_: Literal["anemoi.training.losses.scalers.LatentUniformGridScaler"] = Field(
+        ...,
+        alias="_target_",
+    )
+    latent_shape: list[int] = Field(example=[63, 63])
+    "Latent grid shape; the scaler emits ones at (latent_shape[0] * latent_shape[1],)."
+
+
 class VariableLevelScalerTargets(str, Enum):
     relu_scaler = "anemoi.training.losses.scalers.ReluVariableLevelScaler"
     linear_scaler = "anemoi.training.losses.scalers.LinearVariableLevelScaler"
@@ -240,6 +270,8 @@ ScalerSchema = (
     | VariableLevelScalerSchema
     | VariableMaskingScalerSchema
     | TendencyScalerSchema
+    | LatentTendencyScalerSchema
+    | LatentUniformGridScalerSchema
     | NaNMaskScalerSchema
     | GraphNodeAttributeScalerSchema
     | ReweightedGraphNodeAttributeScalerSchema
