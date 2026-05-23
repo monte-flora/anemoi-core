@@ -508,7 +508,13 @@ class AnemoiDecoderDiTModelV2(nn.Module):
             num_heads=num_heads,
             mlp_ratio=4.0,
             attention_backend="natten2d",
-            attn_kwargs={"attn_kernel": attn_kernel},
+            # qk_norm=True adds LayerNorm to Q and K before the score
+            # product (Dehghani et al. 2023 "Scaling Vision Transformers").
+            # Bounds attention magnitudes regardless of input scale —
+            # eliminates bf16 softmax overflow that crashed v30a-v2's
+            # first 100K attempt at step 8840 with NaN loss. Adds <1% of
+            # params (LayerNorm(head_dim=64) × depth × 2 = ~8K params).
+            attn_kwargs={"attn_kernel": attn_kernel, "qk_norm": True},
             # NOTE: 'zero' conditioning is INCOMPATIBLE with the pixel_shuffle
             # detokenizer's ProjLayer adaLN (it expects a real (B, D)
             # conditioning vector). Use 'dit' with t=0 at forward time —
