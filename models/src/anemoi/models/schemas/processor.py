@@ -160,3 +160,23 @@ class PointWiseMLPProcessorSchema(PointWiseModelComponent):
     "Number of channels."
     dropout_p: NonNegativeFloat = Field(example=0.1)
     "Dropout probability, default 0.0"
+
+
+class NATTEN2DProcessorSchema(TransformerModelComponent):
+    """NATTEN 2D neighborhood-attention processor on a regular hidden grid.
+
+    The hidden mesh must be a row-major flattened ``H_hidden × W_hidden``
+    grid (e.g. ``LimitedAreaSquareNodes``); the count of hidden nodes is
+    asserted == ``H_hidden * W_hidden`` at processor init.
+    """
+
+    target_: Literal["anemoi.models.layers.processor.NATTEN2DProcessor"] = Field(..., alias="_target_")
+    "NATTEN2D Processor object from anemoi.models.layers.processor."
+    num_layers: NonNegativeInt = Field(example=12)
+    "Number of NATTEN blocks. Default 12."
+    hidden_field_shape: list[NonNegativeInt] = Field(example=[62, 62])
+    "Spatial dimensions of the regular hidden grid [H_hidden, W_hidden]."
+    attn_kernel: NonNegativeInt = Field(example=9)
+    "NATTEN 2D neighborhood-attention kernel size. Default 9 (radius 4 grid cells)."
+    qk_norm: bool = Field(example=True)
+    "Normalize query and key. Default True for stability at depth >= 12."

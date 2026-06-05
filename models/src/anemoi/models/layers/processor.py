@@ -791,3 +791,221 @@ class GraphTransformerProcessor(GraphEdgeMixin, BaseProcessor):
         )
 
         return x
+
+
+def _sincos_2d_pos_embed_natten(
+    h: int, w: int, embed_dim: int, device, dtype=None
+) -> Tensor:
+    """Standard 2-D sine-cosine positional embedding (ViT/Atlas style).
+
+    Returns a tensor of shape ``(h*w, embed_dim)``. ``embed_dim`` must be
+    divisible by 4. The formula is analytical so any ``(h, w)`` works
+    without retraining or interpolation — re-instantiate the processor at
+    a different ``hidden_field_shape`` and the embedding regenerates.
+
+    Adapted from ``decoder_dit_wrapper._sincos_2d_pos_embed``; inlined here
+    to keep ``layers/processor`` independent of the ``models/`` subpackage.
+    """
+    import torch as _torch
+
+    if embed_dim % 4 != 0:
+        raise ValueError(
+            f"_sincos_2d_pos_embed_natten embed_dim must be divisible by 4, got {embed_dim}"
+        )
+    dtype = dtype or _torch.float32
+    grid_y = _torch.arange(h, device=device, dtype=dtype)
+    grid_x = _torch.arange(w, device=device, dtype=dtype)
+    yy, xx = _torch.meshgrid(grid_y, grid_x, indexing="ij")  # (h, w)
+    half = embed_dim // 2
+    omega = _torch.arange(half // 2, device=device, dtype=dtype)
+    omega = 1.0 / (10000 ** (omega / (half // 2)))
+    pe_y = _torch.cat([
+        _torch.sin(yy.unsqueeze(-1) * omega),
+        _torch.cos(yy.unsqueeze(-1) * omega),
+    ], dim=-1)
+    pe_x = _torch.cat([
+        _torch.sin(xx.unsqueeze(-1) * omega),
+        _torch.cos(xx.unsqueeze(-1) * omega),
+    ], dim=-1)
+    pe = _torch.cat([pe_y, pe_x], dim=-1)  # (h, w, embed_dim)
+    return pe.reshape(h * w, embed_dim)
+
+
+class NATTEN2DProcessorBlock(nn.Module):
+    """Pre-LN ViT-style block with NATTEN 2D neighborhood self-attention.
+
+    Used by :class:`NATTEN2DProcessor`. No adaLN modulation — we have no
+    conditioning input for a deterministic forecaster. Pure pre-LN block:
+
+        x = x + NATTEN(LN(x), latent_hw=(H, W))
+        x = x + MLP(LN(x))
+
+    The block expects ``x`` of shape ``(B, N, C)`` with ``N == H * W``
+    (row-major flattened image), where ``(H, W)`` is the hidden-grid
+    shape baked in at ``__init__``.
+    """
+
+    def __init__(
+        self,
+        *,
+        num_channels: int,
+        hidden_dim: int,
+        num_heads: int,
+        attn_kernel: int,
+        latent_hw: tuple[int, int],
+        layer_kernels: DotDict,
+        qk_norm: bool = True,
+    ) -> None:
+        super().__init__()
+        from physicsnemo.nn.module.dit_layers import Natten2DSelfAttention
+
+        self.latent_hw = (int(latent_hw[0]), int(latent_hw[1]))
+        self.layer_norm_attention = layer_kernels.LayerNorm(normalized_shape=num_channels)
+        self.layer_norm_mlp = layer_kernels.LayerNorm(normalized_shape=num_channels)
+
+        self.attention = Natten2DSelfAttention(
+            hidden_size=num_channels,
+            num_heads=num_heads,
+            attn_kernel=attn_kernel,
+            qk_norm=qk_norm,
+            norm_layer="torch",
+        )
+
+        self.mlp = nn.Sequential(
+            layer_kernels.Linear(num_channels, hidden_dim),
+            layer_kernels.Activation(),
+            layer_kernels.Linear(hidden_dim, num_channels),
+        )
+
+    def forward(self, x: Tensor, *args, **kwargs) -> tuple[Tensor]:
+        # x: (B, N, C), N == H*W. The trailing positional / keyword args are
+        # ignored — BaseProcessor.run_layers passes shard_shapes/batch_size/
+        # model_comm_group through, but NATTEN handles its own batching and
+        # does not yet support sharding (single-GPU only).
+        x = x + self.attention(self.layer_norm_attention(x), latent_hw=self.latent_hw)
+        x = x + self.mlp(self.layer_norm_mlp(x))
+        return (x,)
+
+
+class NATTEN2DProcessor(BaseProcessor):
+    """Processor that applies stacked NATTEN 2D neighborhood self-attention
+    on a regular 2D hidden grid.
+
+    Used as a drop-in replacement for :class:`GraphInteractionNetProcessor`
+    in the GraphCast-style encoder→processor→decoder stack when the hidden
+    mesh is a regular ``H_hidden × W_hidden`` grid (e.g. built by
+    :class:`anemoi.graphs.nodes.LimitedAreaSquareNodes`). NATTEN provides
+    O(N·k²) local attention on the 2D grid; no hidden↔hidden graph edges
+    are consumed.
+
+    Constraint: ``N_hidden == hidden_field_shape[0] * hidden_field_shape[1]``.
+    Bump ``margin_radius_km`` in the graph YAML if the area-mask drops
+    boundary nodes and breaks this rectangular invariant.
+    """
+
+    def __init__(
+        self,
+        *,
+        num_layers: int,
+        num_channels: int,
+        num_chunks: int,
+        num_heads: int,
+        attn_kernel: int,
+        hidden_field_shape,
+        mlp_hidden_ratio: float = 4.0,
+        qk_norm: bool = True,
+        cpu_offload: bool = False,
+        layer_kernels: DotDict,
+        **kwargs,
+    ) -> None:
+        super().__init__(
+            num_layers=num_layers,
+            num_channels=num_channels,
+            num_chunks=num_chunks,
+            cpu_offload=cpu_offload,
+            layer_kernels=layer_kernels,
+        )
+
+        h, w = int(hidden_field_shape[0]), int(hidden_field_shape[1])
+        self.latent_hw = (h, w)
+
+        # If the framework passed src_grid_size (hidden node count), check
+        # it matches H*W. Emit a warning if not — the inference-time graph
+        # swap (external_graph.py) rebuilds the model with the training
+        # config's hidden_field_shape, so the mismatch is expected when
+        # inferring at full-CONUS on a 62x62-trained ckpt. The post-load
+        # `Predictor._resize_natten_for_inference_graph` hook then
+        # regenerates pos_embed + latent_hw at the correct size. The hard
+        # constraint is enforced in forward() against the actual latent_hw
+        # at runtime, which is the source of truth post-resize.
+        if "src_grid_size" in kwargs:
+            expected = h * w
+            actual = int(kwargs["src_grid_size"])
+            if actual != expected:
+                import logging as _logging
+                _logging.getLogger(__name__).warning(
+                    "NATTEN2DProcessor: hidden node count (%d) != "
+                    "hidden_field_shape product (%d*%d=%d). This is OK at "
+                    "inference if Predictor._resize_natten_for_inference_graph "
+                    "will fix it later via inference_hidden_field_shape; "
+                    "otherwise the rectangular H*W assumption is broken at "
+                    "training and you should bump margin_radius_km in the "
+                    "graph YAML.",
+                    actual, h, w, expected,
+                )
+
+        hidden_dim = int(mlp_hidden_ratio * num_channels)
+        self.build_layers(
+            NATTEN2DProcessorBlock,
+            num_channels=num_channels,
+            hidden_dim=hidden_dim,
+            num_heads=num_heads,
+            attn_kernel=attn_kernel,
+            latent_hw=self.latent_hw,
+            qk_norm=qk_norm,
+            layer_kernels=self.layer_factory,
+        )
+
+        # Sinusoidal 2D positional embedding for the hidden grid. Analytical
+        # (no learned params), so re-instantiating with a different
+        # hidden_field_shape — e.g. full-CONUS inference at a larger hidden
+        # mesh — regenerates correctly without retraining or interpolation.
+        # Registered as a non-persistent buffer so it doesn't bloat ckpts
+        # (regenerated on load from the same formula).
+        pe = _sincos_2d_pos_embed_natten(h, w, num_channels, device="cpu")
+        self.register_buffer("pos_embed", pe.unsqueeze(0), persistent=False)  # (1, N, C)
+
+        self.offload_layers(cpu_offload)
+
+    def forward(
+        self,
+        x: Tensor,
+        batch_size: int,
+        shard_shapes: list[list[int]],
+        model_comm_group: Optional[ProcessGroup] = None,
+        *args,
+        **kwargs,
+    ) -> Tensor:
+        if model_comm_group is not None and model_comm_group.size() > 1:
+            raise NotImplementedError(
+                "NATTEN2DProcessor does not yet support sharding across multiple GPUs."
+            )
+
+        # The anemoi encoder feeds processors a flat (B*N_hidden, C) tensor
+        # (PyG message-passing convention). NATTEN expects (B, N, C). Reshape
+        # in, run blocks, reshape out — the decoder consumes flat (B*N, C).
+        B = int(batch_size)
+        N = x.shape[0] // B
+        H, W = self.latent_hw
+        assert N == H * W, (
+            f"NATTEN2DProcessor: per-sample hidden node count {N} != H*W={H*W}. "
+            f"x.shape={tuple(x.shape)}, batch_size={B}, latent_hw=({H},{W})."
+        )
+        C = x.shape[-1]
+        x = x.reshape(B, N, C)
+
+        x = x + self.pos_embed.to(dtype=x.dtype)
+        (x,) = self.run_layers((x,))
+
+        x = x.reshape(B * N, C)
+        return x

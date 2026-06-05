@@ -208,6 +208,11 @@ class AnemoiTrainer(ABC):
             if self.config.training.transfer_learning:
                 LOGGER.info("Loading weights with Transfer Learning from %s", self.last_checkpoint)
                 model = transfer_learning_loading(model, self.last_checkpoint)
+                # Transfer learning legitimately changes the variable set/order (e.g. adding
+                # diagnostics): weights load by name, re-init stem/head use the new data_indices,
+                # the trunk is order-agnostic. Flag the model so the strict variable-order checks
+                # (here + the CheckVariableOrder sanity callback) are skipped rather than raising.
+                model._skip_variable_order_check = True
             else:
                 LOGGER.info("Restoring only model weights from %s", self.last_checkpoint)
                 # pop data_indices so that the data indices on the checkpoint do not get overwritten
@@ -221,8 +226,21 @@ class AnemoiTrainer(ABC):
                 )
 
             model.data_indices = self.data_indices
-            # check data indices in original checkpoint and current data indices are the same
-            self.data_indices.compare_variables(model._ckpt_model_name_to_index, self.data_indices.name_to_index)
+            # check data indices in original checkpoint and current data indices are the same.
+            # For TRANSFER LEARNING this strict order check is inappropriate: weights are
+            # loaded by name, the only order-dependent params (tokenizer stem / detokenizer
+            # head) are shape-mismatched -> re-init and driven by the NEW data_indices, and
+            # the loaded trunk operates on order-agnostic hidden features. Adding/reordering
+            # variables (e.g. new diagnostics) legitimately changes the order, so enforcing
+            # an exact match would block valid fine-tunes. Skip (warn) for transfer learning;
+            # keep the hard check for the exact-state resume/restore path.
+            if not self.config.training.transfer_learning:
+                self.data_indices.compare_variables(model._ckpt_model_name_to_index, self.data_indices.name_to_index)
+            else:
+                LOGGER.info(
+                    "Transfer learning: skipping strict variable-order check "
+                    "(weights loaded by name; re-init stem/head use the new data_indices).",
+                )
 
         if hasattr(self.config.training, "submodules_to_freeze"):
             # Freeze the chosen model weights

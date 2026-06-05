@@ -9,6 +9,7 @@
 
 from .atlas_decoder_forecaster import GraphAtlasDecoderForecaster
 from .atlas_latent_forecaster import GraphAtlasLatentForecaster
+from .diffusionforecaster import GraphDiffusionDenoiser
 from .diffusionforecaster import GraphDiffusionForecaster
 from .diffusionforecaster import GraphDiffusionTendForecaster
 from .ensforecaster import GraphEnsForecaster
@@ -22,6 +23,7 @@ from .interpolator import GraphInterpolator
 __all__ = [
     "GraphAtlasDecoderForecaster",
     "GraphAtlasLatentForecaster",
+    "GraphDiffusionDenoiser",
     "GraphDiffusionForecaster",
     "GraphDiffusionTendForecaster",
     "GraphEnsForecaster",

@@ -79,6 +79,99 @@ def save_inference_checkpoint(model: torch.nn.Module, metadata: dict, save_path:
     return inference_filepath
 
 
+# Normalization / index buffers are computed from the NEW dataset's statistics and
+# variable layout; they must always come from the new model, never be transferred or
+# name-mapped from the source (doing so corrupts normalization).
+_TRANSFER_KEEP_NEW = ("pre_processors", "post_processors", "residual_normalizer")
+
+
+def _di_ordered_names(data_indices, which: str) -> list[str]:
+    """Variable names in channel order for `which` in {'input','output'}."""
+    n2i = data_indices.name_to_index
+    i2n = {int(v): k for k, v in n2i.items()}
+    return [i2n[int(x)] for x in list(getattr(data_indices.data, which).full)]
+
+
+def _name_map_channels(src_w: torch.Tensor, tgt_w: torch.Tensor, dim: int, new_names: list[str], old_idx: dict) -> torch.Tensor:
+    """Copy source channel-slices into the target by variable NAME along `dim`.
+
+    Shared variables get the source weights; genuinely-new channels stay zero (so a
+    new input contributes nothing to the trunk and a new output predicts 0 / the
+    climatological mean initially).
+    """
+    out = torch.zeros_like(tgt_w)
+    new_pos = [i for i, nm in enumerate(new_names) if nm in old_idx]
+    src_pos = [old_idx[nm] for nm in new_names if nm in old_idx]
+    if new_pos:
+        out.index_copy_(
+            dim,
+            torch.tensor(new_pos, dtype=torch.long, device=out.device),
+            src_w.index_select(dim, torch.tensor(src_pos, dtype=torch.long, device=src_w.device)),
+        )
+    return out
+
+
+def remap_state_dict_for_transfer(
+    state_dict: dict,
+    model_state_dict: dict,
+    old_data_indices: Any = None,
+    new_data_indices: Any = None,
+) -> tuple[dict, int]:
+    """Filter/remap a source state_dict onto a target model's shapes (pure function).
+
+    For each tensor present in the target model:
+      * shape-identical -> passed through unchanged (direct load);
+      * shape differs in exactly ONE dim whose (old,new) sizes equal the (old,new)
+        INPUT or OUTPUT variable counts -> NAME-MAPPED along that dim: source weights
+        for variables present in both models are copied to their (possibly reordered)
+        new positions, genuinely-new channels are zero-inited;
+      * anything else (multi-dim mismatch, dim size not matching a variable count, a
+        normalization/index buffer, or data_indices unavailable) -> DROPPED, so the
+        target model keeps its own freshly-initialised tensor (the historical behaviour).
+
+    Returns the (possibly reduced) state_dict to load with ``strict=False`` and the
+    number of tensors name-mapped. Pure and data-driven (no model/ckpt/IO), so it is
+    unit-testable and generalises to adding/removing inputs or outputs in any project.
+    """
+    sd = dict(state_dict)
+    can_map = old_data_indices is not None and new_data_indices is not None
+    if can_map:
+        old_in, new_in = _di_ordered_names(old_data_indices, "input"), _di_ordered_names(new_data_indices, "input")
+        old_out, new_out = _di_ordered_names(old_data_indices, "output"), _di_ordered_names(new_data_indices, "output")
+        old_in_idx = {n: i for i, n in enumerate(old_in)}
+        old_out_idx = {n: i for i, n in enumerate(old_out)}
+
+    n_mapped = 0
+    for key in list(sd):
+        if key not in model_state_dict or sd[key].shape == model_state_dict[key].shape:
+            continue  # absent (loaded loosely) or shape-identical (direct load)
+
+        sw, tw = sd[key], model_state_dict[key]
+        mapped = None
+        if (
+            can_map
+            and not any(s in key for s in _TRANSFER_KEEP_NEW)
+            and tw.is_floating_point()
+            and sw.dim() == tw.dim()
+        ):
+            diffs = [d for d in range(tw.dim()) if sw.shape[d] != tw.shape[d]]
+            if len(diffs) == 1:
+                d = diffs[0]
+                if sw.shape[d] == len(old_in) and tw.shape[d] == len(new_in):
+                    mapped = _name_map_channels(sw, tw, d, new_in, old_in_idx)
+                elif sw.shape[d] == len(old_out) and tw.shape[d] == len(new_out):
+                    mapped = _name_map_channels(sw, tw, d, new_out, old_out_idx)
+
+        if mapped is not None:
+            sd[key] = mapped
+            n_mapped += 1
+            LOGGER.info("Name-mapped channel transfer: %s  %s -> %s", key, tuple(sw.shape), tuple(tw.shape))
+        else:
+            LOGGER.info("Skipping loading parameter (re-init): %s  ckpt %s vs model %s", key, tuple(sw.shape), tuple(tw.shape))
+            del sd[key]
+    return sd, n_mapped
+
+
 def transfer_learning_loading(model: torch.nn.Module, ckpt_path: Path | str) -> nn.Module:
     # Load the checkpoint
     checkpoint = torch.load(ckpt_path, weights_only=False, map_location=model.device)
@@ -87,20 +180,19 @@ def transfer_learning_loading(model: torch.nn.Module, ckpt_path: Path | str) -> 
     # this is due to loading with strict=False, planning to make this more robust in the future
     checkpoint = chunking_fix_migration(checkpoint)
 
-    # Filter out layers with size mismatch
-    state_dict = checkpoint["state_dict"]
+    # Name-map shape-mismatched channel tensors (added/removed inputs or outputs) instead
+    # of dropping them, so a warm-start across a variable-set change preserves the source
+    # model's encoding/decoding for shared variables. See remap_state_dict_for_transfer.
+    state_dict, n_mapped = remap_state_dict_for_transfer(
+        checkpoint["state_dict"],
+        model.state_dict(),
+        checkpoint.get("hyper_parameters", {}).get("data_indices"),
+        getattr(model, "data_indices", None),
+    )
+    if n_mapped:
+        LOGGER.info("Transfer learning: %d tensors name-mapped by variable across a channel change.", n_mapped)
 
-    model_state_dict = model.state_dict()
-
-    for key in state_dict.copy():
-        if key in model_state_dict and state_dict[key].shape != model_state_dict[key].shape:
-            LOGGER.info("Skipping loading parameter: %s", key)
-            LOGGER.info("Checkpoint shape: %s", str(state_dict[key].shape))
-            LOGGER.info("Model shape: %s", str(model_state_dict[key].shape))
-
-            del state_dict[key]  # Remove the mismatched key
-
-    # Load the filtered st-ate_dict into the model
+    # Load the filtered state_dict into the model
     model.load_state_dict(state_dict, strict=False)
     # Needed for data indices check
     model._ckpt_model_name_to_index = checkpoint["hyper_parameters"]["data_indices"].name_to_index

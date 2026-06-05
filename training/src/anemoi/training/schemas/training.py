@@ -295,6 +295,7 @@ class ImplementedLossesUsingBaseLossSchema(str, Enum):
     graphcast_wind = "anemoi.training.losses.graphcast_wind.GraphCastWindAwareLoss"
     graphcast_mae = "anemoi.training.losses.GraphCastMAELoss"
     graphcast_mse = "anemoi.training.losses.GraphCastMSELoss"
+    weighted_graphcast_mse = "anemoi.training.losses.WeightedGraphCastMSELoss"
     graphcast_huber = "anemoi.training.losses.GraphCastHuberLoss"
     graphcast_logcosh = "anemoi.training.losses.GraphCastLogCoshLoss"
     graphcast_clipped_mse = "anemoi.training.losses.GraphCastClippedMSELoss"
@@ -552,6 +553,7 @@ class CombinedLossSchema(BaseLossSchema):
         | GraphCastClippedMSELossSchema
         | GraphCastPseudoHuberLossSchema
         | GraphCastGaussianNLLLossSchema
+        | GraphCastCRPSLossSchema
         | LogFFT2DistanceSchema
         | FourierCorrelationLossSchema
         | SpectralAmplitudeLossSchema
@@ -883,6 +885,20 @@ class EnsResidualForecasterDropoutSchema(ForecasterSchema):
     "Inherited from parent schema for backward compat; ignored by the dropout task."
 
 
+class StateBoundingSchema(PydanticBaseModel):
+    """Per-channel state bounding config for GraphEnsResidualForecaster.
+
+    Clips the reconstructed normalised state to ``±n_sigma`` at every
+    rollout step. Mean-std normalisation maps physical (μ, σ) → (0, 1),
+    so this is equivalent to the physical-space bound μ ± n_sigma·σ.
+    """
+
+    enabled: bool = Field(default=False)
+    "Toggle state bounding. Default off for back-compat with v31 chain."
+    n_sigma: float = Field(default=4.0)
+    "Symmetric clip threshold in normalised-state σ units. WoFSCast-colleague-validated values: 3-4."
+
+
 class EnsResidualForecasterSchema(ForecasterSchema):
     # FGN-style ensemble residual forecaster: combines GraphResidualForecaster's
     # residual reconstruction with GraphEnsForecaster's ensemble path + per-member
@@ -893,7 +909,9 @@ class EnsResidualForecasterSchema(ForecasterSchema):
     )
     "Training objective (ensemble + residual + per-member noise; pair with GraphCastCRPSLoss)."
     noise_vector_dim: PositiveInt = Field(default=32)
-    "Per-(batch, member) noise-vector dimensionality. Must match model.dit.noise_vector_dim. Default 32 (FGN)."
+    "Per-(batch, member) noise-vector dimensionality. Must match model.dit.noise_vector_dim. Default 32 (FGN). Unused on the AIFS / graph-ensemble path."
+    state_bounding: StateBoundingSchema = Field(default_factory=StateBoundingSchema)
+    "Optional per-channel state bounding (WoFSCast recipe). Disabled by default."
 
 
 class DiffusionForecasterSchema(ForecasterSchema):
@@ -907,6 +925,14 @@ class DiffusionTendForecasterSchema(ForecasterSchema):
         alias="model_task",
     )
     "Training objective."
+
+
+class DiffusionDenoiserSchema(ForecasterSchema):
+    model_task: Literal["anemoi.training.train.tasks.GraphDiffusionDenoiser"] = Field(
+        ...,
+        alias="model_task",
+    )
+    "Training objective (thermalizer state denoiser; target=current frame, forcing-conditioned)."
 
 
 class InterpolationSchema(BaseTrainingSchema):
@@ -931,6 +957,23 @@ class AtlasDecoderForecasterSchema(BaseTrainingSchema):
     "Rollout configuration (locked to 1 for the decoder)."
 
 
+class LatentResidualNormalizerSchema(BaseModel):
+    """Optional v17-style tendency-normalized residual training (added 2026-05-24)
+    for v30c+. When set, the GraphAtlasLatentForecaster trains the predictive to
+    emit tendency-normalized latent residuals (every channel target ~O(1)). Mirrors
+    v17 ResidualNormalizer but at the latent grid scale.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    latent_stats_path: str
+    "Path to training zarr containing ``statistics_tendencies_<freq>_latent_stdev`` and ``stdev``."
+    latent_stats_key: Optional[str] = None
+    "Override key for the σ_lat_tend array. Default: ``statistics_tendencies_<freq>_latent_stdev``."
+    min_stdev: float = 1e-7
+    "Clip σ values below this to avoid divide-by-zero. Default ``1e-7`` matches v17 ResidualNormalizer."
+
+
 class AtlasLatentForecasterSchema(BaseTrainingSchema):
     # v30 Atlas latent predictive training. CRPS in latent space with
     # FGN-style noise injection. Variant B normalization.
@@ -943,6 +986,8 @@ class AtlasLatentForecasterSchema(BaseTrainingSchema):
     "Rollout configuration."
     noise_vector_dim: PositiveInt = Field(default=32)
     "Per-(batch, member) noise-vector dim. Must match model.latent.noise_vector_dim."
+    latent_residual_normalizer: Optional[LatentResidualNormalizerSchema] = None
+    "Optional v17-style tendency-normalized residual training (v30c+)."
 
 
 TrainingSchema = Annotated[
@@ -954,6 +999,7 @@ TrainingSchema = Annotated[
     | InterpolationSchema
     | DiffusionForecasterSchema
     | DiffusionTendForecasterSchema
+    | DiffusionDenoiserSchema
     | AtlasDecoderForecasterSchema
     | AtlasLatentForecasterSchema,
     Discriminator("model_task"),

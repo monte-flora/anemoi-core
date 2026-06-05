@@ -43,6 +43,7 @@ import torch
 from anemoi.models.data_indices.collection import IndexCollection
 from anemoi.models.layers.bilinear_encoder import bilinear_downsample
 from anemoi.models.models.latent_dit_wrapper import AnemoiLatentDiTModel
+from anemoi.models.preprocessing.latent_residual_normalizer import LatentResidualNormalizer
 from anemoi.training.train.tasks.base import BaseGraphModule
 
 if TYPE_CHECKING:
@@ -117,6 +118,24 @@ class GraphAtlasLatentForecaster(BaseGraphModule):
             raise TypeError(error)
         self.predictive: AnemoiLatentDiTModel = inner
 
+        # Honor config-level overrides for these knobs. The training framework
+        # only passes 7 kwargs to model_task(**kwargs) (train.py:202), so
+        # nens/rollout/crps_alpha/spec_w default unless we pull them from
+        # config.training here. Discovered 2026-05-24 — v30b silently ran with
+        # function defaults instead of YAML values.
+        train_cfg = self.config.training
+        if hasattr(train_cfg, "ensemble_size_per_device") and train_cfg.ensemble_size_per_device is not None:
+            nens_per_device = int(train_cfg.ensemble_size_per_device)
+        rollout_cfg = getattr(train_cfg, "rollout", None)
+        if rollout_cfg is not None and hasattr(rollout_cfg, "start") and rollout_cfg.start is not None:
+            rollout = int(rollout_cfg.start)
+        loss_cfg = getattr(train_cfg, "training_loss", None)
+        if loss_cfg is not None:
+            if hasattr(loss_cfg, "alpha") and loss_cfg.alpha is not None:
+                crps_alpha = float(loss_cfg.alpha)
+            if hasattr(loss_cfg, "spectral_crps_weight") and loss_cfg.spectral_crps_weight is not None:
+                spectral_crps_weight = float(loss_cfg.spectral_crps_weight)
+
         self.multi_step = self.predictive.history_len
         self.rollout = rollout
         self.nens_per_device = nens_per_device
@@ -128,12 +147,45 @@ class GraphAtlasLatentForecaster(BaseGraphModule):
         # Full-res spatial shape of the dataloader's batch (cell -> H × W reshape).
         # TODO: derive this from metadata['field_shape'] once we confirm the path.
         self.full_res_shape = tuple(full_res_shape)
+
+        # Optional tendency-normalized residual training (v17 ResidualNormalizer
+        # ported to latent grid). v30b/v30b-det without this collapsed to per-
+        # variable shortcuts in BOTH MSE and CRPS recipes; v17's tendency-norm
+        # trick prevents that. Discovered 2026-05-24.
+        #
+        # Config field: training.latent_residual_normalizer.latent_stats_path
+        # When set: the predictive model is TRAINED to output tendency-normalized
+        # latent residuals (every channel target ~O(1)). At inference time the
+        # AnemoiAtlasModel composer denormalizes before passing to the decoder
+        # (which was trained on mean-std residuals).
+        self.latent_residual_normalizer: Optional[LatentResidualNormalizer] = None
+        norm_cfg = getattr(train_cfg, "latent_residual_normalizer", None)
+        if norm_cfg is not None and getattr(norm_cfg, "latent_stats_path", None):
+            prog_idx_list = (
+                data_indices.model.input.prognostic.tolist()
+                if hasattr(data_indices.model.input.prognostic, "tolist")
+                else list(data_indices.model.input.prognostic)
+            )
+            input_idx_to_name = {idx: name for name, idx in data_indices.data.input.name_to_index.items()}
+            prog_channel_names = [input_idx_to_name[int(i)] for i in prog_idx_list]
+            self.latent_residual_normalizer = LatentResidualNormalizer.from_zarr(
+                latent_stats_path=str(norm_cfg.latent_stats_path),
+                prog_channel_names=prog_channel_names,
+                latent_stats_key=getattr(norm_cfg, "latent_stats_key", None),
+                min_stdev=float(getattr(norm_cfg, "min_stdev", 1e-7)),
+            )
+            # Attach to the inner predictive model so the buffer travels with
+            # the inference-only checkpoint and AnemoiAtlasModel can find it.
+            self.predictive.latent_residual_normalizer = self.latent_residual_normalizer
+
         LOGGER.info(
             "GraphAtlasLatentForecaster: latent=%s history=%d rollout=%d "
-            "nens=%d noise_dim=%d forcings=%d crps_alpha=%.2f spec_w=%.3f",
+            "nens=%d noise_dim=%d forcings=%d crps_alpha=%.2f spec_w=%.3f "
+            "tendency_norm=%s",
             self.latent_shape, self.multi_step, self.rollout,
             self.nens_per_device, self.noise_vector_dim, self.forcings_channels,
             self.crps_alpha, self.spectral_crps_weight,
+            "ON" if self.latent_residual_normalizer is not None else "OFF",
         )
 
     # ------------------------------------------------------------------
@@ -259,8 +311,16 @@ class GraphAtlasLatentForecaster(BaseGraphModule):
             # Flatten spatial into "cell" for the standard scaler/loss path,
             # mirroring how other tasks present their (B, E, cell, V) tensor.
             r_pred_flat_cell = einops.rearrange(r_pred, "b e c h w -> b e (h w) c")
-            r_true_unnorm = z_target - z_curr_init   # (B, C, h, w) — truth diff
-            r_true_flat_cell = einops.rearrange(r_true_unnorm, "b c h w -> b 1 (h w) c")
+            r_true_meanstd = z_target - z_curr_init   # (B, C, h, w) — truth diff in mean-std space
+            # If tendency-norm training is active, transform the TARGET so the
+            # model is trained to predict tendency-normalized residuals (v17
+            # recipe). Model output stays as-is — its natural output is the
+            # tendency-normalized prediction.
+            if self.latent_residual_normalizer is not None:
+                r_true_for_loss = self.latent_residual_normalizer.transform(r_true_meanstd)
+            else:
+                r_true_for_loss = r_true_meanstd
+            r_true_flat_cell = einops.rearrange(r_true_for_loss, "b c h w -> b 1 (h w) c")
 
             # Diagnostic: dump per-channel min/max of the tensors going into
             # the loss when ANY of them has non-finite values. Identifies
@@ -291,8 +351,15 @@ class GraphAtlasLatentForecaster(BaseGraphModule):
 
             # AR feedback: roll history and replace last-step latent.
             # Variant B: z_next = z_t + r_lat in mean-std space.
+            # If tendency-norm training is active, the model's output is
+            # tendency-normalized; denormalize back to mean-std space before
+            # adding to z_curr (which lives in mean-std space).
             z_prev = z_curr
-            z_curr = z_curr + r_lat_flat            # in-place residual update
+            if self.latent_residual_normalizer is not None:
+                r_lat_meanstd = self.latent_residual_normalizer.inverse_transform(r_lat_flat)
+                z_curr = z_curr + r_lat_meanstd
+            else:
+                z_curr = z_curr + r_lat_flat
 
             # Forcings advance: bilinear-encode forcings at the new
             # target time so the next predictive forward sees the right

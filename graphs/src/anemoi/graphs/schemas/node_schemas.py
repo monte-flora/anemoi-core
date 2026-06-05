@@ -174,6 +174,35 @@ class LimitedAreaIcosahedralandHealPixNodeSchema(BaseModel):
     "Maximum distance to the reference nodes to consider a node as valid, in kilometers. Defaults to 100 km."
 
 
+class LimitedAreaSquareNodeSchema(BaseModel):
+    """Regular rectangular triangular mesh on a LAM domain.
+
+    Used by v33 GraphCast+NATTEN hybrid — produces a row-major flattened
+    H_hidden x W_hidden grid that NATTEN2DProcessor reshapes to 2D.
+    """
+
+    target_: Literal["anemoi.graphs.nodes.LimitedAreaSquareNodes"] = Field(..., alias="_target_")
+    "Class implementation for nodes from a Cartesian rectangular triangular mesh."
+    resolution: PositiveInt
+    "Number of doubling levels (1 = single finest mesh only)."
+    reference_node_name: str
+    "Name of the reference nodes for the area mask."
+    nx_grid: PositiveInt
+    "Data grid x-dimension (longitude axis)."
+    ny_grid: PositiveInt
+    "Data grid y-dimension (latitude axis)."
+    dx_finest: PositiveFloat = Field(default=5.0)
+    "Finest mesh spacing in data grid points."
+    offset: int = Field(default=2)
+    "Corner inset in grid points."
+    margin_radius_km: PositiveFloat = Field(example=100.0)
+    "Maximum distance to the reference nodes; set very large (e.g. 1000) to disable masking and keep the full rectangular mesh — required by NATTEN2DProcessor."
+    mask_attr_name: Optional[str] = None
+    "Optional node mask name."
+    include_cell_centers: bool = Field(default=True)
+    "If False, splits each cell with a single diagonal (2 triangles/cell, all vertices on the integer subgrid). Required for v33 NATTEN reshape."
+
+
 class StretchedIcosahdralNodeSchema(BaseModel):
     target_: Literal["anemoi.graphs.nodes.StretchedTriNodes"] = Field(..., alias="_target_")
     "Class implementation for nodes based on iterative refinements of an icosahedron with 2 different resolutions."
@@ -201,6 +230,7 @@ NodeBuilderSchemas = Annotated[
     | ReducedGaussianGridNodeSchema
     | IcosahedralandHealPixNodeSchema
     | LimitedAreaIcosahedralandHealPixNodeSchema
+    | LimitedAreaSquareNodeSchema
     | StretchedIcosahdralNodeSchema,
     Field(discriminator="target_"),
 ]

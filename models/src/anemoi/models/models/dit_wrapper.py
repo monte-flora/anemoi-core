@@ -15,6 +15,7 @@ import logging
 from typing import Optional
 
 import einops
+import hydra
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -157,9 +158,28 @@ class AnemoiDiTModel(nn.Module):
         self.num_input_channels = len(data_indices.model.input)
         self.num_output_channels = len(data_indices.model.output)
 
-        # For probabilistic: input = [x_history, y_noised] concatenated on channels
+        # Diffusion conditioning subset (probabilistic mode only). Default
+        # "full" = condition on the whole input history (forecaster behaviour;
+        # byte-identical for existing probabilistic DiT checkpoints). "forcing"
+        # = condition on forcings only (thermalizer DENOISER — conditioning on
+        # the clean prognostic state to denoise itself would be trivial).
+        # "none" = unconditional. in_channels is sized to the actual
+        # conditioning so we never allocate dead input-projection weights.
+        self.condition_on = str(getattr(dit_cfg, "condition_on", "full"))
+        if self.condition_on == "full":
+            cond_idx = torch.arange(self.num_input_channels, dtype=torch.long)
+        elif self.condition_on == "forcing":
+            cond_idx = torch.as_tensor(list(data_indices.model.input.forcing), dtype=torch.long)
+        elif self.condition_on == "none":
+            cond_idx = torch.zeros(0, dtype=torch.long)
+        else:
+            raise ValueError(f"diffusion.condition_on must be full|forcing|none, got {self.condition_on!r}")
+        self.register_buffer("_cond_idx", cond_idx, persistent=False)
+        n_cond = int(cond_idx.numel())
+
+        # For probabilistic: input = [x_history(cond subset), y_noised] on channels
         if self.mode == "probabilistic":
-            in_channels = self.multi_step * self.num_input_channels + self.num_output_channels
+            in_channels = self.multi_step * n_cond + self.num_output_channels
         else:
             in_channels = self.multi_step * self.num_input_channels
 
@@ -189,13 +209,37 @@ class AnemoiDiTModel(nn.Module):
             f"attention_backend={dit_cfg.attention_backend}"
         )
 
+        # Dropout knobs — exposed as part of the U-Cast (Cachay et al, 2026)
+        # MC-dropout CRPS recipe. All default to 0.0 to preserve byte-identical
+        # behaviour for v17 / v22 / v23 / v24 checkpoints.
+        attn_drop_rate = float(getattr(dit_cfg, "attn_drop_rate", 0.0))
+        proj_drop_rate = float(getattr(dit_cfg, "proj_drop_rate", 0.0))
+        drop_path_rate = float(getattr(dit_cfg, "drop_path_rate", 0.0))
+        if attn_drop_rate or proj_drop_rate or drop_path_rate:
+            LOGGER.info(
+                "DiT dropout knobs: attn_drop=%.3f, proj_drop=%.3f, drop_path=%.3f",
+                attn_drop_rate, proj_drop_rate, drop_path_rate,
+            )
+
+        # Plumbing: physicsnemo's DiT accepts attn_drop_rate/proj_drop_rate
+        # only via ``block_kwargs`` (kwargs forwarded to DiTBlock.__init__),
+        # and ``drop_path_rate`` via ``drop_path_rates: list[float]`` (one
+        # per block, depth-many). Merge with any user-supplied block_kwargs.
+        depth = int(dit_cfg.depth)
+        block_kwargs_in = {}
+        if attn_drop_rate:
+            block_kwargs_in["attn_drop_rate"] = attn_drop_rate
+        if proj_drop_rate:
+            block_kwargs_in["proj_drop_rate"] = proj_drop_rate
+        drop_path_rates = [drop_path_rate] * depth if drop_path_rate else None
+
         self.dit = FlexibleDiT(
             input_size=padded_field_shape,
             in_channels=in_channels,
             out_channels=self.num_output_channels,
             patch_size=int(dit_cfg.patch_size),
             hidden_size=int(dit_cfg.hidden_size),
-            depth=int(dit_cfg.depth),
+            depth=depth,
             num_heads=int(dit_cfg.num_heads),
             mlp_ratio=float(getattr(dit_cfg, "mlp_ratio", 4.0)),
             attention_backend=str(dit_cfg.attention_backend),
@@ -207,6 +251,8 @@ class AnemoiDiTModel(nn.Module):
             force_tokenization_fp32=bool(getattr(dit_cfg, "force_tokenization_fp32", True)),
             detokenizer_type=str(getattr(dit_cfg, "detokenizer_type", "linear_reshape")),
             tokenizer_kernel_size=getattr(dit_cfg, "tokenizer_kernel_size", None),
+            block_kwargs=block_kwargs_in,
+            drop_path_rates=drop_path_rates,
         )
 
         # Architecture summary at instantiation time. Printed once per rank
@@ -413,6 +459,46 @@ class AnemoiDiTModel(nn.Module):
         else:
             self.noise_encoder = None
 
+        # AIFS-style per-grid-point noise conditioning (NoiseConditioning).
+        # Mutually exclusive with the FGN noise-vector path above; the schema
+        # validator catches the both-set case but we re-check defensively in
+        # case a caller bypasses pydantic.
+        noise_injector_cfg = getattr(dit_cfg, "noise_injector", None)
+        if noise_injector_cfg is not None:
+            if self.noise_encoder is not None:
+                raise ValueError(
+                    "AnemoiDiTModel received both `noise_vector_dim` (FGN-style) "
+                    "and `noise_injector` (AIFS-style). They are mutually exclusive. "
+                    "Pick one in DiTConfigSchema."
+                )
+            # Instantiate the NoiseConditioning / NoiseInjector layer. _recursive_
+            # is False so nested ``_target_`` keys (e.g. inside layer_kernels) are
+            # not pre-instantiated by Hydra before NoiseConditioning sees them.
+            self.noise_injector = hydra.utils.instantiate(noise_injector_cfg, _recursive_=False)
+            # Project per-grid-point noise (noise_channels_dim → hidden_size) so
+            # each token's noise lands directly in the adaLN input space. Small-std
+            # init keeps the warm-started deterministic features dominant at FT
+            # step 0; ensemble spread grows as noise_to_hidden trains.
+            hidden_size = int(dit_cfg.hidden_size)
+            nc = int(self.noise_injector.noise_channels)
+            self.noise_to_hidden = nn.Linear(nc, hidden_size)
+            nn.init.normal_(self.noise_to_hidden.weight, std=0.02)
+            nn.init.zeros_(self.noise_to_hidden.bias)
+            # Swap the FlexibleDiT conditioning_embedder for a passthrough so
+            # the per-token noise we pass via ``condition=...`` reaches every
+            # adaLN unchanged. FlexibleDiT detects c.ndim == 3 and routes
+            # through the per-token block forward.
+            self.dit.conditioning_embedder = _PassthroughConditionEmbedder()
+            LOGGER.info(
+                "AnemoiDiTModel: AIFS-style noise conditioning enabled  "
+                "(layer=%s, noise_channels=%d, hidden_size=%d, "
+                "swapped conditioning_embedder to passthrough)",
+                type(self.noise_injector).__name__, nc, hidden_size,
+            )
+        else:
+            self.noise_injector = None
+            self.noise_to_hidden = None
+
     # ------------------------------------------------------------------
     # Padding
     # ------------------------------------------------------------------
@@ -596,6 +682,118 @@ class AnemoiDiTModel(nn.Module):
         return y
 
     # ------------------------------------------------------------------
+    # Forward: AIFS-style per-grid-point noise conditioning
+    # ------------------------------------------------------------------
+
+    def forward_with_spatial_noise(
+        self,
+        x: Tensor,
+        *,
+        model_comm_group: Optional[ProcessGroup] = None,
+        grid_shard_shapes: Optional[list] = None,
+        **kwargs,
+    ) -> Tensor:
+        """Forward with AIFS-style per-grid-point noise conditioning.
+
+        Mirrors ``_forward_deterministic`` but draws a fresh
+        ``(B, E, L_pad, noise_channels)`` noise tensor per call via
+        ``self.noise_injector`` (a ``NoiseConditioning`` layer with an MLP+LN
+        noise embedder), projects it to ``hidden_size`` via
+        ``self.noise_to_hidden``, and threads it through every block's adaLN
+        modulation as a 3-D conditioning tensor. FlexibleDiT detects
+        ``c.ndim == 3`` and routes through ``_block_forward_per_token``.
+
+        Parameters
+        ----------
+        x : Tensor
+            Input window, shape ``(B, T, E, G, V)``. ``E`` is the ensemble
+            dim; member diversity comes from the freshly-sampled per-token
+            noise (one independent sample per (batch, member, token)).
+
+        Returns
+        -------
+        Tensor
+            Model output, shape ``(B, E, G, V_out)``.
+        """
+        if self.noise_injector is None or self.noise_to_hidden is None:
+            raise RuntimeError(
+                "forward_with_spatial_noise() called but noise_injector was not "
+                "configured. Set dit.noise_injector in the model config."
+            )
+
+        B, T, E, G, V = x.shape
+        H, W = self.field_shape
+        input_dtype = x.dtype
+
+        # Same fold as the deterministic / FGN paths: each ensemble member
+        # becomes its own flat batch row so the DiT processes it independently.
+        x_2d = einops.rearrange(x, "b t e (h w) v -> (b e) (t v) h w", h=H, w=W)
+        x_2d, (pad_h, pad_w) = self._pad_to_patch_size(x_2d)
+
+        # Token-grid geometry after padding.
+        ps_h, ps_w = self.dit.patch_size
+        h_patches = x_2d.shape[-2] // ps_h
+        w_patches = x_2d.shape[-1] // ps_w
+        L_pad = h_patches * w_patches
+
+        # Sample noise and embed it.
+        # NoiseConditioning.forward signature:
+        #   (x, batch_size, ensemble_size, grid_size, shard_shapes_ref,
+        #    noise_dtype=fp32, model_comm_group=None) -> (x_unchanged, noise)
+        # The returned ``noise`` is shape ``(B*E*L_pad, noise_channels)`` after
+        # the internal MLP+LN. ``shard_shapes_ref`` must be a list of lists
+        # (each ending with a channels dim) because the layer internally calls
+        # ``change_channels_in_shape``; we pass a trivial single-shard layout
+        # since we run without a noise_projector and on a single model_comm_group.
+        _, noise_flat = self.noise_injector(
+            x_2d,
+            batch_size=B,
+            ensemble_size=E,
+            grid_size=L_pad,
+            shard_shapes_ref=[[B * E * L_pad, 1]],
+            noise_dtype=torch.float32,
+            model_comm_group=model_comm_group,
+        )
+        # (B*E*L_pad, noise_channels) -> (B*E, L_pad, noise_channels)
+        noise_per_token = einops.rearrange(
+            noise_flat, "(bse l) c -> bse l c", bse=B * E, l=L_pad,
+        )
+        # Project to hidden_size in the same dtype as the DiT weights.
+        proj = self.noise_to_hidden(
+            noise_per_token.to(self.noise_to_hidden.weight.dtype)
+        ).to(x_2d.dtype)  # (B*E, L_pad, hidden_size)
+
+        # Forward through DiT. The passthrough conditioning_embedder returns
+        # `condition=proj` unchanged; FlexibleDiT sees c.ndim==3 and dispatches
+        # to the per-token block forward.
+        t = torch.zeros(x_2d.shape[0], device=x_2d.device, dtype=x_2d.dtype)
+        y_2d = self.dit(x_2d, t, condition=proj)
+
+        # Same post-processing as _forward_deterministic / forward_with_noise.
+        if getattr(self, "detokenizer_lowpass", None) is not None:
+            y_2d = self.detokenizer_lowpass(y_2d)
+        if getattr(self, "conv_refinement", None) is not None:
+            y_2d = y_2d + self.conv_refinement(y_2d)
+        if pad_h > 0 or pad_w > 0:
+            y_2d = y_2d[:, :, :H, :W]
+
+        y = einops.rearrange(
+            y_2d, "(b e) v h w -> b e (h w) v", b=B, e=E,
+        ).to(dtype=input_dtype).clone()
+
+        # state-mode persistence skip (parity with the other forwards).
+        if getattr(self, "output_mode", "residual") == "state":
+            x_last = x[:, -1, ...]
+            y[..., self._internal_output_idx] = (
+                y[..., self._internal_output_idx]
+                + x_last[..., self._internal_input_idx]
+            )
+            for bounding in self.boundings:
+                y = bounding(y)
+
+        return y
+
+    # ------------------------------------------------------------------
     # Forward: probabilistic (diffusion) mode
     # ------------------------------------------------------------------
 
@@ -613,12 +811,19 @@ class AnemoiDiTModel(nn.Module):
         H, W = self.field_shape
         input_dtype = x.dtype
 
-        # Reshape input history and noised target to 2D
-        x_2d = einops.rearrange(x, "b t e (h w) v -> (b e) (t v) h w", h=H, w=W)
+        # Restrict conditioning to the configured subset (forcing/none/full).
+        if self.condition_on != "full":
+            x = x[..., self._cond_idx]
+
+        # Reshape noised target to 2D
         y_2d = einops.rearrange(y_noised, "b e (h w) v -> (b e) v h w", h=H, w=W)
 
-        # Concatenate: [x_history, y_noised] along channel dim
-        combined = torch.cat([x_2d, y_2d], dim=1)
+        # Concatenate conditioning history (if any) with the noised target.
+        if self.condition_on == "none":
+            combined = y_2d
+        else:
+            x_2d = einops.rearrange(x, "b t e (h w) v -> (b e) (t v) h w", h=H, w=W)
+            combined = torch.cat([x_2d, y_2d], dim=1)
         combined, (pad_h, pad_w) = self._pad_to_patch_size(combined)
 
         # Use log(sigma)/4 as timestep (EDM convention)
@@ -668,8 +873,11 @@ class AnemoiDiTModel(nn.Module):
 
     def fwd_with_preconditioning(self, x, y_noised, sigma, **kwargs):
         """Forward with EDM preconditioning for diffusion training."""
-        c_skip, c_out, c_in, c_noise = self._get_preconditioning(sigma, self.sigma_data)
-        pred = self._forward_probabilistic(x, c_in * y_noised, c_noise, **kwargs)
+        c_skip, c_out, c_in, _c_noise = self._get_preconditioning(sigma, self.sigma_data)
+        # Pass RAW sigma: _forward_probabilistic computes the EDM timestep
+        # t = log(sigma)/4 itself. Passing c_noise (already log(sigma)/4) would
+        # double-log -> log(negative)=NaN for sigma<1 (the intermittent-NaN bug).
+        pred = self._forward_probabilistic(x, c_in * y_noised, sigma, **kwargs)
         return c_skip * y_noised + c_out * pred
 
     # ------------------------------------------------------------------
@@ -738,7 +946,19 @@ class AnemoiDiTModel(nn.Module):
             # If no vector is attached, a single fresh one is sampled and stored
             # (default member-0 trajectory; the model becomes a deterministic-
             # under-fixed-noise predictor).
-            if getattr(self, "noise_encoder", None) is not None:
+            if getattr(self, "noise_injector", None) is not None:
+                # AIFS-style ensemble model: per-grid-point noise is sampled
+                # fresh on every call inside forward_with_spatial_noise (no
+                # caller-controlled noise vector to thread through, unlike the
+                # FGN path). Different members emerge because the AR loop
+                # invokes this once per member with the same x.
+                model_output = self.forward_with_spatial_noise(
+                    x,
+                    model_comm_group=model_comm_group,
+                    grid_shard_shapes=grid_shard_shapes,
+                    **kwargs,
+                )
+            elif getattr(self, "noise_encoder", None) is not None:
                 B = x.shape[0]
                 E = x.shape[2]
                 noise_vec = getattr(self, "_inference_noise_vec", None)
@@ -767,7 +987,12 @@ class AnemoiDiTModel(nn.Module):
             # Variable indices
             model_prog_idx = data_indices.model.output.prognostic
             model_diag_idx = data_indices.model.output.diagnostic
+            # data.input.prognostic: data space (indexes the n_data-wide normalizer buffers).
             input_prog_idx = data_indices.data.input.prognostic
+            # model.input.prognostic: model-input space (indexes the sliced input tensor x,
+            # which is prognostic+forcing only). These DIVERGE once diagnostics exist; using
+            # the data-space index on x then runs off the end. Equal when diagnostic=[].
+            model_input_prog_idx = data_indices.model.input.prognostic
 
             # Normalizer buffers
             norm_mul, norm_add = self._get_normalizer_buffers(pre_processors)
@@ -784,7 +1009,7 @@ class AnemoiDiTModel(nn.Module):
                 # Residual mode (legacy): output is delta-from-input in residual
                 # normalised space; reconstruct physical state.
                 delta_norm_prog = model_output[..., model_prog_idx]  # (B, 1, G, n_prog)
-                x_last_norm_prog = x[:, -1, ..., input_prog_idx]  # (B, 1, G, n_prog)
+                x_last_norm_prog = x[:, -1, ..., model_input_prog_idx]  # (B, 1, G, n_prog); x is model-input space
                 y_hat_prog_phys = residual_normalizer.inverse_transform_physical_from_normalized(
                     x_last_norm_prog,
                     delta_norm_prog,
@@ -807,9 +1032,12 @@ class AnemoiDiTModel(nn.Module):
             # Diagnostic: direct denormalization
             if len(model_diag_idx) > 0:
                 diag_output_norm = model_output[..., model_diag_idx]
+                # Diagnostics are OUTPUT-only -> their normalizer coeffs live at the
+                # data.output.diagnostic positions (data.input.diagnostic is empty, which
+                # would silently leave diagnostics in normalized units).
                 input_diag_idx = (
-                    data_indices.data.input.diagnostic
-                    if hasattr(data_indices.data.input, "diagnostic")
+                    data_indices.data.output.diagnostic
+                    if hasattr(data_indices.data.output, "diagnostic")
                     else []
                 )
                 if len(input_diag_idx) > 0:

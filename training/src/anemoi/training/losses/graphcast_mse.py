@@ -158,3 +158,44 @@ class GraphCastMSELoss(GraphCastBaseLoss):
         out = self.scale(out, scaler_indices, without_scalers=without_scalers, grid_shard_slice=grid_shard_slice)
 
         return self.reduce(out, squash, group=group if is_sharded else None, sample_weights=sample_weights)
+
+
+class WeightedGraphCastMSELoss(GraphCastMSELoss):
+    """GraphCast per-physical-quantity MSE reduction + per-sample EDM noise weight.
+
+    Identical reduction to GraphCastMSELoss (mean-over-levels within each variable
+    group, so 3D fields are NOT overweighted by level count and a 2D field like
+    comp_refl counts as one physical quantity), but additionally applies the
+    diffusion task's per-sample EDM weight lambda(sigma) as ``sample_weights`` in
+    the batch reduction. This is the loss for GraphDiffusionDenoiser /
+    GraphDiffusionForecaster with a DiT: ``GraphCastMSELoss`` would silently
+    swallow the ``weights`` kwarg (via ``**kwargs``) and ignore the noise
+    weighting; ``anemoi.training.losses.WeightedMSELoss`` applies the noise
+    weight but reduces per-CHANNEL (overweighting 3D vars by level count).
+
+    The diffusion task calls ``self.loss(pred, target, weights=lambda_sigma, ...)``
+    with ``weights`` of shape (B, 1, 1, 1); we route it to ``sample_weights`` (B,),
+    giving a self-normalized weighted batch mean ``sum(lambda*L)/sum(lambda)``.
+    """
+
+    name: str = "weighted_graphcast_mse"
+
+    def forward(
+        self,
+        pred: torch.Tensor,
+        target: torch.Tensor,
+        squash: bool = True,
+        *,
+        scaler_indices: tuple[int, ...] | None = None,
+        without_scalers: list[str] | list[int] | None = None,
+        grid_shard_slice: slice | None = None,
+        group: "ProcessGroup | None" = None,
+        weights: torch.Tensor | None = None,
+        **kwargs,
+    ) -> torch.Tensor:
+        is_sharded = grid_shard_slice is not None
+        out = self.calculate_difference(pred, target)
+        out = self.scale(out, scaler_indices, without_scalers=without_scalers, grid_shard_slice=grid_shard_slice)
+        # diffusion EDM noise weight lambda(sigma): (B,1,1,1) -> per-sample (B,)
+        sample_weights = None if weights is None else weights.reshape(weights.shape[0]).to(out.dtype)
+        return self.reduce(out, squash, group=group if is_sharded else None, sample_weights=sample_weights)

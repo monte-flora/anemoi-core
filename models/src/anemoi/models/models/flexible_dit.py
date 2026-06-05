@@ -471,6 +471,94 @@ class FlexibleHierarchicalDetokenizer(nn.Module):
         return self.refine2(feat)
 
 
+class FlexibleHierarchicalResizeConvDetokenizer(nn.Module):
+    """Two-stage hierarchical upsample, bilinear-resize variant of
+    FlexibleHierarchicalDetokenizer (no PixelShuffle).
+
+    Identical structure to FlexibleHierarchicalDetokenizer EXCEPT the two 2x
+    PixelShuffle upsamples are replaced by bilinear ``F.interpolate``. This
+    removes the sub-pixel-convolution checkerboard artifact (Odena et al. 2016):
+    PixelShuffle's adjacent output cells come from independently-learned
+    sub-kernels and can carry systematic offsets -> periodic checkerboard at the
+    upsample stride. Bilinear resize is smooth across cells, so the only
+    small-scale structure is what the post-resize 3x3 refine convs add.
+
+    Layer names match FlexibleHierarchicalDetokenizer (adaln, proj1, refine1,
+    proj2, refine2) so adaln/refine1/refine2 weights transfer verbatim from a
+    trained hierarchical_2stage checkpoint; only proj1/proj2 change shape
+    (refine_channels instead of refine_channels*4, since bilinear keeps the
+    channel count while PixelShuffle divides it by 4). The natural warm-start for
+    proj1/proj2 is the mean over the 4 PixelShuffle sub-kernel groups of the
+    source checkpoint — that is exactly the checkerboard-free projection.
+    """
+
+    def __init__(
+        self,
+        input_size: tuple,
+        patch_size,
+        out_channels: int,
+        hidden_size: int,
+        refine_channels: int = 128,
+        layernorm_backend: str = "torch",
+    ):
+        super().__init__()
+        self.input_size = input_size
+        self.patch_size = (
+            patch_size if isinstance(patch_size, (tuple, list)) else (patch_size, patch_size)
+        )
+        ph, pw = self.patch_size
+        if ph != 4 or pw != 4:
+            raise NotImplementedError(
+                "Hierarchical 2-stage resize-conv detokenizer requires patch_size=4."
+            )
+        self.out_channels = out_channels
+        self.hidden_size = hidden_size
+        self.h_patches = self.input_size[0] // ph
+        self.w_patches = self.input_size[1] // pw
+
+        self.adaln = _AdaLNModulation2D(hidden_size)
+        # Stage 1: hidden -> refine channels, then bilinear 2x (no *4 for shuffle).
+        self.proj1 = nn.Conv2d(hidden_size, refine_channels, kernel_size=1)
+        self.refine1 = nn.Sequential(
+            nn.GELU(),
+            nn.Conv2d(refine_channels, refine_channels, kernel_size=3, padding=1),
+            nn.GELU(),
+        )
+        # Stage 2: refine -> refine channels, bilinear 2x, refine -> out.
+        self.proj2 = nn.Conv2d(refine_channels, refine_channels, kernel_size=1)
+        self.refine2 = nn.Sequential(
+            nn.GELU(),
+            nn.Conv2d(refine_channels, refine_channels, kernel_size=3, padding=1),
+            nn.GELU(),
+            nn.Conv2d(refine_channels, out_channels, kernel_size=3, padding=1),
+        )
+        nn.init.zeros_(self.refine2[-1].weight)
+        nn.init.zeros_(self.refine2[-1].bias)
+
+    def initialize_weights(self):
+        nn.init.zeros_(self.refine2[-1].weight)
+        nn.init.zeros_(self.refine2[-1].bias)
+
+    def forward(
+        self,
+        x_tokens: Float[torch.Tensor, "batch sequence hidden_size"],
+        c: Float[torch.Tensor, "batch hidden_size"],
+        h_patches: Optional[int] = None,
+        w_patches: Optional[int] = None,
+    ) -> Float[torch.Tensor, "batch out_channels height width"]:
+        hp = h_patches if h_patches is not None else self.h_patches
+        wp = w_patches if w_patches is not None else self.w_patches
+        B, L, D = x_tokens.shape
+        feat = x_tokens.transpose(1, 2).reshape(B, D, hp, wp)
+        feat = self.adaln(feat, c)
+        feat = self.proj1(feat)
+        feat = F.interpolate(feat, scale_factor=2, mode="bilinear", align_corners=False)
+        feat = self.refine1(feat)
+        feat = self.proj2(feat)
+        feat = F.interpolate(feat, scale_factor=2, mode="bilinear", align_corners=False)
+        return self.refine2(feat)
+
+
 class FlexibleProjReshape2DDetokenizer(ProjReshape2DDetokenizer):
     """Detokenizer that infers spatial dims from (h_patches, w_patches) at runtime.
 
@@ -524,8 +612,69 @@ class FlexibleDiT(DiT):
 
     @staticmethod
     def _modulation_fn(x, scale, shift):
-        """Picklable replacement for lambda modulation in DiTBlock and ProjLayer."""
+        """Picklable replacement for lambda modulation in DiTBlock and ProjLayer.
+
+        Supports both 2-D (B, D) and 3-D (B, L, D) conditioning. The 2-D form is
+        FGN-style global noise / time embedding (one modulation per sample
+        broadcast across tokens); the 3-D form is AIFS-style per-token noise.
+        """
+        if scale.ndim == 3:
+            # Per-token: scale/shift already (B, L, D); direct multiply.
+            return x * (1 + scale) + shift
         return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
+
+    @staticmethod
+    def _block_forward_per_token(
+        block,
+        x,
+        c,
+        attn_kwargs: Optional[Dict[str, Any]] = None,
+        p_dropout: Optional[float] = None,
+    ):
+        """Mirror physicsnemo DiTBlock.forward but for 3-D per-token conditioning.
+
+        Two differences vs the upstream forward (which assumes 2-D c):
+        1. ``adaptive_modulation(c).chunk(6, dim=1)`` would split the L dim when
+           c is (B, L, D); use ``dim=-1`` instead.
+        2. ``attention_gate.unsqueeze(1)`` would inject an extra dim when gate
+           is already (B, L, D); skip the unsqueeze.
+
+        block.modulation is shared with the 2-D path via ``_modulation_fn``,
+        which is ndim-aware.
+        """
+        (
+            attention_shift,
+            attention_scale,
+            attention_gate,
+            mlp_shift,
+            mlp_scale,
+            mlp_gate,
+        ) = block.adaptive_modulation(c).chunk(6, dim=-1)
+
+        # Attention block (modulated norm -> attention -> gated residual)
+        modulated_attn_input = block.modulation(
+            block.pre_attention_norm(x), attention_scale, attention_shift,
+        )
+        if block.interdrop is not None:
+            modulated_attn_input = block.interdrop(modulated_attn_input, p_dropout)
+        elif p_dropout is not None:
+            raise ValueError(
+                "p_dropout passed to DiTBlock but intermediate_dropout is disabled"
+            )
+
+        attention_output = block.attention(
+            modulated_attn_input, **(attn_kwargs or {}),
+        )
+        # gate is (B, L, D); DropPath broadcasts (B, 1, 1) across (L, D). No unsqueeze.
+        x = torch.addcmul(x, block.drop_path(attention_gate), attention_output)
+
+        # MLP block
+        modulated_mlp_input = block.modulation(
+            block.pre_mlp_norm(x), mlp_scale, mlp_shift,
+        )
+        mlp_output = block.linear(modulated_mlp_input)
+        x = torch.addcmul(x, block.drop_path(mlp_gate), mlp_output)
+        return x
 
     def __init__(
         self,
@@ -628,12 +777,15 @@ class FlexibleDiT(DiT):
                 )
             elif detokenizer_type == "hierarchical_2stage":
                 self.detokenizer = FlexibleHierarchicalDetokenizer(**common)
+            elif detokenizer_type == "hierarchical_2stage_resizeconv":
+                self.detokenizer = FlexibleHierarchicalResizeConvDetokenizer(**common)
             else:
                 raise ValueError(
                     f"Unknown detokenizer_type={detokenizer_type!r}. Expected one of "
                     "linear_reshape, pixel_shuffle, pixel_shuffle_3x3x2, "
                     "pixel_shuffle_5x5x2, pixel_shuffle_7x7x1, "
-                    "conv_transpose_k12_s4, bilinear_3x3x2, hierarchical_2stage."
+                    "conv_transpose_k12_s4, bilinear_3x3x2, hierarchical_2stage, "
+                    "hierarchical_2stage_resizeconv."
                 )
 
         # Replace unpicklable lambdas with a proper static method so torch.save works.
@@ -670,8 +822,12 @@ class FlexibleDiT(DiT):
         else:
             x = self.tokenizer(x, **tokenizer_kwargs)
 
-        # Compute conditioning embedding
-        c = self.conditioning_embedder(t, condition=condition)  # (B, D) or (B, 0)
+        # Compute conditioning embedding.
+        # The conditioning_embedder may be a _PassthroughConditionEmbedder
+        # (AnemoiDiTModel swaps it in when noise conditioning is enabled), in
+        # which case ``c`` inherits the shape of ``condition`` — either (B, D)
+        # for FGN-style global noise or (B, L, D) for AIFS-style per-token noise.
+        c = self.conditioning_embedder(t, condition=condition)
 
         # Override latent_hw with dynamic value (only relevant for NATTEN backend)
         if self.attn_kwargs_forward:
@@ -681,23 +837,38 @@ class FlexibleDiT(DiT):
             # timm / transformer_engine: no latent_hw needed
             merged_attn_kwargs = {**attn_kwargs}
 
-        for block in self.blocks:
-            x = block(
-                x,
-                c,
-                p_dropout=p_dropout,
-                attn_kwargs=merged_attn_kwargs,
-            )  # (B, L, D)
+        # Dispatch on c.ndim: 3-D = per-token (AIFS), 2-D = global (FGN / time emb).
+        if c.ndim == 3:
+            for block in self.blocks:
+                x = self._block_forward_per_token(
+                    block, x, c,
+                    attn_kwargs=merged_attn_kwargs,
+                    p_dropout=p_dropout,
+                )
+            # Detokenizer's adaptive_modulation expects (B, D). Mean-pool the
+            # per-token conditioning over the token axis so the detokenizer
+            # path stays unchanged. AIFS only conditions the processor on
+            # per-token noise; the detokenizer sees a global summary.
+            c_for_detok = c.mean(dim=1)
+        else:
+            for block in self.blocks:
+                x = block(
+                    x,
+                    c,
+                    p_dropout=p_dropout,
+                    attn_kwargs=merged_attn_kwargs,
+                )  # (B, L, D)
+            c_for_detok = c
 
         # De-tokenize with dynamic spatial dims
         if self.force_tokenization_fp32:
             dtype = x.dtype
             x = x.to(torch.float32)
-            c_fp32 = c.to(torch.float32)  # detokenizer's adaptive_modulation Linear is fp32 under this flag
+            c_fp32 = c_for_detok.to(torch.float32)  # detokenizer's adaptive_modulation Linear is fp32 under this flag
             with torch.autocast(device_type="cuda", enabled=False):
                 x = self.detokenizer(x, c_fp32, h_patches=h_patches, w_patches=w_patches)
             x = x.to(dtype)
         else:
-            x = self.detokenizer(x, c, h_patches=h_patches, w_patches=w_patches)
+            x = self.detokenizer(x, c_for_detok, h_patches=h_patches, w_patches=w_patches)
 
         return x

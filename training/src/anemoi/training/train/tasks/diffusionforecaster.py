@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import logging
+import math
 from typing import TYPE_CHECKING
 
 import torch
@@ -52,7 +53,25 @@ class BaseDiffusionForecaster(BaseGraphModule):
             supporting_arrays=supporting_arrays,
         )
 
-        self.rho = config.model.model.diffusion.rho
+        # rho lives under `diffusion:` for the enc-proc-dec models, but under
+        # `dit:` for AnemoiDiTModel. Support both (DiT path for the thermalizer).
+        mm = config.model.model
+        diff_cfg = getattr(mm, "diffusion", None)
+        if diff_cfg is not None and getattr(diff_cfg, "rho", None) is not None:
+            self.rho = diff_cfg.rho
+        else:
+            self.rho = mm.dit.rho
+
+        # Training-time noise-level sampling distribution. "rho_power" (default,
+        # back-compat) = Karras rho-power curve with a uniform draw; "loguniform"
+        # = p(sigma) ∝ 1/sigma (cBottle coarse models); "lognormal" = Karras EDM
+        # log-normal sigma = exp(N(P_mean, P_std^2)) — cBottle-SR's 5km recipe,
+        # concentrates training mass at the meso-scale sigma band. Lives next to
+        # rho on the dit/diffusion cfg.
+        _src = diff_cfg if diff_cfg is not None and getattr(diff_cfg, "sigma_distribution", None) is not None else getattr(mm, "dit", None)
+        self.sigma_distribution = str(getattr(_src, "sigma_distribution", "rho_power"))
+        self.P_mean = float(getattr(_src, "P_mean", -1.2))
+        self.P_std = float(getattr(_src, "P_std", 1.2))
 
     def get_input(self, batch: torch.Tensor) -> torch.Tensor:
         """Get input tensor shape for diffusion model."""
@@ -132,8 +151,20 @@ class BaseDiffusionForecaster(BaseGraphModule):
         rho: float,
         device: torch.device,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        rnd_uniform = torch.rand(shape, device=device)
-        sigma = (sigma_max ** (1.0 / rho) + rnd_uniform * (sigma_min ** (1.0 / rho) - sigma_max ** (1.0 / rho))) ** rho
+        dist = getattr(self, "sigma_distribution", "rho_power")
+        if dist == "lognormal":
+            # Karras EDM: sigma = exp(N(P_mean, P_std^2)). cBottle-SR's 5km recipe;
+            # concentrates mass at the meso-scale sigma band (P_mean=-1.2 -> median
+            # sigma~0.30). No sigma_min/max clamp (the log-normal sets the range).
+            sigma = torch.exp(self.P_mean + self.P_std * torch.randn(shape, device=device))
+        elif dist == "loguniform":
+            # p(sigma) ∝ 1/sigma: uniform in log(sigma) over [sigma_min, sigma_max].
+            rnd_uniform = torch.rand(shape, device=device)
+            log_min, log_max = math.log(sigma_min), math.log(sigma_max)
+            sigma = torch.exp(log_min + rnd_uniform * (log_max - log_min))
+        else:
+            rnd_uniform = torch.rand(shape, device=device)
+            sigma = (sigma_max ** (1.0 / rho) + rnd_uniform * (sigma_min ** (1.0 / rho) - sigma_max ** (1.0 / rho))) ** rho
         weight = (sigma**2 + sigma_data**2) / (sigma * sigma_data) ** 2
         return sigma, weight
 
@@ -355,3 +386,26 @@ class GraphDiffusionTendForecaster(BaseDiffusionForecaster):
         )
 
         return loss, metrics, y_pred
+
+
+class GraphDiffusionDenoiser(GraphDiffusionForecaster):
+    """Thermalizer denoiser (Pedersen/Zanna/Bruna 2025): an EDM diffusion model
+    of the invariant measure of the TRUE state, used at inference to denoise a
+    drifted emulator state back onto the data manifold (stability + sharpening).
+
+    Unlike the forecaster, the TARGET is the CURRENT state (the field to project
+    onto the manifold), not the next step. Conditioning is handled model-side via
+    ``model.model.diffusion.condition_on='forcing'`` (DiT in_channels sized to
+    forcings only) — conditioning on the clean prognostic state would make the
+    denoising trivial. Everything else (EDM noise sampling, preconditioning,
+    loss weighting, samplers) is inherited from GraphDiffusionForecaster.
+
+    Use with ``multistep_input: 1`` so the single input frame supplies both the
+    conditioning forcings and the target state.
+    """
+
+    def get_target(self, batch: torch.Tensor) -> torch.Tensor:
+        """Target = prognostic state of the CURRENT (last input) frame."""
+        y = batch[:, self.multi_step - 1, ..., self.data_indices.data.output.full]
+        LOGGER.debug("SHAPE: denoiser y.shape = %s", list(y.shape))
+        return y

@@ -139,6 +139,15 @@ class AnemoiModelInterface(torch.nn.Module):
         if hasattr(self.model, "forward_with_noise"):
             self.forward_with_noise = self.model.forward_with_noise
 
+        # AIFS-style ensemble path: similarly expose
+        # ``forward_with_spatial_noise`` and the ``noise_injector`` attribute
+        # (used by the task as the dispatch flag) when the wrapped model
+        # has per-grid-point noise conditioning configured.
+        if hasattr(self.model, "forward_with_spatial_noise"):
+            self.forward_with_spatial_noise = self.model.forward_with_spatial_noise
+        if getattr(self.model, "noise_injector", None) is not None:
+            self.noise_injector = self.model.noise_injector
+
     def predict_step(
         self, batch: torch.Tensor, model_comm_group: Optional[ProcessGroup] = None, gather_out: bool = True, **kwargs
     ) -> torch.Tensor:

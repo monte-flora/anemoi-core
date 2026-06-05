@@ -38,6 +38,7 @@ from .processor import BandedTransformerProcessorSchema  # noqa: TC001
 from .processor import GNNProcessorSchema  # noqa: TC001
 from .processor import GraphInteractionNetProcessorSchema  # noqa: TC001
 from .processor import GraphTransformerProcessorSchema  # noqa: TC001
+from .processor import NATTEN2DProcessorSchema  # noqa: TC001
 from .processor import PointWiseMLPProcessorSchema  # noqa: TC001
 from .processor import TransformerProcessorSchema  # noqa: TC001
 from .residual import ResidualConnectionSchema
@@ -50,6 +51,8 @@ class DefinedModels(str, Enum):
     ANEMOI_MODEL_ENC_PROC_DEC_SHORT = "anemoi.models.models.AnemoiModelEncProcDec"
     ANEMOI_ENS_MODEL_ENC_PROC_DEC = "anemoi.models.models.ens_encoder_processor_decoder.AnemoiEnsModelEncProcDec"
     ANEMOI_ENS_MODEL_ENC_PROC_DEC_SHORT = "anemoi.models.models.AnemoiEnsModelEncProcDec"
+    ANEMOI_ENS_RESIDUAL_MODEL_ENC_PROC_DEC = "anemoi.models.models.ensresidual_encoder_processor_decoder.AnemoiEnsResidualModelEncProcDec"
+    ANEMOI_ENS_RESIDUAL_MODEL_ENC_PROC_DEC_SHORT = "anemoi.models.models.AnemoiEnsResidualModelEncProcDec"
     ANEMOI_MODEL_ENC_HIERPROC_DEC = "anemoi.models.models.hierarchical.AnemoiModelEncProcDecHierarchical"
     ANEMOI_MODEL_ENC_HIERPROC_DEC_SHORT = "anemoi.models.models.AnemoiModelEncProcDecHierarchical"
     ANEMOI_MODEL_INTERPENC_PROC_DEC = "anemoi.models.models.interpolator.AnemoiModelEncProcDecInterpolator"
@@ -217,6 +220,64 @@ class DiffusionSchema(BaseModel):
     "Default parameters for inference sampling"
 
 
+# ----------------------------------------------------------------------
+# Noise-injection schemas (also consumed by EnsModelSchema and DiTConfigSchema).
+# Defined up here so DiTConfigSchema.noise_injector can reference
+# NoiseInjectorUnion without a forward-reference.
+# ----------------------------------------------------------------------
+
+
+class NoOpNoiseInjectorSchema(BaseModel):
+    """Schema for NoOpNoiseInjector - passes input through unchanged."""
+
+    target_: Literal["anemoi.models.layers.ensemble.NoOpNoiseInjector"] = Field(..., alias="_target_")
+    "No-op noise injector class"
+
+
+class NoiseConditioningSchema(BaseModel):
+    """Schema for NoiseConditioning - generates noise for conditioning."""
+
+    target_: Literal["anemoi.models.layers.ensemble.NoiseConditioning"] = Field(..., alias="_target_")
+    "Noise conditioning layer class"
+    noise_std: NonNegativeInt = Field(example=1)
+    "Standard deviation of the noise to be injected."
+    noise_channels_dim: NonNegativeInt = Field(example=4)
+    "Number of channels in the noise tensor."
+    noise_mlp_hidden_dim: NonNegativeInt = Field(example=8)
+    "Hidden dimension of the MLP used to process the noise."
+    layer_kernels: Union[dict[str, dict], None] = Field(default_factory=dict)
+    "Settings related to custom kernels for encoder processor and decoder blocks"
+    noise_matrix: Optional[str] = Field(default=None)
+    "Path to the noise projection matrix file (.npz). If None, no projection is applied."
+    transpose_noise_matrix: bool = Field(default=False)
+    "Whether to transpose the noise projection matrix."
+    row_normalize_noise_matrix: bool = Field(default=False)
+    "Whether to row-normalize the noise projection matrix weights."
+    autocast: bool = Field(default=False)
+    "Whether to use autocast for the noise projection matrix operations."
+
+
+class NoiseInjectorSchema(BaseModel):
+    """Schema for NoiseInjector - injects noise directly into input tensor."""
+
+    target_: Literal["anemoi.models.layers.ensemble.NoiseInjector"] = Field(..., alias="_target_")
+    "Noise injector layer class"
+    noise_std: NonNegativeInt = Field(example=1)
+    "Standard deviation of the noise to be injected."
+    noise_channels_dim: NonNegativeInt = Field(example=4)
+    "Number of channels in the noise tensor."
+    noise_mlp_hidden_dim: NonNegativeInt = Field(example=8)
+    "Hidden dimension of the MLP used to process the noise."
+    layer_kernels: Union[dict[str, dict], None] = Field(default_factory=dict)
+    "Settings related to custom kernels for encoder processor and decoder blocks"
+
+
+NoiseInjectorUnion = Annotated[
+    Union[NoOpNoiseInjectorSchema, NoiseConditioningSchema, NoiseInjectorSchema],
+    Field(discriminator="target_"),
+]
+
+
 class DiTConfigSchema(BaseModel):
     """Schema for DiT-specific configuration."""
 
@@ -279,8 +340,9 @@ class DiTConfigSchema(BaseModel):
         "conv_transpose_k12_s4",
         "bilinear_3x3x2",
         "hierarchical_2stage",
+        "hierarchical_2stage_resizeconv",
     ] = Field(default="linear_reshape")
-    "Detokenizer head architecture. 'linear_reshape' (default) is the stock DiT ProjLayer + reshape (per-token Linear, no cross-patch blending; structurally pixelates). The other variants are Tier-A1/A3 cross-patch-mixing heads from the literature survey: 'pixel_shuffle' (alias for 3x3x2), 'pixel_shuffle_5x5x2' (RF=9 cells), 'pixel_shuffle_7x7x1' (single 7x7 conv, RF=7), 'conv_transpose_k12_s4' (3x overlap, no Odena checkerboard), 'bilinear_3x3x2' (smooth + learned recovery), 'hierarchical_2stage' (SegFormer-style two-step PixelShuffle)."
+    "Detokenizer head architecture. 'linear_reshape' (default) is the stock DiT ProjLayer + reshape (per-token Linear, no cross-patch blending; structurally pixelates). The other variants are Tier-A1/A3 cross-patch-mixing heads from the literature survey: 'pixel_shuffle' (alias for 3x3x2), 'pixel_shuffle_5x5x2' (RF=9 cells), 'pixel_shuffle_7x7x1' (single 7x7 conv, RF=7), 'conv_transpose_k12_s4' (3x overlap, no Odena checkerboard), 'bilinear_3x3x2' (smooth + learned recovery), 'hierarchical_2stage' (SegFormer-style two-step PixelShuffle), 'hierarchical_2stage_resizeconv' (same two-stage structure but bilinear-resize upsamples instead of PixelShuffle — removes the Odena sub-pixel checkerboard; adaln/refine1/refine2 weights are checkpoint-compatible with hierarchical_2stage, proj1/proj2 warm-start from the 4-group sub-kernel mean)."
     # Diffusion-specific (only used when mode='probabilistic')
     sigma_data: Optional[PositiveFloat] = Field(default=1.0)
     "Data scaling parameter for EDM preconditioning."
@@ -290,8 +352,26 @@ class DiTConfigSchema(BaseModel):
     "Minimum noise level for diffusion training."
     rho: Optional[PositiveFloat] = Field(default=7.0)
     "Karras schedule parameter for training noise distribution."
+    sigma_distribution: Literal["rho_power", "loguniform", "lognormal"] = Field(default="rho_power")
+    "Training-time noise-level sampling. 'rho_power' (default, byte-identical for " \
+    "existing diffusion DiT checkpoints): Karras rho-power curve with a uniform " \
+    "draw (concentrates mass at high sigma for rho>1). 'loguniform': p(sigma) ∝ " \
+    "1/sigma over [sigma_min, sigma_max] (cBottle coarse models). 'lognormal': " \
+    "Karras EDM sigma = exp(N(P_mean, P_std^2)) — cBottle-SR's 5km recipe, " \
+    "concentrates mass at the meso-scale sigma band (P_mean=-1.2 -> median ~0.30)."
+    P_mean: float = Field(default=-1.2)
+    "Mean of log(sigma) for the 'lognormal' noise distribution (Karras EDM default -1.2)."
+    P_std: float = Field(default=1.2)
+    "Std of log(sigma) for the 'lognormal' noise distribution (Karras EDM default 1.2)."
     inference_defaults: dict = Field(default_factory=dict)
     "Default parameters for inference sampling (noise schedule, sampler)."
+    condition_on: Literal["full", "forcing", "none"] = Field(default="full")
+    "Diffusion conditioning subset (probabilistic mode). 'full' (default, " \
+    "byte-identical for existing diffusion DiT checkpoints): condition on the " \
+    "whole input history (forecaster). 'forcing': condition on forcings only " \
+    "(thermalizer DENOISER via GraphDiffusionDenoiser — conditioning on the " \
+    "clean prognostic state to denoise itself is trivial); in_channels is sized " \
+    "to forcings so no dead input-projection weights. 'none': unconditional."
     output_mode: Literal["residual", "state"] = Field(default="residual")
     "How the model output is interpreted. 'residual' (default, back-compat): " \
     "DiT output is a normalised residual; the task reconstructs state externally. " \
@@ -304,9 +384,23 @@ class DiTConfigSchema(BaseModel):
     drop_path_rate: float = Field(default=0.0)
     "Stochastic-depth (DropPath) rate applied at each block's residual gate. 0.0 = off (default)."
     noise_vector_dim: Optional[int] = Field(default=None)
-    "Dimension of the per-(batch, member) noise vector for FGN-style ensemble training (None = disabled, deterministic). 32 matches FGN."
+    "Dimension of the per-(batch, member) noise vector for FGN-style ensemble training (None = disabled, deterministic). 32 matches FGN. Mutually exclusive with `noise_injector`."
     noise_encoder_type: Literal["matmul", "fourier_mlp", "none"] = Field(default="none")
     "How to encode the noise vector into the DiT hidden_size: 'matmul' (single Linear, FGN-faithful), 'fourier_mlp' (Sinusoidal+MLP, GenCast-style), 'none' (disabled). When 'matmul' or 'fourier_mlp', AnemoiDiTModel swaps the conditioning_embedder for a passthrough so the encoded noise reaches every adaLN unchanged."
+    noise_injector: Optional[NoiseInjectorUnion] = Field(default=None)
+    "AIFS-style per-grid-point noise conditioning. When set, AnemoiDiTModel instantiates this NoiseConditioning / NoiseInjector layer and routes the per-token noise embedding through the DiT processor's adaLN (3-D conditioning). The detokenizer receives the mean-pooled (2-D) projection so existing detokenizer code paths are unchanged. Mutually exclusive with `noise_vector_dim` (FGN-style global noise)."
+
+    @model_validator(mode="after")
+    def _check_noise_mutually_exclusive(self) -> "DiTConfigSchema":
+        if self.noise_vector_dim is not None and self.noise_injector is not None:
+            msg = (
+                "DiTConfigSchema: `noise_vector_dim` (FGN-style global noise) and "
+                "`noise_injector` (AIFS-style per-token noise) are mutually exclusive — "
+                "pick one. Got noise_vector_dim="
+                f"{self.noise_vector_dim} and noise_injector._target_={getattr(self.noise_injector, 'target_', '?')}."
+            )
+            raise ValueError(msg)
+        return self
 
 
 class DiTModel(BaseModel):
@@ -445,7 +539,7 @@ class BaseModelSchema(PydanticBaseModel):
     latent_skip: bool = True
     "Add skip connection in latent space before/after processor. Currently only in interpolator."
     processor: Union[
-        GNNProcessorSchema, GraphInteractionNetProcessorSchema, GraphTransformerProcessorSchema, TransformerProcessorSchema, PointWiseMLPProcessorSchema, BandedTransformerProcessorSchema
+        GNNProcessorSchema, GraphInteractionNetProcessorSchema, GraphTransformerProcessorSchema, TransformerProcessorSchema, PointWiseMLPProcessorSchema, BandedTransformerProcessorSchema, NATTEN2DProcessorSchema
     ] = Field(
         ...,
         discriminator="target_",
@@ -470,55 +564,9 @@ class BaseModelSchema(PydanticBaseModel):
     "Modules to be compiled"
 
 
-class NoOpNoiseInjectorSchema(BaseModel):
-    """Schema for NoOpNoiseInjector - passes input through unchanged."""
-
-    target_: Literal["anemoi.models.layers.ensemble.NoOpNoiseInjector"] = Field(..., alias="_target_")
-    "No-op noise injector class"
-
-
-class NoiseConditioningSchema(BaseModel):
-    """Schema for NoiseConditioning - generates noise for conditioning."""
-
-    target_: Literal["anemoi.models.layers.ensemble.NoiseConditioning"] = Field(..., alias="_target_")
-    "Noise conditioning layer class"
-    noise_std: NonNegativeInt = Field(example=1)
-    "Standard deviation of the noise to be injected."
-    noise_channels_dim: NonNegativeInt = Field(example=4)
-    "Number of channels in the noise tensor."
-    noise_mlp_hidden_dim: NonNegativeInt = Field(example=8)
-    "Hidden dimension of the MLP used to process the noise."
-    layer_kernels: Union[dict[str, dict], None] = Field(default_factory=dict)
-    "Settings related to custom kernels for encoder processor and decoder blocks"
-    noise_matrix: Optional[str] = Field(default=None)
-    "Path to the noise projection matrix file (.npz). If None, no projection is applied."
-    transpose_noise_matrix: bool = Field(default=False)
-    "Whether to transpose the noise projection matrix."
-    row_normalize_noise_matrix: bool = Field(default=False)
-    "Whether to row-normalize the noise projection matrix weights."
-    autocast: bool = Field(default=False)
-    "Whether to use autocast for the noise projection matrix operations."
-
-
-class NoiseInjectorSchema(BaseModel):
-    """Schema for NoiseInjector - injects noise directly into input tensor."""
-
-    target_: Literal["anemoi.models.layers.ensemble.NoiseInjector"] = Field(..., alias="_target_")
-    "Noise injector layer class"
-    noise_std: NonNegativeInt = Field(example=1)
-    "Standard deviation of the noise to be injected."
-    noise_channels_dim: NonNegativeInt = Field(example=4)
-    "Number of channels in the noise tensor."
-    noise_mlp_hidden_dim: NonNegativeInt = Field(example=8)
-    "Hidden dimension of the MLP used to process the noise."
-    layer_kernels: Union[dict[str, dict], None] = Field(default_factory=dict)
-    "Settings related to custom kernels for encoder processor and decoder blocks"
-
-
-NoiseInjectorUnion = Annotated[
-    Union[NoOpNoiseInjectorSchema, NoiseConditioningSchema, NoiseInjectorSchema],
-    Field(discriminator="target_"),
-]
+# NoOpNoiseInjectorSchema, NoiseConditioningSchema, NoiseInjectorSchema, and
+# NoiseInjectorUnion are now defined above DiTConfigSchema (so DiTConfigSchema
+# can reference NoiseInjectorUnion directly, no forward-reference).
 
 
 class EnsModelSchema(BaseModelSchema):

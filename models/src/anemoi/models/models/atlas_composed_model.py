@@ -116,6 +116,16 @@ class AnemoiAtlasModel(nn.Module):
         self.prognostic_channels = prognostic_channels
         self.forcings_channels = forcings_channels
 
+        # If the predictive was trained with a LatentResidualNormalizer
+        # (v30c+: tendency-normalized latent residual targets), its output is
+        # in tendency-norm space. The decoder is trained on mean-std r_lat,
+        # so we denormalize before passing to the decoder.
+        # The normalizer is attached to predictive as an attribute by the
+        # training task; we surface it here for use in `forward`.
+        self.latent_residual_normalizer = getattr(
+            predictive, "latent_residual_normalizer", None,
+        )
+
     def encode(self, x: torch.Tensor) -> torch.Tensor:
         """Bilinear-downsample a full-resolution prognostic field to latent.
 
@@ -194,6 +204,19 @@ class AnemoiAtlasModel(nn.Module):
             forcings_curr=forcings_curr_lat,
             forcings_prev=forcings_prev_lat,
         )
+
+        # 2b) If the predictive was trained with a LatentResidualNormalizer
+        #     (v30c+), its output is in tendency-normalized space. Denormalize
+        #     back to mean-std space — the decoder was trained on mean-std
+        #     r_lat targets, so it needs the same input distribution at inference.
+        if self.latent_residual_normalizer is not None:
+            if r_t.dim() == 5:
+                B, E = r_t.shape[:2]
+                r_t_flat = r_t.reshape(B * E, *r_t.shape[2:])
+                r_t_flat = self.latent_residual_normalizer.inverse_transform(r_t_flat)
+                r_t = r_t_flat.reshape(B, E, *r_t_flat.shape[1:])
+            else:
+                r_t = self.latent_residual_normalizer.inverse_transform(r_t)
 
         # 3) Decoder produces full-res residual conditioned on x_curr
         #    (including forcings).

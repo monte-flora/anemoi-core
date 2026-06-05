@@ -15,6 +15,7 @@ from .graphcast_mahalanobis import GraphCastMahalanobisLoss
 from .graphcast_crps import GraphCastCRPSLoss
 from .graphcast_mae import GraphCastMAELoss
 from .graphcast_mse import GraphCastMSELoss
+from .graphcast_mse import WeightedGraphCastMSELoss
 from .graphcast_robust import GraphCastClippedMSELoss
 from .graphcast_robust import GraphCastPseudoHuberLoss
 from .huber import HuberLoss

@@ -68,6 +68,27 @@ class GraphEnsResidualForecaster(GraphEnsForecaster):
             self.noise_vector_dim, self.nens_per_device,
         )
 
+        # Per-channel state bounding (WoFSCast-colleague recipe). When
+        # ``training.state_bounding.enabled: True``, the reconstructed
+        # state in normalized space is clipped to ``[-n_sigma, +n_sigma]``
+        # at every rollout step. For mean-std-normalised prognostics this
+        # is equivalent to clipping the physical state to ``μ ± n_sigma·σ``
+        # (per-channel μ, σ from the training distribution) — no per-
+        # channel lookup needed because the normaliser already maps to
+        # μ=0, σ=1. The clip teaches the model to stay in-distribution
+        # under multi-step rollout AND prevents exploding amplitudes at
+        # inference. Applied symmetrically — does not affect ensemble
+        # spread, only outlier suppression.
+        sb_cfg = getattr(train_cfg, "state_bounding", None)
+        self.state_bounding_enabled = bool(getattr(sb_cfg, "enabled", False)) if sb_cfg is not None else False
+        self.state_bounding_n_sigma = float(getattr(sb_cfg, "n_sigma", 4.0)) if sb_cfg is not None else 4.0
+        if self.state_bounding_enabled:
+            LOGGER.info(
+                "GraphEnsResidualForecaster: state bounding ENABLED  (clip "
+                "normalised state to ±%.2f σ at every rollout step)",
+                self.state_bounding_n_sigma,
+            )
+
         # Sanity: the underlying AnemoiDiTModel must support forward_with_noise.
         # We can't check this at __init__ because self.model is built lazily by
         # the base class; we'll error at the first forward call if it's missing.
@@ -140,22 +161,42 @@ class GraphEnsResidualForecaster(GraphEnsForecaster):
         nm_mul_prog = norm_mul[input_prog_idx].float()
         nm_add_prog = norm_add[input_prog_idx].float()
 
+        # Decide noise path at the start of the trajectory:
+        #
+        #   AIFS-style (per-grid-point): the model has a ``noise_injector``;
+        #       ``forward_with_spatial_noise`` samples noise INTERNALLY on every
+        #       call (fresh per step, AIFS convention). No noise vector to thread
+        #       through; member diversity is produced inside the model.
+        #
+        #   FGN-style (global per-member): the model has a ``noise_encoder``;
+        #       we sample ONE noise vector per (batch, member, trajectory) and
+        #       reuse it on every rollout step. This matches the FGN inference
+        #       contract where ``forward_with_noise`` is called repeatedly with
+        #       the same z, and at rollout=1 is identical to per-step sampling.
+        use_aifs_noise = getattr(self.model, "noise_injector", None) is not None
+        use_fgn_noise = (not use_aifs_noise) and hasattr(self.model, "forward_with_noise")
+
+        B = x.shape[0]
+        if use_aifs_noise:
+            noise_vec_traj = None
+        elif use_fgn_noise:
+            noise_vec_traj = self._sample_noise(B, x.device, x.dtype)
+        else:
+            msg = (
+                "GraphEnsResidualForecaster requires the model to expose either "
+                "an AIFS-style ``noise_injector`` (per-grid-point noise) or an "
+                "FGN-style ``forward_with_noise(x, noise_vec)`` method. Neither "
+                "was found. Configure dit.noise_injector OR dit.noise_vector_dim."
+            )
+            raise AttributeError(msg)
+
         for rollout_step in range(rollout or self.rollout):
-            B = x.shape[0]
-
-            # ---- forward with per-member noise -----------------------------
-            # noise_vec: (B, nens_per_device, noise_vector_dim)
-            noise_vec = self._sample_noise(B, x.device, x.dtype)
-
-            if not hasattr(self.model, "forward_with_noise"):
-                msg = (
-                    "GraphEnsResidualForecaster requires the model to implement "
-                    "forward_with_noise(x, noise_vec). Use AnemoiDiTModel with "
-                    "noise_vector_dim configured."
-                )
-                raise AttributeError(msg)
-
-            model_output = self.model.forward_with_noise(x, noise_vec)
+            if use_aifs_noise:
+                # AIFS: fresh per-grid-point noise sampled inside the model.
+                model_output = self.model.forward_with_spatial_noise(x)
+            else:
+                # FGN: same trajectory-level noise across every rollout step.
+                model_output = self.model.forward_with_noise(x, noise_vec_traj)
             # model_output: (B, nens_per_device, latlon, n_output)
 
             # ---- residual reconstruction (same math as GraphResidualForecaster) ----
@@ -199,6 +240,20 @@ class GraphEnsResidualForecaster(GraphEnsForecaster):
                 y_pred_phys_prog * nm_mul_prog + nm_add_prog
             ).to(model_output.dtype)
 
+            # State bounding: clip normalised state to ±n_sigma per channel.
+            # Mean-std normaliser maps physical (μ, σ) → (0, 1), so this is
+            # equivalent to physical-space clip at μ ± n_sigma·σ. Applied
+            # symmetrically to every prognostic channel; outlier suppression
+            # only, does not reduce ensemble spread within ±n_sigma. The
+            # bound is what the WoFSCast colleague found load-bearing for
+            # CRPS rollout stability at storm scale.
+            if self.state_bounding_enabled:
+                y_pred_prog = torch.clamp(
+                    y_pred_prog,
+                    -self.state_bounding_n_sigma,
+                    self.state_bounding_n_sigma,
+                )
+
             # Build full prediction tensor (prognostic + diagnostic) for _advance_input.
             n_output = len(self.data_indices.model.output.full)
             y_pred = torch.zeros(
@@ -221,19 +276,25 @@ class GraphEnsResidualForecaster(GraphEnsForecaster):
 
             grid_shard_slice = self.grid_shard_slice
 
-            # GraphCastCRPSLoss expects target shape (B, 1, G, V) or (B, G, V) —
-            # see graphcast_crps.calculate_difference. Since the per-member
-            # targets are identical at rollout=1, slicing member 0 is exact.
-            # At rollout > 1, falling back to member 0's residual gives a single
-            # reference truth; the alternative would be to evaluate CRPS per
-            # member (with each having its own target), but the standard FGN
-            # formulation uses a single truth.
+            # Target shape: pass 4-D ``(B, 1, G, V)`` with singleton ensemble
+            # dim. GraphCastCRPSLoss.calculate_difference accepts both 3-D
+            # ``(B, G, V)`` and 4-D ``(B, 1, G, V)`` and squeezes internally.
+            # GraphCast*MSE*/MAE/Huber etc. need the 4-D form so that
+            # ``pred (B, E, G, V) - target (B, 1, G, V)`` broadcasts cleanly
+            # along the ensemble axis; the 3-D form caused a right-aligned
+            # broadcast that compared pred's ensemble dim against target's
+            # batch dim (3 vs 4) and crashed v31c CombinedLoss[CRPS, MSE].
+            #
+            # Member-0 slicing (vs all-members average) is exact at
+            # rollout=1 (all members share x_last); at rollout > 1 the
+            # truth-residual is intrinsically per-member, but the standard
+            # FGN formulation uses a single reference truth so we pick m0.
             Δx_true_for_loss = Δx_true_norm[:, 0:1]  # (B, 1, G, n_prog)
 
             loss = checkpoint(
                 self.compute_loss_metrics_residual,
                 Δx̂_norm_prog,
-                Δx_true_for_loss.squeeze(1),  # (B, G, n_prog) — matches CRPS API
+                Δx_true_for_loss,                    # (B, 1, G, n_prog)
                 rollout_step,
                 validation_mode,
                 use_reentrant=False,
@@ -291,7 +352,9 @@ class GraphEnsResidualForecaster(GraphEnsForecaster):
             Per-member predicted residuals in normalized residual space,
             shape ``(B, nens_per_device, G, n_prog)``.
         target_residual : torch.Tensor
-            Single-realisation truth residual, shape ``(B, G, n_prog)``.
+            Single-realisation truth residual, shape ``(B, 1, G, n_prog)``
+            (4-D with singleton ensemble dim — broadcasts cleanly for MSE
+            children of CombinedLoss; CRPS internally squeezes the singleton).
         step : int
             Rollout step index (kept for API compatibility; unused here).
         validation_mode : bool

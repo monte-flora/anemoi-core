@@ -41,6 +41,15 @@ class CheckVariableOrder(pl.callbacks.Callback):
         dataset : NativeGridDataset
             Dataset to compare against
         """
+        # Transfer learning legitimately changes the variable set/order (weights loaded by
+        # name; re-init stem/head use the new data_indices; trunk is order-agnostic). The
+        # loader flags the model in that case -> skip the strict order check rather than raise.
+        if getattr(pl_module, "_skip_variable_order_check", False):
+            LOGGER.info(
+                "CheckVariableOrder: skipping strict variable-order check (transfer learning).",
+            )
+            return
+
         data_name_to_index = dataset.name_to_index
 
         if hasattr(pl_module, "_ckpt_model_name_to_index"):
