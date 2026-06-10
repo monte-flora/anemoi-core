@@ -837,14 +837,35 @@ class FlexibleDiT(DiT):
             # timm / transformer_engine: no latent_hw needed
             merged_attn_kwargs = {**attn_kwargs}
 
+        # Gradient (activation) checkpointing: recompute each DiT block in the
+        # backward pass instead of storing its activations. Enables full-CONUS
+        # (992x1524 = 94,488 tokens) training on a single 40 GB GPU at the cost
+        # of ~30-40% extra compute. Post-init knob set by AnemoiDiTModel from
+        # dit_cfg.gradient_checkpointing; getattr-guarded so checkpoints saved
+        # before this attribute existed load and run unchanged.
+        use_ckpt = (
+            getattr(self, "gradient_checkpointing", False)
+            and self.training
+            and torch.is_grad_enabled()
+        )
+
         # Dispatch on c.ndim: 3-D = per-token (AIFS), 2-D = global (FGN / time emb).
         if c.ndim == 3:
             for block in self.blocks:
-                x = self._block_forward_per_token(
-                    block, x, c,
-                    attn_kwargs=merged_attn_kwargs,
-                    p_dropout=p_dropout,
-                )
+                if use_ckpt:
+                    x = torch.utils.checkpoint.checkpoint(
+                        self._block_forward_per_token,
+                        block, x, c,
+                        attn_kwargs=merged_attn_kwargs,
+                        p_dropout=p_dropout,
+                        use_reentrant=False,
+                    )
+                else:
+                    x = self._block_forward_per_token(
+                        block, x, c,
+                        attn_kwargs=merged_attn_kwargs,
+                        p_dropout=p_dropout,
+                    )
             # Detokenizer's adaptive_modulation expects (B, D). Mean-pool the
             # per-token conditioning over the token axis so the detokenizer
             # path stays unchanged. AIFS only conditions the processor on
@@ -852,12 +873,22 @@ class FlexibleDiT(DiT):
             c_for_detok = c.mean(dim=1)
         else:
             for block in self.blocks:
-                x = block(
-                    x,
-                    c,
-                    p_dropout=p_dropout,
-                    attn_kwargs=merged_attn_kwargs,
-                )  # (B, L, D)
+                if use_ckpt:
+                    x = torch.utils.checkpoint.checkpoint(
+                        block,
+                        x,
+                        c,
+                        p_dropout=p_dropout,
+                        attn_kwargs=merged_attn_kwargs,
+                        use_reentrant=False,
+                    )  # (B, L, D)
+                else:
+                    x = block(
+                        x,
+                        c,
+                        p_dropout=p_dropout,
+                        attn_kwargs=merged_attn_kwargs,
+                    )  # (B, L, D)
             c_for_detok = c
 
         # De-tokenize with dynamic spatial dims

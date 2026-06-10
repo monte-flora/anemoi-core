@@ -294,6 +294,14 @@ class AnemoiDiTModel(nn.Module):
         LOGGER.info("  dit total: %s params", _fmt_params(total_dit))
         LOGGER.info("=" * 78)
 
+        # Gradient (activation) checkpointing on the DiT blocks: recompute in
+        # backward instead of storing activations. Required for full-CONUS
+        # (992x1524) training on 40 GB GPUs; ~30-40% step-time cost. Default
+        # False preserves existing behaviour/throughput.
+        self.dit.gradient_checkpointing = bool(getattr(dit_cfg, "gradient_checkpointing", False))
+        if self.dit.gradient_checkpointing:
+            LOGGER.info("DiT gradient checkpointing ENABLED (per-block recompute in backward)")
+
         # Optional post-init activation swap: set dit_cfg.activation to one of
         # {"gelu", "silu", "relu"}. Replaces every nn.GELU inside the DiT
         # transformer (including physicsnemo-internal MLPs) with the chosen

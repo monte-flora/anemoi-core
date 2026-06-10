@@ -331,6 +331,8 @@ class DiTConfigSchema(BaseModel):
     "σ of the post-detokenizer Gaussian low-pass filter. 0 (default) disables; positive float (typical 0.5–1.0) enables a non-learnable, depth-wise 2-D Gaussian blur as a Nyquist rolloff. Applied in-line before conv_refinement."
     detokenizer_lowpass_kernel: int = Field(default=5)
     "Odd kernel size (3/5/7) for the Gaussian LPF. Used only when detokenizer_lowpass_sigma > 0."
+    gradient_checkpointing: bool = Field(default=False)
+    "Recompute each DiT block in the backward pass instead of storing activations (torch.utils.checkpoint, non-reentrant). Enables full-CONUS (992x1524) training on 40 GB GPUs at ~30-40% step-time cost. Default False preserves existing behaviour."
     detokenizer_type: Literal[
         "linear_reshape",
         "pixel_shuffle",
