@@ -779,6 +779,29 @@ class DDPEnsGroupStrategyStrategySchema(BaseDDPStrategySchema):
 StrategySchemas = BaseDDPStrategySchema | DDPEnsGroupStrategyStrategySchema
 
 
+class InputNoiseSchema(BaseModel):
+    """Colored input-noise robustness training (see BaseTrainingSchema.input_noise)."""
+
+    enabled: bool = False
+    "Master switch. Off by default (no behaviour change for existing configs)."
+    prob: float = 0.5
+    "Per-batch probability of injecting noise (one draw per training step per rank)."
+    scale_max: float = 3.0
+    "Amplitude multiplier sampled U(0, scale_max) per batch, covering rollout-grown noise levels."
+    lambda_min_km: float = 8.58
+    "Short-wavelength band edge (2*cell = Nyquist)."
+    lambda_max_km: float = 25.0
+    "Long-wavelength band edge. Keep below scales carrying genuine predictive signal."
+    cell_km: float = 4.29
+    "Grid spacing."
+    shape_powerlaw_p: float = 3.3
+    "Spectral power-law exponent within the band, P(lambda) ~ lambda^p (measured from v39 1-step error)."
+    spec_path: str | None = None
+    "npz with arrays `vars` (names) and `sigma_band_rms` (per-variable normalized band-rms amplitudes)."
+    default_sigma: float = 0.0
+    "Fallback sigma for prognostic variables missing from the spec (0 = no noise on those)."
+
+
 class BaseTrainingSchema(BaseModel):
     """Training configuration."""
 
@@ -817,6 +840,12 @@ class BaseTrainingSchema(BaseModel):
     (in normalized state space). Only honored when ``training.model_task`` resolves
     to a forecaster that reads it (e.g. grafai.training.NoisyResidualForecaster).
     0.0 disables noise. Typical values: 0.01-0.10."""
+    input_noise: InputNoiseSchema = Field(default_factory=lambda: InputNoiseSchema())
+    """Colored (band-limited) input-noise robustness training (v42-P1). Injects
+    spectrally-shaped noise into the normalized input state's prognostic channels
+    with per-variable amplitudes measured from the model's own 1-step error
+    (noise_spec npz); target unchanged, so the single-step map learns to DAMP
+    its own grid-scale noise. Read by GraphResidualForecaster."""
     training_loss: LossSchemas
     "Training loss configuration."
     loss_gradient_scaling: bool = False

@@ -104,6 +104,110 @@ class GraphResidualForecaster(BaseRolloutGraphModule):
                 "diagnostic loss path disabled (L_prog only).",
             )
 
+        # ------------------------------------------------------------------
+        # Colored input-noise robustness training (v42-P1). Injects band-
+        # limited, spectrally-shaped noise into the NORMALIZED input state's
+        # prognostic channels with per-variable amplitudes measured from the
+        # model's own 1-step error spectrum; target unchanged -> the single-
+        # step map is trained to DAMP its own grid-scale noise (the measured
+        # closed-loop gain is 1.04-1.37 per step in the 9-25 km band, which
+        # compounds to the 18 h rollout failure). Disabled by default.
+        # ------------------------------------------------------------------
+        self._inoise = None
+        in_cfg = getattr(getattr(self.config, "training", None), "input_noise", None)
+        if in_cfg is not None and getattr(in_cfg, "enabled", False):
+            self._init_input_noise(in_cfg)
+
+    def _init_input_noise(self, cfg) -> None:
+        import numpy as np
+
+        # Per-channel sigma in MODEL-INPUT space (prognostic channels only;
+        # forcings are clean external inputs and must not be perturbed).
+        name_to_index = self.data_indices.name_to_index
+        input_full = list(self.data_indices.data.input.full)
+        idx_to_name = {v: k for k, v in name_to_index.items()}
+        input_names = [idx_to_name[i] for i in input_full]   # model-input channel order
+        prog_pos = list(self.data_indices.model.input.prognostic)
+
+        spec = {}
+        if cfg.spec_path:
+            d = np.load(cfg.spec_path, allow_pickle=True)
+            spec = {str(v): float(s) for v, s in zip(d["vars"], d["sigma_band_rms"])}
+        sigma = torch.zeros(len(input_names))
+        missing = []
+        for p in prog_pos:
+            n = input_names[p]
+            if n in spec:
+                sigma[p] = spec[n]
+            else:
+                sigma[p] = float(cfg.default_sigma)
+                missing.append(n)
+        if missing:
+            LOGGER.warning("input_noise: %d prognostic vars missing from spec (default_sigma=%g): %s",
+                           len(missing), cfg.default_sigma, missing[:5])
+        self.register_buffer("_inoise_sigma", sigma, persistent=False)
+
+        # Field shape (DiT regular grid) for the spectral mask.
+        dit = getattr(getattr(self.config.model, "model", None), "dit", None)
+        if dit is None or getattr(dit, "field_shape", None) is None:
+            LOGGER.warning("input_noise: no model.model.dit.field_shape; noise DISABLED")
+            return
+        H, W = [int(v) for v in dit.field_shape]
+        self._inoise = {
+            "prob": float(cfg.prob), "scale_max": float(cfg.scale_max),
+            "H": H, "W": W, "lmin": float(cfg.lambda_min_km),
+            "lmax": float(cfg.lambda_max_km), "cell": float(cfg.cell_km),
+            "p": float(cfg.shape_powerlaw_p), "mask": None,
+        }
+        LOGGER.info(
+            "input_noise ENABLED: band %.1f-%.1f km, shape p=%.1f, prob=%.2f, "
+            "scale U(0,%.1f), %d/%d channels (max sigma=%.4f)",
+            cfg.lambda_min_km, cfg.lambda_max_km, cfg.shape_powerlaw_p, cfg.prob,
+            cfg.scale_max, int((sigma > 0).sum()), len(input_names), float(sigma.max()),
+        )
+
+    def _inject_input_noise(self, x: torch.Tensor) -> torch.Tensor:
+        """x: (..., grid, vars) NORMALIZED model-input tensor. Returns x (+ noise).
+
+        Dimension-agnostic over leading dims (handles both (bs, ms, grid, v)
+        and (bs, ms, ens, grid, v) layouts).
+        """
+        st = self._inoise
+        if st is None or not self.training or torch.rand(()) > st["prob"]:
+            return x
+        H, W = st["H"], st["W"]
+        *lead, grid, nv = x.shape
+        if grid != H * W:
+            if not st.get("warned_shape"):
+                st["warned_shape"] = True
+                LOGGER.warning(
+                    "input_noise: grid size %d != field_shape %dx%d — noise is "
+                    "NEVER injected this run (check model.model.dit.field_shape)",
+                    grid, H, W,
+                )
+            return x
+        if st["mask"] is None:
+            ky = torch.fft.fftfreq(H, d=st["cell"], device=x.device)
+            kx = torch.fft.rfftfreq(W, d=st["cell"], device=x.device)
+            kk = torch.sqrt(ky[:, None] ** 2 + kx[None, :] ** 2)
+            wl = torch.where(kk > 0, 1.0 / kk.clamp_min(1e-12), torch.full_like(kk, 1e9))
+            band = (wl >= st["lmin"]) & (wl <= st["lmax"])
+            amp = torch.zeros_like(kk)
+            amp[band] = (wl[band] / st["lmin"]) ** (st["p"] / 2.0)  # power ~ lambda^p
+            # calibrate so a generated field has unit spatial std
+            probe = torch.fft.irfft2(torch.fft.rfft2(torch.randn(8, H, W, device=x.device)) * amp, s=(H, W))
+            st["mask"] = amp / probe.std().clamp_min(1e-12)
+        n_lead = 1
+        for d in lead:
+            n_lead *= d
+        white = torch.randn(n_lead * nv, H, W, device=x.device)
+        eps = torch.fft.irfft2(torch.fft.rfft2(white) * st["mask"], s=(H, W))
+        eps = eps.reshape(*lead, nv, grid).movedim(-2, -1)  # (..., grid, vars)
+        scale = self._inoise_sigma.to(device=x.device, dtype=x.dtype) * (
+            torch.rand((), device=x.device) * st["scale_max"]
+        )
+        return x + eps.to(x.dtype) * scale
+
     @staticmethod
     def _extract_loss_scalers(loss) -> tuple[torch.Tensor | None, torch.Tensor | None]:
         """Pull the (VARIABLE, GRID) scaler tensors from a loss / its MSE leaf.
@@ -207,6 +311,11 @@ class GraphResidualForecaster(BaseRolloutGraphModule):
             ...,
             self.data_indices.data.input.full,
         ]  # (bs, multi_step, latlon, nvar)
+
+        # Colored input-noise robustness training (v42-P1): perturb the
+        # NORMALIZED input's prognostic channels; target unchanged. No-op
+        # unless training.input_noise.enabled (and self.training).
+        x = self._inject_input_noise(x)
 
         msg = (
             "Batch length not sufficient for requested multi_step length!"
