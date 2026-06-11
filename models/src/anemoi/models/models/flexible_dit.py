@@ -57,6 +57,44 @@ class FlexiblePatchEmbed2DTokenizer(PatchEmbed2DTokenizer):
         return tokens
 
 
+class AntiAliasedPatchEmbed2DTokenizer(FlexiblePatchEmbed2DTokenizer):
+    """BlurPool tokenizer (Zhang 2019, antialiased-cnns): same k=4 conv WEIGHTS
+    as the standard patch embed, but run at stride 1, low-passed with a
+    binomial filter, then subsampled ::4 phase-aligned with the original
+    stride-4 sampling. Sub-token (aliasing) content in the autoregressive
+    input can no longer fold into the token representation — the encoder-side
+    half of the anti-aliased loop (v43b). State-dict identical to the
+    standard tokenizer, so trained checkpoints warm-start strict=True.
+    """
+
+    def forward(self, x):
+        proj = self.x_embedder.proj
+        ph = self.patch_size[0] if isinstance(self.patch_size, tuple) else self.patch_size
+        # stride-1 'valid' conv with the SAME k=ph weights; output offsets 0..H-ph
+        y = F.conv2d(x, proj.weight, proj.bias, stride=1)
+        # binomial low-pass sized for factor-ph subsampling (k=7 for ph=4)
+        k1 = torch.tensor([1.0, 6.0, 15.0, 20.0, 15.0, 6.0, 1.0],
+                          device=y.device, dtype=y.dtype) / 64.0
+        k2 = (k1[:, None] * k1[None, :]).expand(y.shape[1], 1, 7, 7)
+        y = F.pad(y, (3, 3, 3, 3), mode="reflect")
+        y = F.conv2d(y, k2, groups=y.shape[1])
+        x_emb = y[..., ::ph, ::ph]              # same positions as stride-ph conv
+        B, D, Hp, Wp = x_emb.shape
+        tokens = x_emb.flatten(2).transpose(1, 2)
+        # pos_embed handling identical to FlexiblePatchEmbed2DTokenizer
+        if isinstance(self.pos_embed, nn.Parameter):
+            train_h, train_w = self.h_patches, self.w_patches
+            if (Hp, Wp) != (train_h, train_w):
+                pe = self.pos_embed.transpose(1, 2).reshape(1, D, train_h, train_w)
+                pe = F.interpolate(pe, size=(Hp, Wp), mode="bicubic", align_corners=False)
+                tokens = tokens + pe.flatten(2).transpose(1, 2)
+            else:
+                tokens = tokens + self.pos_embed
+        else:
+            tokens = tokens + self.pos_embed
+        return tokens
+
+
 class OverlappingPatchEmbed2DTokenizer(FlexiblePatchEmbed2DTokenizer):
     """Tokenizer with **overlapping** input patches via kernel_size > stride.
 
@@ -716,6 +754,7 @@ class FlexibleDiT(DiT):
         *args,
         detokenizer_type: str = "linear_reshape",
         tokenizer_kernel_size: Optional[int] = None,
+        tokenizer_anti_aliased: bool = False,
         **kwargs,
     ):
         """Build a FlexibleDiT.
@@ -767,6 +806,11 @@ class FlexibleDiT(DiT):
                 # Load only the pos_embed (kernel weights have different shape).
                 with torch.no_grad():
                     flex_tok.pos_embed.copy_(orig_tok.pos_embed)
+            elif tokenizer_anti_aliased:
+                # BlurPool tokenizer (v43b): same weights, stride-1 + blur +
+                # subsample — loads the standard tokenizer state strict.
+                flex_tok = AntiAliasedPatchEmbed2DTokenizer(**tok_kwargs)
+                flex_tok.load_state_dict(orig_tok.state_dict())
             else:
                 flex_tok = FlexiblePatchEmbed2DTokenizer(**tok_kwargs)
                 flex_tok.load_state_dict(orig_tok.state_dict())

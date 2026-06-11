@@ -303,6 +303,8 @@ class DiTConfigSchema(BaseModel):
     "External conditioning dimension. None for unconditional."
     tokenizer_kwargs: dict = Field(default_factory=dict)
     "Kwargs passed to PatchEmbed2DTokenizer (e.g., pos_embed='none')."
+    tokenizer_anti_aliased: bool = Field(default=False)
+    "BlurPool tokenizer (Zhang 2019): run the k=patch_size embed conv at stride 1 with the SAME weights, binomial low-pass, then subsample ::patch_size phase-aligned. Anti-aliases the autoregressive input so sub-token noise cannot fold into the token representation (encoder half of the anti-aliased loop, v43b). State-dict compatible with the standard tokenizer."
     tokenizer_kernel_size: Optional[int] = Field(default=None)
     "Tokenizer Conv2d kernel size in input cells. None (default) uses kernel=patch_size for the standard non-overlapping PatchEmbed (each token is a disjoint patch). Set to a larger even-offset value (e.g. 8 with patch_size=4) to enable an OverlappingPatchEmbed2DTokenizer where adjacent tokens share input cells, structurally breaking the per-token spatial independence that drives 16 km decoder pixelation. kernel_size must be >= patch_size and (kernel_size − patch_size) must be even."
     attn_kwargs: dict = Field(default_factory=dict)

@@ -251,6 +251,7 @@ class AnemoiDiTModel(nn.Module):
             force_tokenization_fp32=bool(getattr(dit_cfg, "force_tokenization_fp32", True)),
             detokenizer_type=str(getattr(dit_cfg, "detokenizer_type", "linear_reshape")),
             tokenizer_kernel_size=getattr(dit_cfg, "tokenizer_kernel_size", None),
+            tokenizer_anti_aliased=bool(getattr(dit_cfg, "tokenizer_anti_aliased", False)),
             block_kwargs=block_kwargs_in,
             drop_path_rates=drop_path_rates,
         )
