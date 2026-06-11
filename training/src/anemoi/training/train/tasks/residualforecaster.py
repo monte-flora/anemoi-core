@@ -118,6 +118,33 @@ class GraphResidualForecaster(BaseRolloutGraphModule):
         if in_cfg is not None and getattr(in_cfg, "enabled", False):
             self._init_input_noise(in_cfg)
 
+        # AIFS-CRPS reference-field truncation (their eq. 1):
+        #   x_{t+1} = U(D(x_t)) + f(x_t)
+        # The target residual AND the reconstruction both use the truncated
+        # reference, so the loss trains the tendency to regenerate the
+        # removed scales while the identity path can no longer carry
+        # sub-(factor*dx) junk (leftover-advection artifacts, lattice noise)
+        # between steps. Read from model config so train/inference agree.
+        self._ref_trunc = 0
+        self._ref_trunc_hw = None
+        dit_cfg = getattr(getattr(self.config.model, "model", None), "dit", None)
+        if dit_cfg is not None:
+            self._ref_trunc = int(getattr(dit_cfg, "reference_truncation", 0) or 0)
+            if self._ref_trunc and getattr(dit_cfg, "field_shape", None) is not None:
+                self._ref_trunc_hw = tuple(int(v) for v in dit_cfg.field_shape)
+                LOGGER.info("reference_truncation ENABLED: factor %d, grid %s",
+                            self._ref_trunc, self._ref_trunc_hw)
+
+    def _truncate_reference(self, x_phys: torch.Tensor) -> torch.Tensor:
+        """U(D(x)) on (..., grid, n_prog); no-op when disabled or sharded."""
+        if not self._ref_trunc or self._ref_trunc_hw is None:
+            return x_phys
+        H, W = self._ref_trunc_hw
+        if x_phys.shape[-2] != H * W:
+            return x_phys
+        from anemoi.models.models.flexible_dit import reference_truncate
+        return reference_truncate(x_phys, H, W, self._ref_trunc)
+
     def _init_input_noise(self, cfg) -> None:
         import numpy as np
 
@@ -373,9 +400,13 @@ class GraphResidualForecaster(BaseRolloutGraphModule):
             x_last_phys = (x_last_norm.float() - norm_add[input_prog_idx].float()) / norm_mul[input_prog_idx].float()
             y_true_phys = (y_true_norm.float() - norm_add[input_prog_idx].float()) / norm_mul[input_prog_idx].float()
 
+            # Reference-field truncation (AIFS eq. 1): both the target residual
+            # and the reconstruction below are taken w.r.t. U(D(x_last)).
+            x_ref_phys = self._truncate_reference(x_last_phys)
+
             # Compute target residual in physical space, then normalize by diff_std only
             Δx_true_norm = self.model.residual_normalizer.transform(
-                x_last_phys,
+                x_ref_phys,
                 y_true_phys,
                 in_place=False,
             )
@@ -386,7 +417,7 @@ class GraphResidualForecaster(BaseRolloutGraphModule):
 
             # Reconstruct next state in physical space (only prognostic)
             y_pred_phys_prog = self.model.residual_normalizer.inverse_transform(
-                x_last_phys,
+                x_ref_phys,
                 Δx̂_norm_prog,
                 in_place=False,
             )

@@ -401,6 +401,12 @@ class AnemoiDiTModel(nn.Module):
             )
         LOGGER.info("AnemoiDiTModel: output_mode = %s", self.output_mode)
 
+        # AIFS-CRPS reference-field truncation (eq. 1): x_{t+1} = U(D(x_t)) + f(x_t).
+        # 0/None = off. Factor 2 removes <4dx from the carried reference state.
+        self.reference_truncation = int(getattr(dit_cfg, "reference_truncation", 0) or 0)
+        if self.reference_truncation:
+            LOGGER.info("AnemoiDiTModel: reference_truncation factor = %d", self.reference_truncation)
+
         # Boundings (e.g., ReLU for precipitation). Applied only in state mode;
         # see _forward_deterministic.
         self.boundings = build_boundings(config, data_indices, statistics)
@@ -1019,6 +1025,13 @@ class AnemoiDiTModel(nn.Module):
                 # normalised space; reconstruct physical state.
                 delta_norm_prog = model_output[..., model_prog_idx]  # (B, 1, G, n_prog)
                 x_last_norm_prog = x[:, -1, ..., model_input_prog_idx]  # (B, 1, G, n_prog); x is model-input space
+                if self.reference_truncation:
+                    H_rt, W_rt = self.field_shape
+                    if x_last_norm_prog.shape[-2] == H_rt * W_rt:
+                        from anemoi.models.models.flexible_dit import reference_truncate
+                        x_last_norm_prog = reference_truncate(
+                            x_last_norm_prog.float(), H_rt, W_rt, self.reference_truncation,
+                        ).to(x_last_norm_prog.dtype)
                 y_hat_prog_phys = residual_normalizer.inverse_transform_physical_from_normalized(
                     x_last_norm_prog,
                     delta_norm_prog,

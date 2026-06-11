@@ -431,6 +431,26 @@ class FlexibleBilinearConvDetokenizer(nn.Module):
         return self.refine(feat)
 
 
+def reference_truncate(x: torch.Tensor, H: int, W: int, factor: int) -> torch.Tensor:
+    """AIFS-CRPS eq. (1) reference-field truncation: U(D(x)).
+
+    Down/up-sample the carried (reference) state so the autoregressive
+    identity path cannot transport sub-(factor*dx) content between steps;
+    the model's tendency keeps full control of those scales and must
+    regenerate them each step. x: (..., G, C) with G == H*W. avg-pool down,
+    bilinear up — both preserve constants, so the operator commutes with
+    affine normalization (safe in normalized OR physical space).
+    """
+    *lead, G, C = x.shape
+    n = 1
+    for d in lead:
+        n *= d
+    f = x.reshape(n, G, C).permute(0, 2, 1).reshape(n * 1, C, H, W)
+    f = torch.nn.functional.avg_pool2d(f, factor)
+    f = torch.nn.functional.interpolate(f, size=(H, W), mode="bilinear", align_corners=False)
+    return f.reshape(n, C, G).permute(0, 2, 1).reshape(*lead, G, C)
+
+
 def _post_shuffle_binomial_blur(feat: torch.Tensor, kernel: torch.Tensor) -> torch.Tensor:
     """Fixed depthwise 3x3 binomial blur, reflect-padded (no zero rim).
 
