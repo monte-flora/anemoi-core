@@ -116,6 +116,15 @@ class AnemoiAtlasModel(nn.Module):
         self.prognostic_channels = prognostic_channels
         self.forcings_channels = forcings_channels
 
+        # Channel POSITIONS of prognostics/forcings within the (interleaved)
+        # input.full channel order of the image fed to forward(). When None,
+        # falls back to the legacy block-order assumption ([prog | forcings]),
+        # which is WRONG for ufs2arco data (forcings interleave alphabetically
+        # within the prognostic ordering) — the v30 composed-noise seam bug.
+        # predict_step sets these from data_indices on every call.
+        self.prog_positions: Optional[list[int]] = None
+        self.forcing_positions: Optional[list[int]] = None
+
         # If the predictive was trained with a LatentResidualNormalizer
         # (v30c+: tendency-normalized latent residual targets), its output is
         # in tendency-norm space. The decoder is trained on mean-std r_lat,
@@ -132,9 +141,12 @@ class AnemoiAtlasModel(nn.Module):
         Only the first ``prognostic_channels`` are encoded; forcings are
         handled separately by :meth:`encode_forcings`.
         """
-        # If x has forcings appended, slice to prognostic only first.
+        # If x carries forcings too, slice to prognostic only first.
         if x.shape[1] > self.prognostic_channels:
-            x = x[:, : self.prognostic_channels]
+            if self.prog_positions is not None:
+                x = x[:, self.prog_positions]
+            else:
+                x = x[:, : self.prognostic_channels]
         return bilinear_downsample(x, target_shape=self.latent_shape)
 
     def encode_forcings(self, x: torch.Tensor) -> Optional[torch.Tensor]:
@@ -152,7 +164,10 @@ class AnemoiAtlasModel(nn.Module):
                 f"{self.prognostic_channels} prognostic + {self.forcings_channels} forcings."
             )
             raise ValueError(error)
-        f = x[:, self.prognostic_channels : self.prognostic_channels + self.forcings_channels]
+        if self.forcing_positions is not None:
+            f = x[:, self.forcing_positions]
+        else:
+            f = x[:, self.prognostic_channels : self.prognostic_channels + self.forcings_channels]
         return bilinear_downsample(f, target_shape=self.latent_shape)
 
     def forward(
@@ -219,8 +234,12 @@ class AnemoiAtlasModel(nn.Module):
                 r_t = self.latent_residual_normalizer.inverse_transform(r_t)
 
         # 3) Decoder produces full-res residual conditioned on x_curr
-        #    (including forcings).
-        prog_slice = x_curr[:, : self.prognostic_channels]
+        #    (including forcings; the decoder was TRAINED on the interleaved
+        #    input.full order, so x_curr passes through unchanged).
+        if self.prog_positions is not None:
+            prog_slice = x_curr[:, self.prog_positions]
+        else:
+            prog_slice = x_curr[:, : self.prognostic_channels]
         if r_t.dim() == 5:
             # Ensemble (B, E, C, h, w) — decode each member separately.
             B, E = r_t.shape[:2]
@@ -314,6 +333,17 @@ class AnemoiAtlasModel(nn.Module):
             input_full_idx = data_indices.data.input.full
             input_prog_idx = data_indices.data.input.prognostic
             input_forc_idx = data_indices.data.input.forcing
+
+            # Seam-bug fix (2026-06-11): the image below follows the
+            # INTERLEAVED input.full channel order, so give forward() the
+            # actual prognostic/forcing channel POSITIONS within that order
+            # instead of assuming [prog | forcings] blocks. See
+            # v30-teacherforced-diag/FINDINGS.md (buggy: 12.69 K t2m/step,
+            # index-based: 0.50 K, same weights).
+            full_list = [int(i) for i in input_full_idx]
+            pos_of = {d: p for p, d in enumerate(full_list)}
+            self.prog_positions = [pos_of[int(i)] for i in input_prog_idx]
+            self.forcing_positions = [pos_of[int(i)] for i in input_forc_idx]
 
             # Slice last + second-to-last frames as full-state tensors
             # (B, V_full, H, W). Squeeze ensemble dim — the composed forward

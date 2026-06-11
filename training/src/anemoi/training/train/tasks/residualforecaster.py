@@ -124,10 +124,10 @@ class GraphResidualForecaster(BaseRolloutGraphModule):
         # Per-channel sigma in MODEL-INPUT space (prognostic channels only;
         # forcings are clean external inputs and must not be perturbed).
         name_to_index = self.data_indices.name_to_index
-        input_full = list(self.data_indices.data.input.full)
-        idx_to_name = {v: k for k, v in name_to_index.items()}
+        input_full = [int(i) for i in self.data_indices.data.input.full]
+        idx_to_name = {int(v): k for k, v in name_to_index.items()}
         input_names = [idx_to_name[i] for i in input_full]   # model-input channel order
-        prog_pos = list(self.data_indices.model.input.prognostic)
+        prog_pos = [int(p) for p in self.data_indices.model.input.prognostic]
 
         spec = {}
         if cfg.spec_path:
