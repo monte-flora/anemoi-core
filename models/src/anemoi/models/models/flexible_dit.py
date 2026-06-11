@@ -393,6 +393,18 @@ class FlexibleBilinearConvDetokenizer(nn.Module):
         return self.refine(feat)
 
 
+def _post_shuffle_binomial_blur(feat: torch.Tensor, kernel: torch.Tensor) -> torch.Tensor:
+    """Fixed depthwise 3x3 binomial blur, reflect-padded (no zero rim).
+
+    Anti-aliasing for PixelShuffle outputs (v42-P2): kills the 2-cell
+    checkerboard at the scale it is born while passing resolved structure.
+    """
+    C = feat.shape[1]
+    w = kernel.to(feat.dtype).expand(C, 1, 3, 3)
+    feat = torch.nn.functional.pad(feat, (1, 1, 1, 1), mode="reflect")
+    return torch.nn.functional.conv2d(feat, w, groups=C)
+
+
 class FlexibleHierarchicalDetokenizer(nn.Module):
     """Two-stage hierarchical upsample: PixelShuffle 2x -> conv -> PixelShuffle 2x -> conv.
 
@@ -412,12 +424,28 @@ class FlexibleHierarchicalDetokenizer(nn.Module):
         hidden_size: int,
         refine_channels: int = 128,
         layernorm_backend: str = "torch",
+        post_shuffle_blur: bool = False,
+        output_blur: bool = False,
     ):
         super().__init__()
         self.input_size = input_size
         self.patch_size = (
             patch_size if isinstance(patch_size, (tuple, list)) else (patch_size, patch_size)
         )
+        # v42-P2: fixed depthwise binomial blur ([1,2,1] x [1,2,1] / 16) applied
+        # immediately after EACH PixelShuffle, at the scale where the
+        # checkerboard is born (a 2-cell artifact there), before the refine
+        # convs mix it across the finer grid. Parameter-free -> trained
+        # hierarchical_2stage checkpoints load unchanged.
+        # output_blur (v43a2): one more blur AFTER refine2, so the zero-padded
+        # refine convs / token-resolution adaLN cannot re-imprint the 4dx token
+        # lattice downstream of the last smoothing (observed as a 17 km error
+        # spike in v43a).
+        self.post_shuffle_blur = bool(post_shuffle_blur)
+        self.output_blur = bool(output_blur)
+        if self.post_shuffle_blur or self.output_blur:
+            k = torch.tensor([1.0, 2.0, 1.0])
+            self.register_buffer("_blur_k", (k[:, None] * k[None, :] / 16.0), persistent=False)
         ph, pw = self.patch_size
         if ph != 4 or pw != 4:
             raise NotImplementedError("Hierarchical 2-stage detokenizer requires patch_size=4.")
@@ -465,10 +493,17 @@ class FlexibleHierarchicalDetokenizer(nn.Module):
         feat = self.adaln(feat, c)
         feat = self.proj1(feat)
         feat = self.shuffle1(feat)              # (B, refine, hp*2, wp*2)
+        if self.post_shuffle_blur:
+            feat = _post_shuffle_binomial_blur(feat, self._blur_k)
         feat = self.refine1(feat)
         feat = self.proj2(feat)
         feat = self.shuffle2(feat)              # (B, refine, hp*4, wp*4)
-        return self.refine2(feat)
+        if self.post_shuffle_blur:
+            feat = _post_shuffle_binomial_blur(feat, self._blur_k)
+        out = self.refine2(feat)
+        if self.output_blur:
+            out = _post_shuffle_binomial_blur(out, self._blur_k)
+        return out
 
 
 class FlexibleHierarchicalResizeConvDetokenizer(nn.Module):
@@ -777,6 +812,18 @@ class FlexibleDiT(DiT):
                 )
             elif detokenizer_type == "hierarchical_2stage":
                 self.detokenizer = FlexibleHierarchicalDetokenizer(**common)
+            elif detokenizer_type == "hierarchical_2stage_blur":
+                # v42-P2: anti-aliased variant — fixed binomial blur after each
+                # PixelShuffle stage. Parameter-free, so hierarchical_2stage
+                # checkpoints warm-start unchanged.
+                self.detokenizer = FlexibleHierarchicalDetokenizer(**common, post_shuffle_blur=True)
+            elif detokenizer_type == "hierarchical_2stage_blur2":
+                # v43a2: stage blurs + a final OUTPUT blur after refine2 so the
+                # zero-padded refine convs cannot re-imprint the 4dx token
+                # lattice downstream of the last smoothing.
+                self.detokenizer = FlexibleHierarchicalDetokenizer(
+                    **common, post_shuffle_blur=True, output_blur=True,
+                )
             elif detokenizer_type == "hierarchical_2stage_resizeconv":
                 self.detokenizer = FlexibleHierarchicalResizeConvDetokenizer(**common)
             else:
@@ -785,7 +832,7 @@ class FlexibleDiT(DiT):
                     "linear_reshape, pixel_shuffle, pixel_shuffle_3x3x2, "
                     "pixel_shuffle_5x5x2, pixel_shuffle_7x7x1, "
                     "conv_transpose_k12_s4, bilinear_3x3x2, hierarchical_2stage, "
-                    "hierarchical_2stage_resizeconv."
+                    "hierarchical_2stage_blur, hierarchical_2stage_resizeconv."
                 )
 
         # Replace unpicklable lambdas with a proper static method so torch.save works.

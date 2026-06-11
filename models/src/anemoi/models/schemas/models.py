@@ -342,6 +342,8 @@ class DiTConfigSchema(BaseModel):
         "conv_transpose_k12_s4",
         "bilinear_3x3x2",
         "hierarchical_2stage",
+        "hierarchical_2stage_blur",
+        "hierarchical_2stage_blur2",
         "hierarchical_2stage_resizeconv",
     ] = Field(default="linear_reshape")
     "Detokenizer head architecture. 'linear_reshape' (default) is the stock DiT ProjLayer + reshape (per-token Linear, no cross-patch blending; structurally pixelates). The other variants are Tier-A1/A3 cross-patch-mixing heads from the literature survey: 'pixel_shuffle' (alias for 3x3x2), 'pixel_shuffle_5x5x2' (RF=9 cells), 'pixel_shuffle_7x7x1' (single 7x7 conv, RF=7), 'conv_transpose_k12_s4' (3x overlap, no Odena checkerboard), 'bilinear_3x3x2' (smooth + learned recovery), 'hierarchical_2stage' (SegFormer-style two-step PixelShuffle), 'hierarchical_2stage_resizeconv' (same two-stage structure but bilinear-resize upsamples instead of PixelShuffle — removes the Odena sub-pixel checkerboard; adaln/refine1/refine2 weights are checkpoint-compatible with hierarchical_2stage, proj1/proj2 warm-start from the 4-group sub-kernel mean)."
