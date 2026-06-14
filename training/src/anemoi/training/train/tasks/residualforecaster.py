@@ -189,22 +189,30 @@ class GraphResidualForecaster(BaseRolloutGraphModule):
             )
 
     def _apply_state_bounding(self, x: torch.Tensor) -> torch.Tensor:
-        """Clamp the reconstructed physical prognostic state in-place-ish before
-        feedback (no-op unless training.state_bounding.enabled). ``x`` is
-        (..., grid, n_prog) in data.input.prognostic order."""
+        """Clamp the reconstructed physical prognostic state before feedback,
+        FUNCTIONALLY (broadcast clamp + where, no in-place — autograd-safe under
+        gradient checkpointing). No-op unless training.state_bounding.enabled.
+        ``x`` is (..., grid, n_prog) in data.input.prognostic order. Per-channel
+        lower/upper/zero-threshold vectors are built once and cached."""
         if not getattr(self, "_sb_enabled", False):
             return x
-        x = x.clone()
-        for p, mn in self._sb_min:
-            x[..., p] = x[..., p].clamp_min(mn)
-        for p, lo, hi in self._sb_ranges:
-            if lo is not None:
-                x[..., p] = x[..., p].clamp_min(lo)
-            if hi is not None:
-                x[..., p] = x[..., p].clamp_max(hi)
-        for p, thr in self._sb_zero:
-            col = x[..., p]
-            x[..., p] = torch.where(col < thr, torch.zeros_like(col), col)
+        n = x.shape[-1]
+        if getattr(self, "_sb_lo", None) is None or self._sb_lo.numel() != n or self._sb_lo.device != x.device:
+            lo = torch.full((n,), float("-inf"), device=x.device, dtype=torch.float32)
+            hi = torch.full((n,), float("inf"), device=x.device, dtype=torch.float32)
+            zt = torch.full((n,), float("-inf"), device=x.device, dtype=torch.float32)
+            for p, mn in self._sb_min:
+                lo[p] = max(float(lo[p]), mn)
+            for p, l, h in self._sb_ranges:
+                if l is not None:
+                    lo[p] = max(float(lo[p]), l)
+                if h is not None:
+                    hi[p] = min(float(hi[p]), h)
+            for p, thr in self._sb_zero:
+                zt[p] = thr
+            self._sb_lo, self._sb_hi, self._sb_zt = lo, hi, zt
+        x = torch.clamp(x, min=self._sb_lo.to(x.dtype), max=self._sb_hi.to(x.dtype))
+        x = torch.where(x < self._sb_zt.to(x.dtype), torch.zeros((), device=x.device, dtype=x.dtype), x)
         return x
 
     def _truncate_reference(self, x_phys: torch.Tensor) -> torch.Tensor:

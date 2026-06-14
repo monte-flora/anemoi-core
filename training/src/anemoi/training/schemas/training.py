@@ -872,15 +872,42 @@ class BaseTrainingSchema(BaseModel):
     "Number of ensemble members per device. Default is 1 for non-ensemble forecasting."
 
 
+class StateBoundingSchema(PydanticBaseModel):
+    """State bounding config (both modes optional, combinable):
+
+    * Ensemble ±n_sigma clip (GraphEnsResidualForecaster): symmetric clip of the
+      normalised state to ``±n_sigma`` each rollout step.
+    * Physical clamp (GraphResidualForecaster rollout FT): positive bounding
+      (``variables`` to >= ``min_val``), per-variable ``var_ranges``, and
+      low-precip ``zero_below``, applied to the reconstructed physical state
+      before feedback so the rollout loop matches operational inference.
+    """
+
+    enabled: bool = Field(default=False)
+    "Toggle state bounding. Default off for back-compat."
+    n_sigma: float = Field(default=4.0)
+    "Ensemble mode: symmetric clip in normalised-state σ units (WoFSCast: 3-4)."
+    min_val: float = Field(default=0.0)
+    "Physical mode: lower bound applied to every name in `variables`."
+    variables: list[str] = Field(default_factory=list)
+    "Physical mode: variable names (fnmatch ok, e.g. qv_*) clamped to >= min_val."
+    var_ranges: dict = Field(default_factory=dict)
+    "Physical mode: per-variable [min, max] (None = unbounded that side)."
+    zero_below: dict = Field(default_factory=dict)
+    "Physical mode: per-variable threshold; values below it set to 0 (drizzle removal)."
+
+
 class ForecasterSchema(BaseTrainingSchema):
-    model_task: Literal["anemoi.training.train.tasks.GraphForecaster", 
-                        # Monte 7 Nov 2025: Added to accomodate 
+    model_task: Literal["anemoi.training.train.tasks.GraphForecaster",
+                        # Monte 7 Nov 2025: Added to accomodate
                         # the GraphResidualForecaster.
                         "anemoi.training.train.tasks.GraphResidualForecaster"
                        ] = Field(..., alias="model_task")
     "Training objective."
     rollout: Rollout = Field(default_factory=Rollout)
     "Rollout configuration."
+    state_bounding: StateBoundingSchema = Field(default_factory=StateBoundingSchema)
+    "Optional state bounding (physical clamp for rollout FT, or ensemble ±nσ). Off by default."
 
 class ForecasterEnsSchema(ForecasterSchema):
     model_task: Literal["anemoi.training.train.tasks.GraphEnsForecaster",] = Field(..., alias="model_task")
@@ -912,20 +939,6 @@ class EnsResidualForecasterDropoutSchema(ForecasterSchema):
     "Training objective (ensemble + residual + MC dropout; pair with GraphCastCRPSLoss)."
     noise_vector_dim: PositiveInt = Field(default=32)
     "Inherited from parent schema for backward compat; ignored by the dropout task."
-
-
-class StateBoundingSchema(PydanticBaseModel):
-    """Per-channel state bounding config for GraphEnsResidualForecaster.
-
-    Clips the reconstructed normalised state to ``±n_sigma`` at every
-    rollout step. Mean-std normalisation maps physical (μ, σ) → (0, 1),
-    so this is equivalent to the physical-space bound μ ± n_sigma·σ.
-    """
-
-    enabled: bool = Field(default=False)
-    "Toggle state bounding. Default off for back-compat with v31 chain."
-    n_sigma: float = Field(default=4.0)
-    "Symmetric clip threshold in normalised-state σ units. WoFSCast-colleague-validated values: 3-4."
 
 
 class EnsResidualForecasterSchema(ForecasterSchema):
