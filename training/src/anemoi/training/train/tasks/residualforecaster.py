@@ -152,6 +152,61 @@ class GraphResidualForecaster(BaseRolloutGraphModule):
                     [nm for nm in prog_names if any(fnmatch(nm, p_) for p_ in excl)][:8],
                 )
 
+        # ------------------------------------------------------------------
+        # In-loop PHYSICAL state bounding (train/inference consistency). Clamps
+        # the reconstructed physical prognostic state BEFORE it is renormalized
+        # and fed back, matching the operational post-hoc stack: positive
+        # bounding (qv>=0 via `variables` + `min_val`), per-variable `var_ranges`,
+        # and low-precip `zero_below`. The model thus trains under the same
+        # clamped feedback it sees operationally and never learns to propagate
+        # states (negative humidity, drizzle) that inference would clip away.
+        # Read from training config; disabled by default (exact no-op).
+        # ------------------------------------------------------------------
+        self._sb_enabled = False
+        self._sb_min, self._sb_ranges, self._sb_zero = [], [], []
+        sb_cfg = getattr(getattr(self.config, "training", None), "state_bounding", None)
+        if sb_cfg is not None and getattr(sb_cfg, "enabled", False):
+            from fnmatch import fnmatch as _fnmatch
+            _i2n = {int(v): k for k, v in self.data_indices.name_to_index.items()}
+            _prog = [_i2n[int(i)] for i in self.data_indices.data.input.prognostic]
+            _n2p = {nm: p for p, nm in enumerate(_prog)}
+            _minv = float(getattr(sb_cfg, "min_val", 0.0))
+            for pat in (getattr(sb_cfg, "variables", []) or []):
+                self._sb_min += [(p, _minv) for nm, p in _n2p.items() if _fnmatch(nm, pat)]
+            for nm, rng in (getattr(sb_cfg, "var_ranges", {}) or {}).items():
+                if nm in _n2p:
+                    lo = None if rng[0] is None else float(rng[0])
+                    hi = None if (len(rng) < 2 or rng[1] is None) else float(rng[1])
+                    self._sb_ranges.append((_n2p[nm], lo, hi))
+            for nm, thr in (getattr(sb_cfg, "zero_below", {}) or {}).items():
+                if nm in _n2p:
+                    self._sb_zero.append((_n2p[nm], float(thr)))
+            self._sb_enabled = bool(self._sb_min or self._sb_ranges or self._sb_zero)
+            LOGGER.info(
+                "state_bounding ENABLED (prognostic-space, applied to fed-back state): "
+                "%d min-clamp, %d ranges, %d zero_below",
+                len(self._sb_min), len(self._sb_ranges), len(self._sb_zero),
+            )
+
+    def _apply_state_bounding(self, x: torch.Tensor) -> torch.Tensor:
+        """Clamp the reconstructed physical prognostic state in-place-ish before
+        feedback (no-op unless training.state_bounding.enabled). ``x`` is
+        (..., grid, n_prog) in data.input.prognostic order."""
+        if not getattr(self, "_sb_enabled", False):
+            return x
+        x = x.clone()
+        for p, mn in self._sb_min:
+            x[..., p] = x[..., p].clamp_min(mn)
+        for p, lo, hi in self._sb_ranges:
+            if lo is not None:
+                x[..., p] = x[..., p].clamp_min(lo)
+            if hi is not None:
+                x[..., p] = x[..., p].clamp_max(hi)
+        for p, thr in self._sb_zero:
+            col = x[..., p]
+            x[..., p] = torch.where(col < thr, torch.zeros_like(col), col)
+        return x
+
     def _truncate_reference(self, x_phys: torch.Tensor) -> torch.Tensor:
         """U(D(x)) on (..., grid, n_prog); no-op when disabled or sharded."""
         if not self._ref_trunc or self._ref_trunc_hw is None:
@@ -443,6 +498,11 @@ class GraphResidualForecaster(BaseRolloutGraphModule):
                 Δx̂_norm_prog,
                 in_place=False,
             )
+
+            # In-loop physical bounding (qv>=0 / ranges / low-precip zero_below):
+            # clamp the reconstructed state before it feeds the next step, so the
+            # rollout loop matches operational inference. No-op unless enabled.
+            y_pred_phys_prog = self._apply_state_bounding(y_pred_phys_prog)
 
             # Renormalize prognostic predictions for next rollout step (normalized state space)
             y_pred_prog = (y_pred_phys_prog * norm_mul[input_prog_idx].float() + norm_add[input_prog_idx].float()).to(model_output.dtype)
