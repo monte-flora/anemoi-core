@@ -551,15 +551,15 @@ class FlexibleHierarchicalDetokenizer(nn.Module):
         feat = self.adaln(feat, c)
         feat = self.proj1(feat)
         feat = self.shuffle1(feat)              # (B, refine, hp*2, wp*2)
-        if self.post_shuffle_blur:
+        if getattr(self, "post_shuffle_blur", False):
             feat = _post_shuffle_binomial_blur(feat, self._blur_k)
         feat = self.refine1(feat)
         feat = self.proj2(feat)
         feat = self.shuffle2(feat)              # (B, refine, hp*4, wp*4)
-        if self.post_shuffle_blur:
+        if getattr(self, "post_shuffle_blur", False):
             feat = _post_shuffle_binomial_blur(feat, self._blur_k)
         out = self.refine2(feat)
-        if self.output_blur:
+        if getattr(self, "output_blur", False):
             out = _post_shuffle_binomial_blur(out, self._blur_k)
         return out
 

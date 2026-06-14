@@ -132,8 +132,25 @@ class GraphResidualForecaster(BaseRolloutGraphModule):
             self._ref_trunc = int(getattr(dit_cfg, "reference_truncation", 0) or 0)
             if self._ref_trunc and getattr(dit_cfg, "field_shape", None) is not None:
                 self._ref_trunc_hw = tuple(int(v) for v in dit_cfg.field_shape)
-                LOGGER.info("reference_truncation ENABLED: factor %d, grid %s",
-                            self._ref_trunc, self._ref_trunc_hw)
+                # Channel gating: positions (in input.prognostic order) to truncate;
+                # surface/terrain-anchored fields are excluded (their small scales
+                # are stationary truth, and truncation inflates their targets).
+                from fnmatch import fnmatch
+                excl = list(getattr(dit_cfg, "reference_truncation_exclude",
+                                    ["pressure_*", "t2m", "skintemp", "snowh"]) or [])
+                idx_to_name = {int(v): k for k, v in self.data_indices.name_to_index.items()}
+                prog_names = [idx_to_name[int(i)] for i in self.data_indices.data.input.prognostic]
+                self._ref_trunc_chans = [
+                    c for c, nm in enumerate(prog_names)
+                    if not any(fnmatch(nm, pat) for pat in excl)
+                ]
+                LOGGER.info(
+                    "reference_truncation ENABLED: factor %d, grid %s, %d/%d prognostic "
+                    "channels (excluded: %s)",
+                    self._ref_trunc, self._ref_trunc_hw,
+                    len(self._ref_trunc_chans), len(prog_names),
+                    [nm for nm in prog_names if any(fnmatch(nm, p_) for p_ in excl)][:8],
+                )
 
     def _truncate_reference(self, x_phys: torch.Tensor) -> torch.Tensor:
         """U(D(x)) on (..., grid, n_prog); no-op when disabled or sharded."""
@@ -143,7 +160,12 @@ class GraphResidualForecaster(BaseRolloutGraphModule):
         if x_phys.shape[-2] != H * W:
             return x_phys
         from anemoi.models.models.flexible_dit import reference_truncate
-        return reference_truncate(x_phys, H, W, self._ref_trunc)
+        chans = getattr(self, "_ref_trunc_chans", None)
+        if chans is None or len(chans) == x_phys.shape[-1]:
+            return reference_truncate(x_phys, H, W, self._ref_trunc)
+        out = x_phys.clone()
+        out[..., chans] = reference_truncate(x_phys[..., chans], H, W, self._ref_trunc)
+        return out
 
     def _init_input_noise(self, cfg) -> None:
         import numpy as np

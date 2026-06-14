@@ -304,6 +304,9 @@ class DiTConfigSchema(BaseModel):
     tokenizer_kwargs: dict = Field(default_factory=dict)
     "Kwargs passed to PatchEmbed2DTokenizer (e.g., pos_embed='none')."
     reference_truncation: Optional[int] = Field(default=None)
+    reference_truncation_exclude: list[str] = Field(
+        default=["pressure_*", "t2m", "skintemp", "snowh"])
+    "fnmatch patterns of prognostic variables EXCLUDED from reference truncation. Terrain/surface-anchored fields whose small scales are stationary truth (not advection leftovers): truncating their reference inflates the tendency-normalized target (pressure_0: 8.5x measured) and burns gradient budget re-painting static structure."
     "AIFS-CRPS reference-field truncation (their eq. 1): x_{t+1} = U(D(x_t)) + f(x_t). The carried reference state is avg-pool downsampled by this factor and bilinearly upsampled back, so the autoregressive identity path cannot transport sub-(factor*dx) content (leftover-advection artifacts, accumulated lattice noise); the tendency regenerates those scales each step and the loss sees the composed operation. None/0 = off. Factor 2 removes ~<4dx."
     tokenizer_anti_aliased: bool = Field(default=False)
     "BlurPool tokenizer (Zhang 2019): run the k=patch_size embed conv at stride 1 with the SAME weights, binomial low-pass, then subsample ::patch_size phase-aligned. Anti-aliases the autoregressive input so sub-token noise cannot fold into the token representation (encoder half of the anti-aliased loop, v43b). State-dict compatible with the standard tokenizer."

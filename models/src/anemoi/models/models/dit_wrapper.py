@@ -406,6 +406,7 @@ class AnemoiDiTModel(nn.Module):
         self.reference_truncation = int(getattr(dit_cfg, "reference_truncation", 0) or 0)
         if self.reference_truncation:
             LOGGER.info("AnemoiDiTModel: reference_truncation factor = %d", self.reference_truncation)
+        self.reference_truncation_exclude = list(getattr(dit_cfg, "reference_truncation_exclude", ["pressure_*", "t2m", "skintemp", "snowh"]) or [])
 
         # Boundings (e.g., ReLU for precipitation). Applied only in state mode;
         # see _forward_deterministic.
@@ -1025,13 +1026,26 @@ class AnemoiDiTModel(nn.Module):
                 # normalised space; reconstruct physical state.
                 delta_norm_prog = model_output[..., model_prog_idx]  # (B, 1, G, n_prog)
                 x_last_norm_prog = x[:, -1, ..., model_input_prog_idx]  # (B, 1, G, n_prog); x is model-input space
-                if self.reference_truncation:
+                if getattr(self, "reference_truncation", 0):
                     H_rt, W_rt = self.field_shape
                     if x_last_norm_prog.shape[-2] == H_rt * W_rt:
+                        from fnmatch import fnmatch
                         from anemoi.models.models.flexible_dit import reference_truncate
-                        x_last_norm_prog = reference_truncate(
-                            x_last_norm_prog.float(), H_rt, W_rt, self.reference_truncation,
-                        ).to(x_last_norm_prog.dtype)
+                        excl = list(getattr(self, "reference_truncation_exclude",
+                                            ["pressure_*", "t2m", "skintemp", "snowh"]) or [])
+                        i2n = {int(v): k for k, v in data_indices.name_to_index.items()}
+                        prog_names = [i2n[int(i)] for i in data_indices.data.input.prognostic]
+                        chans = [c for c, nm in enumerate(prog_names)
+                                 if not any(fnmatch(nm, pat) for pat in excl)]
+                        xt = x_last_norm_prog.float()
+                        if len(chans) == xt.shape[-1]:
+                            xt = reference_truncate(xt, H_rt, W_rt, self.reference_truncation)
+                        else:
+                            xt = xt.clone()
+                            xt[..., chans] = reference_truncate(
+                                xt[..., chans], H_rt, W_rt, self.reference_truncation,
+                            )
+                        x_last_norm_prog = xt.to(x_last_norm_prog.dtype)
                 y_hat_prog_phys = residual_normalizer.inverse_transform_physical_from_normalized(
                     x_last_norm_prog,
                     delta_norm_prog,
