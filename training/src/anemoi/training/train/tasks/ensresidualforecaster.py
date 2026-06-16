@@ -215,7 +215,15 @@ class GraphEnsResidualForecaster(GraphEnsForecaster):
 
         model_prog_idx = self.data_indices.model.output.prognostic
         model_diag_idx = self.data_indices.model.output.diagnostic
+        # data-space prognostic indices: for the full data tensor `batch` (n_data-wide)
+        # and the n_data-wide normalizer buffers (norm_mul/norm_add).
         input_prog_idx = self.data_indices.data.input.prognostic
+        # model-input-space prognostic indices: for the SLICED input tensor `x`
+        # (= batch[..., data.input.full], i.e. input.full-wide). When diagnostic-only
+        # outputs are present (e.g. v39 surface 2D fields), data-space != model-input
+        # space, so indexing `x` with the data-space idx overruns -> device-side assert.
+        # Without diagnostics this equals input_prog_idx (no-op). Matches residualforecaster.
+        model_input_prog_idx = self.data_indices.model.input.prognostic
 
         norm_mul, norm_add = self._get_normalizer_buffers(self.model.pre_processors)
 
@@ -267,7 +275,7 @@ class GraphEnsResidualForecaster(GraphEnsForecaster):
             # next state.
             Δx̂_norm_prog = model_output[..., model_prog_idx]  # (B, nens, G, n_prog)
 
-            x_last_norm = x[:, -1, ..., input_prog_idx]            # (B, nens, G, n_prog)
+            x_last_norm = x[:, -1, ..., model_input_prog_idx]      # (B, nens, G, n_prog)
             y_true_norm = batch[
                 :,
                 self.multi_step + rollout_step,
