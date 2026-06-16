@@ -449,40 +449,6 @@ class NativeGridDataset(IterableDataset):
             # Convert to torch tensor
             x_tensor = torch.from_numpy(x)
 
-            # Diagnostic plot: save first sample's first channel as 2D image
-            if sample_count == 0 and self.label == "train" and self.global_rank == 0:
-                try:
-                    import matplotlib
-                    matplotlib.use("Agg")
-                    import matplotlib.pyplot as plt
-
-                    # x_tensor shape: [dates, ensemble, gridpoints, variables]
-                    input_field = x_tensor[0, 0, :, 0].numpy()  # first timestep, first channel
-                    target_field = x_tensor[-1, 0, :, 0].numpy()  # last timestep, first channel
-
-                    grid_shape = (445, 595)
-
-                    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
-                    inp_2d = input_field.reshape(grid_shape)
-                    tgt_2d = target_field.reshape(grid_shape)
-                    diff_2d = tgt_2d - inp_2d
-                    im0 = axes[0].imshow(inp_2d, origin="lower", aspect="auto")
-                    plt.colorbar(im0, ax=axes[0])
-                    im1 = axes[1].imshow(tgt_2d, origin="lower", aspect="auto")
-                    plt.colorbar(im1, ax=axes[1])
-                    im2 = axes[2].imshow(diff_2d, origin="lower", aspect="auto", cmap="RdBu_r")
-                    plt.colorbar(im2, ax=axes[2])
-                    axes[0].set_title(f"Input (t=0), ch0, normalized")
-                    axes[1].set_title(f"Target (t+1), ch0, normalized")
-                    axes[2].set_title(f"Target - Input, ch0")
-                    plt.suptitle(f"label={self.label}, idx={i}, npts={len(input_field)}")
-                    plt.tight_layout()
-                    plt.savefig("/home/mflora/dataloader_diagnostic.png", dpi=150)
-                    plt.close()
-                    LOGGER.info("Saved dataloader diagnostic plot to /home/mflora/dataloader_diagnostic.png")
-                except Exception as e:
-                    LOGGER.warning("Failed to save diagnostic plot: %s", e)
-
             # Sidecar write — spike monitor uses this to attach the underlying
             # zarr time_index / trajectory_id / date to a logged spike.
             # No-op when ANEMOI_SPIKE_SIDECAR_DIR is unset; <70 B/sample otherwise.
