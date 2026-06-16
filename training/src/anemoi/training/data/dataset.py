@@ -41,6 +41,7 @@ class NativeGridDataset(IterableDataset):
         num_gpus_per_model: int = 1,
         trajectory_diverse_batching: bool = False,
         trajectory_filter: int | list[int] | None = None,
+        date_range: tuple | None = None,
     ) -> None:
         """Initialize (part of) the dataset state.
 
@@ -71,6 +72,11 @@ class NativeGridDataset(IterableDataset):
         self.label = label
         self.trajectory_diverse_batching = trajectory_diverse_batching
         self.trajectory_filter = trajectory_filter
+        # (np.datetime64 lo, hi) — keep only samples whose start date is in range.
+        # Used for a deterministic DATE-based train/val split on forecast/trajectory
+        # datasets, computed from a single clean full open (the broken non-unique
+        # date open_dataset(start,end) path is avoided entirely).
+        self.date_range = date_range
         self.relative_date_indices = relative_date_indices  # relative index of dates to extract
 
         self.num_gpus_per_ens = num_gpus_per_ens
@@ -163,6 +169,13 @@ class NativeGridDataset(IterableDataset):
             LOGGER.info("Trajectory filter: keeping %d / %d samples (trajectory_filter=%s)",
                         mask.sum(), len(indices), self.trajectory_filter)
             indices = indices[mask]
+        if getattr(self, "date_range", None) is not None:
+            lo, hi = self.date_range
+            dts = np.asarray(self.data.dates)
+            dmask = (dts[indices] >= lo) & (dts[indices] <= hi)
+            LOGGER.info("Date filter: keeping %d / %d samples (range %s .. %s)",
+                        int(dmask.sum()), len(indices), lo, hi)
+            indices = indices[dmask]
         return indices
 
     def set_comm_group_info(
