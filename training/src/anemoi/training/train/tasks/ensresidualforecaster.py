@@ -89,9 +89,71 @@ class GraphEnsResidualForecaster(GraphEnsForecaster):
                 self.state_bounding_n_sigma,
             )
 
+        # In-loop PHYSICAL bounding — same recipe v48a's deterministic forecaster
+        # uses: positive bounding (qv>=0 via ``variables``+``min_val``), per-variable
+        # ``var_ranges``, and low-precip ``zero_below``, applied to the reconstructed
+        # physical state BEFORE renormalization/feedback at every rollout step. The
+        # ensemble thus trains under the same clamp the operational post-hoc stack
+        # applies, and never learns to propagate states (negative humidity, drizzle)
+        # inference would clip away. Distinct from the ±n_sigma normalized clip above
+        # (both can be active): physical bounding enforces variable ranges, n_sigma
+        # suppresses outliers. Read from the same training.state_bounding block.
+        self._sb_phys_enabled = False
+        self._sb_min, self._sb_ranges, self._sb_zero = [], [], []
+        if sb_cfg is not None and getattr(sb_cfg, "enabled", False):
+            from fnmatch import fnmatch as _fnmatch
+            _i2n = {int(v): k for k, v in self.data_indices.name_to_index.items()}
+            _prog = [_i2n[int(i)] for i in self.data_indices.data.input.prognostic]
+            _n2p = {nm: p for p, nm in enumerate(_prog)}
+            _minv = float(getattr(sb_cfg, "min_val", 0.0))
+            for pat in (getattr(sb_cfg, "variables", []) or []):
+                self._sb_min += [(p, _minv) for nm, p in _n2p.items() if _fnmatch(nm, pat)]
+            for nm, rng in (getattr(sb_cfg, "var_ranges", {}) or {}).items():
+                if nm in _n2p:
+                    lo = None if rng[0] is None else float(rng[0])
+                    hi = None if (len(rng) < 2 or rng[1] is None) else float(rng[1])
+                    self._sb_ranges.append((_n2p[nm], lo, hi))
+            for nm, thr in (getattr(sb_cfg, "zero_below", {}) or {}).items():
+                if nm in _n2p:
+                    self._sb_zero.append((_n2p[nm], float(thr)))
+            self._sb_phys_enabled = bool(self._sb_min or self._sb_ranges or self._sb_zero)
+            if self._sb_phys_enabled:
+                LOGGER.info(
+                    "GraphEnsResidualForecaster: PHYSICAL state bounding ENABLED "
+                    "(fed-back state): %d min-clamp, %d ranges, %d zero_below",
+                    len(self._sb_min), len(self._sb_ranges), len(self._sb_zero),
+                )
+
         # Sanity: the underlying AnemoiDiTModel must support forward_with_noise.
         # We can't check this at __init__ because self.model is built lazily by
         # the base class; we'll error at the first forward call if it's missing.
+
+    def _apply_state_bounding(self, x: torch.Tensor) -> torch.Tensor:
+        """Physical bounding (qv>=0 / var_ranges / low-precip zero_below) on the
+        reconstructed physical state before feedback — FUNCTIONAL (broadcast clamp
+        + where, autograd-safe). ``x`` is (..., grid, n_prog) in
+        data.input.prognostic order; per-channel vectors built once and cached.
+        No-op unless physical state bounding is configured."""
+        if not getattr(self, "_sb_phys_enabled", False):
+            return x
+        n = x.shape[-1]
+        if getattr(self, "_sb_lo", None) is None or self._sb_lo.numel() != n or self._sb_lo.device != x.device:
+            lo = torch.full((n,), float("-inf"), device=x.device, dtype=torch.float32)
+            hi = torch.full((n,), float("inf"), device=x.device, dtype=torch.float32)
+            zt = torch.full((n,), float("-inf"), device=x.device, dtype=torch.float32)
+            for p, mn in self._sb_min:
+                lo[p] = max(float(lo[p]), mn)
+            for p, l, h in self._sb_ranges:
+                if l is not None:
+                    lo[p] = max(float(lo[p]), l)
+                if h is not None:
+                    hi[p] = min(float(hi[p]), h)
+            for p, thr in self._sb_zero:
+                zt[p] = thr
+            self._sb_lo, self._sb_hi, self._sb_zt = lo, hi, zt
+        x = torch.clamp(x, min=self._sb_lo.to(x.dtype), max=self._sb_hi.to(x.dtype))
+        x = torch.where(x < self._sb_zt.to(x.dtype), torch.zeros((), device=x.device, dtype=x.dtype), x)
+        return x
 
     @staticmethod
     def _get_normalizer_buffers(processors) -> tuple[torch.Tensor, torch.Tensor]:
@@ -234,6 +296,12 @@ class GraphEnsResidualForecaster(GraphEnsForecaster):
                 Δx̂_norm_prog,
                 in_place=False,
             )
+
+            # In-loop PHYSICAL bounding (qv>=0 / var_ranges / low-precip zero_below),
+            # applied to the fed-back state — same as v48a. Broadcasts over the
+            # ensemble dim (per-member). Affects feedback only; the CRPS loss is on
+            # the residual Δx̂. Distinct from the ±n_sigma clip applied below.
+            y_pred_phys_prog = self._apply_state_bounding(y_pred_phys_prog)
 
             # Renormalize for next-step input.
             y_pred_prog = (
