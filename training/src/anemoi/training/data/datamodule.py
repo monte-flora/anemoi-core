@@ -177,8 +177,66 @@ class AnemoiDatasetsDataModule(pl.LightningDataModule):
         return timestep // frequency
 
     @cached_property
+    def _full_reader(self) -> Callable:
+        """Open the full series ONCE (start/end -> null) and share this single
+        reader across the trajectory split + train + val datasets.
+
+        Two reasons this must be one shared open:
+        (1) Date-range ``start``/``end`` subsetting is ill-defined and
+            non-deterministic on forecast/trajectory datasets whose dates are
+            non-unique (repeated valid-times across initialisations) — so we
+            open the full series and split by ``trajectory_id`` instead.
+        (2) Repeated ``open_dataset`` calls in one process corrupt the
+            anemoi-datasets store's shared read buffer, making ``trajectory_ids``
+            non-deterministic across opens. A single shared reader (with the
+            ``trajectory_ids`` cached_property in anemoi-datasets) yields one
+            clean, stable array for the partition AND the per-split filtering.
+        """
+        from omegaconf import OmegaConf
+
+        cfg = OmegaConf.to_container(self.config.dataloader.training, resolve=True)
+        cfg["start"] = None
+        cfg["end"] = None
+        return self.add_trajectory_ids(open_dataset(cfg))
+
+    @cached_property
+    def trajectory_split(self) -> tuple:
+        """Deterministic (train_ids, val_ids) partition of unique trajectory_ids.
+
+        Active only when ``dataloader.split_by_trajectory`` is True. Holds out
+        every stride-th trajectory (stride = round(1 / validation_trajectory_fraction))
+        for validation; the remainder are training. This is the correct split
+        axis for forecast/trajectory datasets — it is disjoint, deterministic,
+        and avoids the broken non-unique-date range subsetting entirely.
+        """
+        if not getattr(self.config.dataloader, "split_by_trajectory", False):
+            return None, None
+        tids = getattr(self._full_reader, "trajectory_ids", None)
+        if tids is None:
+            msg = "dataloader.split_by_trajectory=True but the dataset exposes no trajectory_ids"
+            raise ValueError(msg)
+        uniq = np.unique(np.asarray(tids))
+        frac = float(getattr(self.config.dataloader, "validation_trajectory_fraction", 0.1))
+        stride = max(2, int(round(1.0 / max(frac, 1e-6))))
+        val_ids = uniq[::stride]
+        train_ids = np.setdiff1d(uniq, val_ids, assume_unique=True)
+        LOGGER.info(
+            "Trajectory split: %d train / %d val trajectories of %d unique (frac=%.3f, stride=%d)",
+            len(train_ids), len(val_ids), len(uniq), frac, stride,
+        )
+        return train_ids, val_ids
+
+    @cached_property
     def ds_train(self) -> NativeGridDataset:
         shuffle = getattr(self.config.dataloader, "shuffle_training", True)
+        train_ids, _ = self.trajectory_split
+        if train_ids is not None:
+            return self._get_dataset(
+                self._full_reader,
+                shuffle=shuffle,
+                label="train",
+                trajectory_filter=train_ids,
+            )
         return self._get_dataset(
             open_dataset(self.config.dataloader.training),
             shuffle=shuffle,
@@ -187,6 +245,15 @@ class AnemoiDatasetsDataModule(pl.LightningDataModule):
 
     @cached_property
     def ds_valid(self) -> NativeGridDataset:
+        _, val_ids = self.trajectory_split
+        if val_ids is not None:
+            return self._get_dataset(
+                self._full_reader,
+                shuffle=False,
+                val_rollout=self.config.dataloader.validation_rollout,
+                label="validation",
+                trajectory_filter=val_ids,
+            )
         if not self.config.dataloader.training.end < self.config.dataloader.validation.start:
             LOGGER.warning(
                 "Training end date %s is not before validation start date %s.",
@@ -222,11 +289,15 @@ class AnemoiDatasetsDataModule(pl.LightningDataModule):
         shuffle: bool = True,
         val_rollout: int = 1,
         label: str = "generic",
+        trajectory_filter: object = None,
     ) -> NativeGridDataset:
 
         LOGGER.info(f"{data_reader=}")
-        
+
         data_reader = self.add_trajectory_ids(data_reader)  # NOTE: Functionality to be moved to anemoi datasets
+
+        if trajectory_filter is None:
+            trajectory_filter = getattr(self.config.dataloader, "trajectory_filter", None)
 
         return NativeGridDataset(
             data_reader=data_reader,
@@ -236,7 +307,7 @@ class AnemoiDatasetsDataModule(pl.LightningDataModule):
             grid_indices=self.grid_indices,
             label=label,
             trajectory_diverse_batching=getattr(self.config.dataloader, "trajectory_diverse_batching", False),
-            trajectory_filter=getattr(self.config.dataloader, "trajectory_filter", None),
+            trajectory_filter=trajectory_filter,
             #num_gpus_per_ens=getattr(self.config.system.hardware, "num_gpus_per_ensemble", 1),
             #num_gpus_per_model=self.config.system.hardware.num_gpus_per_model,
         )
